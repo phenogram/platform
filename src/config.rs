@@ -6,8 +6,10 @@ use crate::error::{AppError, Result};
 pub struct Config {
     pub app_env: String,
     pub listen_addr: SocketAddr,
-    /// Browser-facing landing page and management console origin.
-    pub web_base_url: String,
+    /// Public marketing and capability overview origin.
+    pub landing_base_url: String,
+    /// Authenticated browser console and management API origin.
+    pub app_base_url: String,
     /// Telegram-compatible, webhook, event stream, and public file origin.
     pub api_base_url: String,
     pub database_url: String,
@@ -25,26 +27,35 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
         let app_env = value("APP_ENV", "development");
-        // PUBLIC_BASE_URL is retained only as a non-breaking local-development
-        // fallback. Production validation below requires the two public hosts
-        // to be configured separately.
-        let legacy_base_url = optional("PUBLIC_BASE_URL");
-        let web_base_url = optional("WEB_BASE_URL")
+        // The former one-origin variables are retained only for local and test
+        // compatibility. Production must name all three origins explicitly.
+        let development_origin = optional("PUBLIC_BASE_URL").or_else(|| optional("WEB_BASE_URL"));
+        let landing_base_url = optional("LANDING_BASE_URL")
             .or_else(|| {
                 (app_env != "production")
-                    .then(|| legacy_base_url.clone())
+                    .then(|| development_origin.clone())
                     .flatten()
             })
-            .ok_or_else(|| AppError::Config("WEB_BASE_URL is required".into()))?
+            .ok_or_else(|| AppError::Config("LANDING_BASE_URL is required".into()))?
+            .trim_end_matches('/')
+            .to_owned();
+        let app_base_url = optional("APP_BASE_URL")
+            .or_else(|| {
+                (app_env != "production")
+                    .then(|| development_origin.clone())
+                    .flatten()
+            })
+            .or_else(|| (app_env != "production").then(|| landing_base_url.clone()))
+            .ok_or_else(|| AppError::Config("APP_BASE_URL is required".into()))?
             .trim_end_matches('/')
             .to_owned();
         let api_base_url = optional("API_BASE_URL")
             .or_else(|| {
                 (app_env != "production")
-                    .then_some(legacy_base_url)
+                    .then_some(development_origin)
                     .flatten()
             })
-            .or_else(|| (app_env != "production").then(|| web_base_url.clone()))
+            .or_else(|| (app_env != "production").then(|| app_base_url.clone()))
             .ok_or_else(|| AppError::Config("API_BASE_URL is required".into()))?
             .trim_end_matches('/')
             .to_owned();
@@ -52,7 +63,8 @@ impl Config {
             app_env: app_env.clone(),
             listen_addr: SocketAddr::from_str(&value("LISTEN_ADDR", "127.0.0.1:8080"))
                 .map_err(|e| AppError::Config(format!("invalid LISTEN_ADDR: {e}")))?,
-            web_base_url,
+            landing_base_url,
+            app_base_url,
             api_base_url,
             database_url: required("DATABASE_URL")?,
             master_key: required("MASTER_KEY")?,
@@ -78,17 +90,30 @@ impl Config {
             ));
         }
         let production = self.app_env == "production";
-        let web_origin = validate_public_origin("WEB_BASE_URL", &self.web_base_url, production)?;
+        let landing_origin =
+            validate_public_origin("LANDING_BASE_URL", &self.landing_base_url, production)?;
+        let app_origin = validate_public_origin("APP_BASE_URL", &self.app_base_url, production)?;
         let api_origin = validate_public_origin("API_BASE_URL", &self.api_base_url, production)?;
-        if production
-            && web_origin
-                .host_str()
-                .zip(api_origin.host_str())
-                .is_some_and(|(web, api)| web.eq_ignore_ascii_case(api))
-        {
-            return Err(AppError::Config(
-                "WEB_BASE_URL and API_BASE_URL must use different hosts in production".into(),
-            ));
+        if production {
+            let hosts = [
+                ("LANDING_BASE_URL", landing_origin.host_str()),
+                ("APP_BASE_URL", app_origin.host_str()),
+                ("API_BASE_URL", api_origin.host_str()),
+            ];
+            for left in 0..hosts.len() {
+                for right in (left + 1)..hosts.len() {
+                    if hosts[left]
+                        .1
+                        .zip(hosts[right].1)
+                        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+                    {
+                        return Err(AppError::Config(format!(
+                            "{} and {} must use different hosts in production",
+                            hosts[left].0, hosts[right].0
+                        )));
+                    }
+                }
+            }
         }
         for (name, secret) in [
             ("MASTER_KEY", &self.master_key),
@@ -132,41 +157,73 @@ impl Config {
     }
 
     pub fn secure_cookies(&self) -> bool {
-        self.app_env == "production" || self.web_base_url.starts_with("https://")
+        self.app_env == "production" || self.app_base_url.starts_with("https://")
     }
 
     pub fn public_request_access(&self, host: Option<&str>, path: &str) -> PublicRequestAccess {
-        let console = host.is_some_and(|host| host_matches_origin(host, &self.web_base_url));
-        let api = host.is_some_and(|host| host_matches_origin(host, &self.api_base_url));
-
-        // One-host local development remains supported. Production validation
-        // requires different hosts, so this cannot weaken the live boundary.
-        if console && api {
-            return PublicRequestAccess::Allowed;
-        }
-        if console {
-            return if is_machine_path(path) {
-                PublicRequestAccess::WrongSurface
-            } else {
-                PublicRequestAccess::Allowed
-            };
-        }
-        if api {
-            return if is_machine_path(path) {
-                PublicRequestAccess::Allowed
-            } else {
-                PublicRequestAccess::WrongSurface
-            };
+        match self.public_surface(host) {
+            PublicSurface::Combined => return PublicRequestAccess::Allowed,
+            PublicSurface::Landing => {
+                return if is_landing_path(path) {
+                    PublicRequestAccess::Allowed
+                } else {
+                    PublicRequestAccess::WrongSurface
+                };
+            }
+            PublicSurface::App => {
+                return if is_machine_path(path) {
+                    PublicRequestAccess::WrongSurface
+                } else {
+                    PublicRequestAccess::Allowed
+                };
+            }
+            PublicSurface::Api => {
+                return if is_machine_path(path) {
+                    PublicRequestAccess::Allowed
+                } else {
+                    PublicRequestAccess::WrongSurface
+                };
+            }
+            PublicSurface::Unknown => {}
         }
         // Kubernetes and other direct service probes generally use a pod or
         // service IP as Host. Health is deliberately the sole host-independent
         // endpoint and contains no credentials or tenant data. This exception
-        // is reached only after excluding both configured public hosts.
+        // is reached only after excluding every configured public host.
         if path == "/api/health" {
             return PublicRequestAccess::Allowed;
         }
         PublicRequestAccess::UnknownHost
     }
+
+    pub fn public_surface(&self, host: Option<&str>) -> PublicSurface {
+        let Some(host) = host else {
+            return PublicSurface::Unknown;
+        };
+        let landing = host_matches_origin(host, &self.landing_base_url);
+        let app = host_matches_origin(host, &self.app_base_url);
+        let api = host_matches_origin(host, &self.api_base_url);
+        if landing && app && api {
+            PublicSurface::Combined
+        } else if landing {
+            PublicSurface::Landing
+        } else if app {
+            PublicSurface::App
+        } else if api {
+            PublicSurface::Api
+        } else {
+            PublicSurface::Unknown
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicSurface {
+    Landing,
+    App,
+    Api,
+    Combined,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,17 +332,26 @@ fn is_machine_path(path: &str) -> bool {
         || path.starts_with("/public/")
 }
 
+fn is_landing_path(path: &str) -> bool {
+    path == "/"
+        || matches!(
+            path,
+            "/assets/app.css" | "/assets/app.js" | "/assets/runtime.js"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-    use super::{Config, PublicRequestAccess};
+    use super::{Config, PublicRequestAccess, PublicSurface};
 
-    fn config(app_env: &str, console: &str, api: &str) -> Config {
+    fn config(app_env: &str, landing: &str, app: &str, api: &str) -> Config {
         Config {
             app_env: app_env.into(),
             listen_addr: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
-            web_base_url: console.into(),
+            landing_base_url: landing.into(),
+            app_base_url: app.into(),
             api_base_url: api.into(),
             database_url: "postgresql://phenogram:password@localhost/phenogram".into(),
             master_key: "m".repeat(32),
@@ -300,25 +366,32 @@ mod tests {
     }
 
     #[test]
-    fn production_requires_separate_https_hosts() {
+    fn production_requires_three_separate_https_hosts() {
         assert!(
             config(
                 "production",
                 "https://phenogram.io",
+                "https://app.phenogram.io",
                 "https://api.phenogram.io"
             )
             .validate()
             .is_ok()
         );
         assert!(
-            config("production", "https://phenogram.io", "https://phenogram.io")
-                .validate()
-                .is_err()
+            config(
+                "production",
+                "https://phenogram.io",
+                "https://phenogram.io",
+                "https://api.phenogram.io"
+            )
+            .validate()
+            .is_err()
         );
         assert!(
             config(
                 "production",
                 "http://phenogram.io",
+                "https://app.phenogram.io",
                 "https://api.phenogram.io"
             )
             .validate()
@@ -327,22 +400,35 @@ mod tests {
     }
 
     #[test]
-    fn separates_console_and_machine_surfaces_by_host() {
+    fn separates_landing_app_and_machine_surfaces_by_host() {
         let config = config(
             "production",
             "https://phenogram.io",
+            "https://app.phenogram.io",
             "https://api.phenogram.io",
         );
         assert_eq!(
-            config.public_request_access(Some("phenogram.io"), "/settings"),
+            config.public_request_access(Some("phenogram.io"), "/"),
             PublicRequestAccess::Allowed
         );
         assert_eq!(
-            config.public_request_access(Some("phenogram.io:443"), "/api/bots"),
-            PublicRequestAccess::Allowed
+            config.public_request_access(Some("phenogram.io"), "/api/plans"),
+            PublicRequestAccess::WrongSurface
         );
         assert_eq!(
             config.public_request_access(Some("phenogram.io"), "/bot123:getMe"),
+            PublicRequestAccess::WrongSurface
+        );
+        assert_eq!(
+            config.public_request_access(Some("phenogram.io"), "/client-route"),
+            PublicRequestAccess::WrongSurface
+        );
+        assert_eq!(
+            config.public_request_access(Some("app.phenogram.io:443"), "/api/bots"),
+            PublicRequestAccess::Allowed
+        );
+        assert_eq!(
+            config.public_request_access(Some("app.phenogram.io"), "/bot123:getMe"),
             PublicRequestAccess::WrongSurface
         );
         assert_eq!(
@@ -358,6 +444,14 @@ mod tests {
             PublicRequestAccess::WrongSurface
         );
         assert_eq!(
+            config.public_request_access(Some("phenogram.io"), "/api/health"),
+            PublicRequestAccess::WrongSurface
+        );
+        assert_eq!(
+            config.public_request_access(Some("app.phenogram.io"), "/api/health"),
+            PublicRequestAccess::Allowed
+        );
+        assert_eq!(
             config.public_request_access(Some("10.42.0.17:8080"), "/api/health"),
             PublicRequestAccess::Allowed
         );
@@ -369,14 +463,35 @@ mod tests {
             config.public_request_access(Some("phenogram.io:80"), "/"),
             PublicRequestAccess::UnknownHost
         );
+        assert_eq!(
+            config.public_surface(Some("phenogram.io")),
+            PublicSurface::Landing
+        );
+        assert_eq!(
+            config.public_surface(Some("app.phenogram.io")),
+            PublicSurface::App
+        );
+        assert_eq!(
+            config.public_surface(Some("api.phenogram.io")),
+            PublicSurface::Api
+        );
     }
 
     #[test]
     fn permits_single_origin_local_development() {
-        let config = config("test", "http://127.0.0.1:18080", "http://127.0.0.1:18080");
+        let config = config(
+            "test",
+            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18080",
+        );
         assert_eq!(
             config.public_request_access(Some("127.0.0.1:18080"), "/api/me"),
             PublicRequestAccess::Allowed
+        );
+        assert_eq!(
+            config.public_surface(Some("127.0.0.1:18080")),
+            PublicSurface::Combined
         );
         assert_eq!(
             config.public_request_access(Some("127.0.0.1:18080"), "/bot123/getMe"),

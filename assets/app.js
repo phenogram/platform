@@ -5,6 +5,15 @@
   const modalRoot = document.querySelector("#modal-root");
   const toastRegion = document.querySelector("#toast-region");
   const API = "/api";
+  const runtime = window.PHENOGRAM_RUNTIME || {
+    surface: "combined",
+    landingBaseUrl: window.location.origin,
+    appBaseUrl: window.location.origin,
+    apiBaseUrl: window.location.origin,
+  };
+  const surface = ["landing", "app", "combined"].includes(runtime.surface) ? runtime.surface : "combined";
+  const appHref = (path = "/") => `${String(runtime.appBaseUrl || window.location.origin).replace(/\/$/, "")}/#${path.startsWith("/") ? path : `/${path}`}`;
+  const landingHref = (anchor = "") => `${String(runtime.landingBaseUrl || window.location.origin).replace(/\/$/, "")}/${anchor ? `#${anchor.replace(/^#/, "")}` : ""}`;
 
   const state = {
     phase: "booting",
@@ -315,6 +324,12 @@
 
   async function bootstrap() {
     state.route = parseRoute();
+    if (surface === "landing") {
+      state.phase = "guest";
+      render();
+      if (state.route.params.anchor) window.setTimeout(() => document.getElementById(state.route.params.anchor)?.scrollIntoView(), 10);
+      return;
+    }
     const healthPromise = api("/health", { auth: false }).then((value) => { state.health = value || { status: "ok" }; }).catch((error) => { state.health = { status: "down", message: errorMessage(error) }; });
     try {
       const payload = await api("/me");
@@ -335,7 +350,7 @@
         navigate("/overview");
         return;
       }
-    } else if (!['landing', 'auth'].includes(state.route.name)) {
+    } else if ((surface === "app" && state.route.name === "landing") || !['landing', 'auth'].includes(state.route.name)) {
       navigate("/login");
       return;
     }
@@ -530,7 +545,8 @@
     }
 
     if (!state.user) {
-      if (!['landing', 'auth'].includes(state.route.name)) state.route = { name: "auth", params: { mode: "login" } };
+      if (surface === "landing") state.route = { name: "landing", params: state.route.params };
+      else if (surface === "app" || !['landing', 'auth'].includes(state.route.name)) state.route = { name: "auth", params: { mode: "login" } };
       render();
       if (state.route.params.anchor) window.setTimeout(() => document.getElementById(state.route.params.anchor)?.scrollIntoView(), 10);
       return;
@@ -561,7 +577,9 @@
   function render() {
     if (state.phase === "booting") return;
     if (!state.user) {
-      app.innerHTML = state.route.name === "auth" ? renderAuth(state.route.params.mode) : renderLanding();
+      app.innerHTML = surface === "landing" || (surface === "combined" && state.route.name !== "auth")
+        ? renderLanding()
+        : renderAuth(state.route.params.mode || "login");
       document.body.classList.remove("console-open");
     } else {
       app.innerHTML = renderApp();
@@ -576,13 +594,13 @@
     return `
       <main class="landing" id="main-content" tabindex="-1">
         <header class="landing__header">
-          <a class="brand" href="#/" aria-label="Phenogram home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
+          <a class="brand" href="${esc(landingHref())}" aria-label="Phenogram home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
           <nav class="landing__nav" aria-label="Main navigation">
             <a href="#platform">Platform</a><a href="#workflow">How it works</a><a href="#pricing">Pricing</a><a href="#security">Security</a>
           </nav>
           <div class="landing__actions">
-            <a class="btn btn--dark-ghost" href="#/login">Sign in</a>
-            <a class="btn btn--white" href="#/register">Start free ${icon("arrow")}</a>
+            <a class="btn btn--dark-ghost" href="${esc(appHref("/login"))}">Sign in</a>
+            <a class="btn btn--white" href="${esc(appHref("/register"))}">Start free ${icon("arrow")}</a>
           </div>
         </header>
 
@@ -592,14 +610,14 @@
             <h1>Telegram bots,<br><em>finally observable.</em></h1>
             <p class="hero__lead">Keep the Bot API your code already knows. Add durable updates, real-time debugging, safer file access, and an operator view—with one endpoint change.</p>
             <div class="hero__actions">
-              <a class="btn btn--white btn--lg" href="#/register">Connect your first bot ${icon("arrow")}</a>
+              <a class="btn btn--white btn--lg" href="${esc(appHref("/register"))}">Connect your first bot ${icon("arrow")}</a>
               <a class="btn btn--dark-ghost btn--lg" href="#workflow">See the 2-minute setup</a>
             </div>
             <p class="hero__note">Free forever for one bot · 30-day update history · No card required</p>
           </div>
           <div class="console-preview" aria-label="Phenogram dashboard preview">
             <div class="console-preview__window">
-              <div class="console-preview__bar"><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__url">phenogram.io / weather-assistant</span></div>
+              <div class="console-preview__bar"><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__url">app.phenogram.io / weather-assistant</span></div>
               <div class="console-preview__body">
                 <aside class="console-preview__side"><div class="preview-brand"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</div><div class="preview-nav-line active"></div><div class="preview-nav-line"></div><div class="preview-nav-line"></div><div class="preview-nav-line"></div></aside>
                 <div class="console-preview__main">
@@ -645,20 +663,20 @@
           <div class="security-copy"><p class="eyebrow">Designed for sensitive credentials</p><h2>Your token proves ownership. It never becomes product UI.</h2><p>Phenogram verifies a bot server-side, encrypts the token at rest, and redacts credentials from request history. Public bot keys identify; they never authorize API calls.</p><div class="security-list"><div>${icon("check")}Encrypted token storage</div><div>${icon("check")}Expiring, scoped file links</div><div>${icon("check")}Audited operator actions</div><div>${icon("check")}Explicit bot deletion controls</div></div></div>
         </div></section>
 
-        <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="#/register">Start with one free bot ${icon("arrow")}</a></section>
-        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="#/"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
+        <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="${esc(appHref("/register"))}">Start with one free bot ${icon("arrow")}</a></section>
+        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="${esc(landingHref())}"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
       </main>`;
   }
 
   function landingPrice(name, price, copy, features, featured) {
-    return `<article class="price-card ${featured ? "price-card--featured" : ""}">${featured ? '<span class="price-card__tag">Most popular</span>' : ""}<h3>${esc(name)}</h3><div class="price-card__price">${esc(price)}${price !== "$0" ? "<span> / month</span>" : ""}</div><p>${esc(copy)}</p><ul class="price-list">${features.map((feature) => `<li>${icon("check")}${esc(feature)}</li>`).join("")}</ul><a class="btn ${featured ? "btn--primary" : "btn--secondary"} btn--block" href="#/register">Start free</a></article>`;
+    return `<article class="price-card ${featured ? "price-card--featured" : ""}">${featured ? '<span class="price-card__tag">Most popular</span>' : ""}<h3>${esc(name)}</h3><div class="price-card__price">${esc(price)}${price !== "$0" ? "<span> / month</span>" : ""}</div><p>${esc(copy)}</p><ul class="price-list">${features.map((feature) => `<li>${icon("check")}${esc(feature)}</li>`).join("")}</ul><a class="btn ${featured ? "btn--primary" : "btn--secondary"} btn--block" href="${esc(appHref("/register"))}">Start free</a></article>`;
   }
 
   function renderAuth(mode = "login") {
     const register = mode === "register";
     return `<main class="auth-screen" id="main-content" tabindex="-1">
       <section class="auth-panel">
-        <a class="brand" href="#/"><span class="brand-mark brand-mark--primary"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
+        <a class="brand" href="${esc(landingHref())}"><span class="brand-mark brand-mark--primary"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
         <div class="auth-panel__body">
           <p class="eyebrow">${register ? "Create your workspace" : "Developer console"}</p>
           <h1>${register ? "Start building clearly." : "Welcome back."}</h1>

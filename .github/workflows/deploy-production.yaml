@@ -16,7 +16,8 @@ env:
   TELEGRAM_IMAGE: ghcr.io/phenogram/telegram-bot-api
   RELEASE_NAME: phenogram
   KUBE_NAMESPACE: phenogram
-  WEB_HEALTH_URL: https://phenogram.io/api/health
+  LANDING_URL: https://phenogram.io
+  APP_URL: https://app.phenogram.io
   MACHINE_API_URL: https://api.phenogram.io
 
 jobs:
@@ -127,7 +128,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: production
-      url: https://phenogram.io
+      url: https://app.phenogram.io
     permissions:
       contents: read
     steps:
@@ -223,6 +224,35 @@ jobs:
           test -n "$TELEGRAM_DIGEST"
           secret_revision="$(kubectl --namespace "$KUBE_NAMESPACE" get secret phenogram-secrets --output 'jsonpath={.metadata.resourceVersion}')"
           test -n "$secret_revision"
+          # Existing certificate Secret names may only be referenced by their
+          # established Ingress identities. This prevents ingress-shim from
+          # racing a replacement Certificate owner during topology changes.
+          for binding in \
+            'phenogram-web:phenogram.io:phenogram-io-tls' \
+            'phenogram-app:app.phenogram.io:app-phenogram-io-tls' \
+            'phenogram-api:api.phenogram.io:api-phenogram-io-tls'; do
+            ingress_name="${binding%%:*}"
+            remainder="${binding#*:}"
+            expected_host="${remainder%%:*}"
+            expected_secret="${remainder#*:}"
+            secret_owners="$(kubectl --namespace "$KUBE_NAMESPACE" get ingress --output json \
+              | jq --raw-output --arg secret "$expected_secret" \
+                '.items[] | select(any(.spec.tls[]?; .secretName == $secret)) | .metadata.name')"
+            unexpected_owners="$(printf '%s\n' "$secret_owners" | grep -v -x -e '' -e "$ingress_name" || true)"
+            if test -n "$unexpected_owners"; then
+              printf 'TLS Secret %s is referenced by unexpected Ingress(es): %s\n' "$expected_secret" "$unexpected_owners" >&2
+              exit 1
+            fi
+            if kubectl --namespace "$KUBE_NAMESPACE" get ingress "$ingress_name" >/dev/null 2>&1; then
+              actual_host="$(kubectl --namespace "$KUBE_NAMESPACE" get ingress "$ingress_name" --output 'jsonpath={.spec.rules[0].host}')"
+              actual_secret="$(kubectl --namespace "$KUBE_NAMESPACE" get ingress "$ingress_name" --output 'jsonpath={.spec.tls[0].secretName}')"
+              test "$actual_host" = "$expected_host"
+              test "$actual_secret" = "$expected_secret"
+            elif kubectl --namespace "$KUBE_NAMESPACE" get secret "$expected_secret" >/dev/null 2>&1; then
+              printf 'TLS Secret %s exists without its expected Ingress %s; certificate ownership must be inspected manually.\n' "$expected_secret" "$ingress_name" >&2
+              exit 1
+            fi
+          done
           helm upgrade --install "$RELEASE_NAME" deploy/helm/phenogram-platform \
             --namespace "$KUBE_NAMESPACE" \
             --values deploy/helm/phenogram-platform/values-production.yaml \
@@ -242,18 +272,26 @@ jobs:
           kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-postgresql --timeout=5m
           kubectl --namespace "$KUBE_NAMESPACE" get pods,service,ingress,pvc
 
-      - name: Verify public host separation and health
+      - name: Verify public three-host separation and health
         run: |
           set -euo pipefail
           response="$(curl --fail --silent --show-error \
             --retry 18 --retry-all-errors --retry-delay 10 \
             --connect-timeout 10 --max-time 20 \
-            "$WEB_HEALTH_URL")"
+            "$APP_URL/api/health")"
           printf '%s' "$response" | grep -q '"status":"ok"'
           curl --fail --silent --show-error \
             --connect-timeout 10 --max-time 20 \
             --output /dev/null \
-            "https://phenogram.io/"
+            "$LANDING_URL/"
+          test "$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null --write-out '%{http_code}' \
+            "$LANDING_URL/api/health")" = "404"
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null \
+            "$APP_URL/"
           test "$(curl --silent --show-error \
             --connect-timeout 10 --max-time 20 \
             --output /dev/null --write-out '%{http_code}' \
@@ -266,4 +304,4 @@ jobs:
             --connect-timeout 10 --max-time 20 \
             --output /dev/null --write-out '%{http_code}' \
             "$MACHINE_API_URL/bot0:invalid/getMe")" = "401"
-          printf '%s\n' 'Both public hosts, health, and ingress separation passed.'
+          printf '%s\n' 'Landing, app, and machine API host separation passed.'

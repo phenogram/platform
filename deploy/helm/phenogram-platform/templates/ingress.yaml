@@ -1,12 +1,15 @@
 {{- if .Values.ingress.enabled }}
+{{- $fullname := include "phenogram.fullname" . -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "phenogram.fullname" . }}-web
+  # Keep the live apex ingress identity so ingress-shim updates the existing
+  # phenogram-io-tls Certificate owner instead of racing a second owner.
+  name: {{ $fullname }}-web
   labels:
     {{- include "phenogram.labels" . | nindent 4 }}
-    app.kubernetes.io/component: web-ingress
-  {{- with .Values.ingress.annotations }}
+    app.kubernetes.io/component: landing-ingress
+  {{- with omit .Values.ingress.annotations "traefik.ingress.kubernetes.io/router.pathmatcher" }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -14,30 +17,71 @@ spec:
   {{- with .Values.ingress.className }}
   ingressClassName: {{ . }}
   {{- end }}
-  {{- if .Values.ingress.web.tls.enabled }}
+  {{- if .Values.ingress.landing.tls.enabled }}
   tls:
     - hosts:
-        - {{ .Values.ingress.web.host | quote }}
-      secretName: {{ .Values.ingress.web.tls.secretName }}
+        - {{ .Values.ingress.landing.host | quote }}
+      secretName: {{ .Values.ingress.landing.tls.secretName }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.web.host | quote }}
+    - host: {{ .Values.ingress.landing.host | quote }}
       http:
         paths:
-          # The console is a same-origin SPA. Its landing page, assets, client
-          # routes, and management API intentionally share this host.
           - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: http
+          - path: /assets
             pathType: Prefix
             backend:
               service:
-                name: {{ include "phenogram.fullname" . }}
+                name: {{ $fullname }}
                 port:
                   name: http
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "phenogram.fullname" . }}-api
+  name: {{ $fullname }}-app
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app-ingress
+  {{- with omit .Values.ingress.annotations "traefik.ingress.kubernetes.io/router.pathmatcher" }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.app.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.app.host | quote }}
+      secretName: {{ .Values.ingress.app.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.app.host | quote }}
+      http:
+        paths:
+          # The authenticated console uses same-origin management /api calls.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # Keep this identity stable: cert-manager's api-phenogram-io-tls Certificate
+  # is controller-owned by this Ingress in the live namespace.
+  name: {{ $fullname }}-api
   labels:
     {{- include "phenogram.labels" . | nindent 4 }}
     app.kubernetes.io/component: api-ingress
@@ -59,14 +103,14 @@ spec:
     - host: {{ .Values.ingress.api.host | quote }}
       http:
         paths:
-          # No catch-all path is present on the API host. Landing pages,
-          # browser assets, and the management /api tree are web-host only.
+          # Traefik's explicit PathPrefix matcher is required for the Telegram
+          # shape /bot<TOKEN>/..., which is not a Kubernetes path-segment prefix.
           {{- range list "/bot" "/file" "/telegram" "/events" "/public" }}
           - path: {{ . | quote }}
             pathType: Prefix
             backend:
               service:
-                name: {{ include "phenogram.fullname" $ }}
+                name: {{ $fullname }}
                 port:
                   name: http
           {{- end }}

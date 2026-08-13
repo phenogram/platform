@@ -6,7 +6,10 @@ use axum::{
     response::Response,
 };
 
-use crate::{config::PublicRequestAccess, state::AppState};
+use crate::{
+    config::{PublicRequestAccess, PublicSurface},
+    state::AppState,
+};
 
 const INDEX: &str = include_str!("../assets/index.html");
 const CSS: &str = include_str!("../assets/app.css");
@@ -22,6 +25,29 @@ pub async fn css() -> Response {
 
 pub async fn js() -> Response {
     asset(JS, "text/javascript; charset=utf-8", "no-cache")
+}
+
+pub async fn runtime_js(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let surface = match state.config.public_surface(host) {
+        PublicSurface::Landing => "landing",
+        PublicSurface::App => "app",
+        PublicSurface::Combined => "combined",
+        PublicSurface::Api | PublicSurface::Unknown => "unknown",
+    };
+    let runtime = serde_json::json!({
+        "surface": surface,
+        "landingBaseUrl": state.config.landing_base_url,
+        "appBaseUrl": state.config.app_base_url,
+        "apiBaseUrl": state.config.api_base_url,
+    });
+    asset_owned(
+        format!("window.PHENOGRAM_RUNTIME = {runtime};\n"),
+        "text/javascript; charset=utf-8",
+        "no-store",
+    )
 }
 
 pub async fn fallback(
@@ -118,6 +144,16 @@ fn asset(body: &'static str, content_type: &'static str, cache_control: &'static
         .expect("valid static response")
 }
 
+fn asset_owned(body: String, content_type: &'static str, cache_control: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(body))
+        .expect("valid dynamic asset response")
+}
+
 pub async fn security_headers(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -157,7 +193,8 @@ mod tests {
         let config = Config {
             app_env: "production".into(),
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
-            web_base_url: "https://phenogram.io".into(),
+            landing_base_url: "https://phenogram.io".into(),
+            app_base_url: "https://app.phenogram.io".into(),
             api_base_url: "https://api.phenogram.io".into(),
             database_url: "postgresql://phenogram:password@127.0.0.1/phenogram".into(),
             master_key: "m".repeat(32),
@@ -175,7 +212,7 @@ mod tests {
         crate::app(AppState::new(config, db).unwrap())
     }
 
-    async fn status(app: &axum::Router, host: &str, path: &str) -> axum::http::StatusCode {
+    async fn response(app: &axum::Router, host: &str, path: &str) -> axum::response::Response {
         app.clone()
             .oneshot(
                 Request::builder()
@@ -186,27 +223,66 @@ mod tests {
             )
             .await
             .unwrap()
-            .status()
     }
 
     #[tokio::test]
-    async fn router_never_serves_the_spa_on_api_or_unknown_hosts() {
+    async fn router_separates_landing_app_api_and_unknown_hosts() {
         let app = test_app();
         assert_eq!(
-            status(&app, "phenogram.io", "/client-route").await,
+            response(&app, "phenogram.io", "/").await.status(),
             axum::http::StatusCode::OK
         );
         assert_eq!(
-            status(&app, "api.phenogram.io", "/client-route").await,
+            response(&app, "phenogram.io", "/client-route")
+                .await
+                .status(),
             axum::http::StatusCode::NOT_FOUND
         );
         assert_eq!(
-            status(&app, "api.phenogram.io", "/botjunk").await,
+            response(&app, "phenogram.io", "/api/plans").await.status(),
             axum::http::StatusCode::NOT_FOUND
         );
         assert_eq!(
-            status(&app, "attacker.example", "/").await,
+            response(&app, "app.phenogram.io", "/client-route")
+                .await
+                .status(),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            response(&app, "app.phenogram.io", "/botjunk")
+                .await
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            response(&app, "api.phenogram.io", "/client-route")
+                .await
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            response(&app, "attacker.example", "/").await.status(),
             axum::http::StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_identifies_each_browser_surface() {
+        use http_body_util::BodyExt;
+
+        let app = test_app();
+        let landing = response(&app, "phenogram.io", "/assets/runtime.js").await;
+        let landing = landing.into_body().collect().await.unwrap().to_bytes();
+        let landing = std::str::from_utf8(&landing).unwrap();
+        assert!(landing.contains(r#""surface":"landing""#));
+        assert!(landing.contains(r#""appBaseUrl":"https://app.phenogram.io""#));
+
+        let app_response = response(&app, "app.phenogram.io", "/assets/runtime.js").await;
+        let app_response = app_response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&app_response)
+                .unwrap()
+                .contains(r#""surface":"app""#)
         );
     }
 }

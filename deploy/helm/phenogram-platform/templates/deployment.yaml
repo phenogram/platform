@@ -59,8 +59,10 @@ spec:
               value: {{ .Values.config.appEnv | quote }}
             - name: LISTEN_ADDR
               value: {{ .Values.config.listenAddr | quote }}
-            - name: WEB_BASE_URL
-              value: {{ .Values.config.webBaseUrl | quote }}
+            - name: LANDING_BASE_URL
+              value: {{ .Values.config.landingBaseUrl | quote }}
+            - name: APP_BASE_URL
+              value: {{ .Values.config.appBaseUrl | quote }}
             - name: API_BASE_URL
               value: {{ .Values.config.apiBaseUrl | quote }}
             - name: TELEGRAM_CLOUD_API_URL

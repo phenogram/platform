@@ -21,16 +21,17 @@ This repository is a production-oriented MVP, not a claim of complete Telegram B
 
 ```mermaid
 flowchart LR
+    L["Visitor"] -->|"phenogram.io"| M["Landing surface"]
+    O["Developer/operator"] -->|"app.phenogram.io"| V["Console and management API"]
     D["Bot application"] -->|"api.phenogram.io /bot{token}/{method}"| P["Machine API surface"]
     P -->|"ordinary Bot API methods"| T["Telegram cloud API or local Bot API server"]
     T -->|"secret-protected webhook"| I["Phenogram ingress"]
     I --> DB[("PostgreSQL")]
     DB --> G["Virtual getUpdates"]
     DB --> W["Downstream webhook workers"]
-    DB --> V["phenogram.io console and management API"]
+    DB --> V
     DB --> S["SSE replay"]
     I -->|"live, same process"| S
-    O["Developer/operator"] --> V
 ```
 
 At startup the application runs SQL migrations, starts one retention task and four downstream webhook workers, then serves the API and embedded web UI. PostgreSQL is the system of record. The live SSE broadcast is in-process; PostgreSQL supplies reconnect replay.
@@ -56,16 +57,25 @@ Put those values in `MASTER_KEY`, `PUBLIC_ID_KEY`, and `LINK_SIGNING_KEY`, set a
 
 ```sh
 docker compose up --build -d
-curl -fsS http://localhost:8080/api/health
+curl -fsS http://app.localhost/api/health
 ```
 
-Open `http://localhost:8080`, create an account, and connect the bot token. The local defaults deliberately set both base URLs to that one origin. Phenogram verifies `getMe`, checks for an existing Telegram webhook, encrypts the credential, and asks Telegram to deliver updates to Phenogram.
+Open `http://localhost` for the landing page or `http://app.localhost` for the developer console, create an account, and connect the bot token. The default Caddy sites deliberately exercise all three public surfaces locally; `*.localhost` resolves to loopback in modern browsers. Phenogram verifies `getMe`, checks for an existing Telegram webhook, encrypts the credential, and asks Telegram to deliver updates to Phenogram.
 
-Production has two public origins: `WEB_BASE_URL=https://phenogram.io` serves the landing page, console, and management API, while `API_BASE_URL=https://api.phenogram.io` serves Telegram-compatible bot/file routes, Telegram ingress, SSE, and signed downloads. Configure both without a trailing slash. They must be different HTTPS hosts in production; they may be identical for one-origin local development. Telegram cannot deliver updates to the default `localhost` URL, so a locally connected bot may be saved with a `degraded` status.
+Production has three public origins: `LANDING_BASE_URL=https://phenogram.io` serves only the public landing experience, `APP_BASE_URL=https://app.phenogram.io` serves the authenticated console and management API, and `API_BASE_URL=https://api.phenogram.io` serves Telegram-compatible bot/file routes, Telegram ingress, SSE, and signed downloads. Configure all three without a trailing slash. They must be distinct HTTPS hosts in production.
+
+For explicit one-origin development without Caddy, set all three base URLs to `http://localhost:8080`, start only `postgres` and `app`, and use the loopback-published application port. Telegram cannot deliver updates to a `localhost` API URL, so a locally connected bot may be saved with a `degraded` status.
+
+```sh
+LANDING_BASE_URL=http://localhost:8080 \
+APP_BASE_URL=http://localhost:8080 \
+API_BASE_URL=http://localhost:8080 \
+docker compose up --build -d postgres app
+```
 
 ## Management API
 
-The web console uses the JSON API under `/api` on `phenogram.io`; no separate OpenAPI document is generated in this MVP. The management API is intentionally unavailable on `api.phenogram.io`.
+The web console uses the JSON API under `/api` on `app.phenogram.io`; no separate OpenAPI document is generated in this MVP. The management API is intentionally unavailable on the landing and machine API hosts.
 
 | Area | Routes |
 | --- | --- |
@@ -76,7 +86,7 @@ The web console uses the JSON API under `/api` on `phenogram.io`; no separate Op
 | Bot View | `GET /api/bots/{bot_id}/conversations`, `GET /api/bots/{bot_id}/conversations/{chat_id}/messages`, `POST /api/bots/{bot_id}/messages` |
 | Delivery | `GET/POST /api/bots/{bot_id}/stream-keys`, `DELETE /api/bots/{bot_id}/stream-keys/{key_id}`, `POST /api/bots/{bot_id}/file-links`, `POST /api/bots/{bot_id}/routing` |
 
-Registration/login set an HTTP-only session cookie and return a CSRF token. Every other mutating management request requires that cookie plus `X-Phenogram-CSRF`. In production, all management mutations—including registration and login—also require an `Origin` equal to `WEB_BASE_URL` (`https://phenogram.io`); configure the base URL without a trailing slash.
+Registration/login set an HTTP-only session cookie and return a CSRF token. Every other mutating management request requires that cookie plus `X-Phenogram-CSRF`. In production, all management mutations—including registration and login—also require an `Origin` equal to `APP_BASE_URL` (`https://app.phenogram.io`); configure the base URL without a trailing slash.
 
 ## Point a bot at Phenogram
 
@@ -192,7 +202,7 @@ Routing migration is explicitly confirmed, serialized per bot, and invokes Teleg
 - Bot public IDs are keyed, stable pseudonyms; they are identifiers, not authorization.
 - Session cookies are `HttpOnly` and `SameSite=Strict`, with `Secure` enabled for production/HTTPS.
 - Mutating management requests require an exact-origin check plus `X-Phenogram-CSRF`.
-- Production separates browser and management traffic on `phenogram.io` from token-bearing and public machine routes on `api.phenogram.io`; both the edge and application reject routes on the wrong host.
+- Production separates the public landing page on `phenogram.io`, authenticated console and management traffic on `app.phenogram.io`, and token-bearing or public machine routes on `api.phenogram.io`; both the edge and application reject routes on the wrong host.
 - Registration/login use per-process limits of 30 attempts per source and eight per source/email over ten minutes, with four concurrent Argon2 jobs.
 - Upstream ingress requires Telegram's secret-token header and update IDs are deduplicated per bot.
 - Downstream webhook delivery disables inherited proxies, rejects non-global production addresses, resolves once per attempt, and pins the request to the validated addresses. Keep infrastructure egress policy as an additional control.

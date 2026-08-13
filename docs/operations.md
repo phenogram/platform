@@ -11,7 +11,7 @@ This guide describes the runtime that exists in this repository. It assumes a si
 | Caddy or equivalent | TLS, security headers, streaming reverse proxy, access-log redaction | Certificates/logs, depending on deployment |
 | Optional `telegram-bot-api` | Official local Telegram Bot API server for eligible plans | `telegram-bot-api-data` volume |
 
-The base Compose file contains PostgreSQL, the application, and Caddy. The application port is published only on loopback; Caddy publishes HTTP/HTTPS and reaches `app:8080` on the Compose network. `deploy/Caddyfile` reads `PHENOGRAM_WEB_DOMAIN` (default `localhost`) and `PHENOGRAM_API_DOMAIN` (default `api.localhost`) and enforces the same host split as production. Direct local access to port 8080 remains a supported one-origin development mode when `WEB_BASE_URL` and `API_BASE_URL` are identical. `compose.premium.yaml` is an optional overlay for the separate official Telegram service.
+The base Compose file contains PostgreSQL, the application, and Caddy. The application port is published only on loopback; Caddy publishes HTTP/HTTPS and reaches `app:8080` on the Compose network. `deploy/Caddyfile` reads `PHENOGRAM_LANDING_DOMAIN` (default `http://localhost`), `PHENOGRAM_APP_DOMAIN` (default `http://app.localhost`), and `PHENOGRAM_API_DOMAIN` (default `http://api.localhost`) and enforces the same three-host split as production. Direct local access to port 8080 remains a supported one-origin development mode when all three base URLs are `http://localhost:8080`; in that mode start only `postgres` and `app`, not Caddy. `compose.premium.yaml` is an optional overlay for the separate official Telegram service.
 
 Application startup is fail-fast: configuration is validated, PostgreSQL is connected, migrations are applied, background tasks are started, and only then is the HTTP listener bound. `SIGTERM` and `SIGINT` stop the HTTP server gracefully. A delivery interrupted after the lease is taken is marked retryable by the retention task once its five-minute lease expires.
 
@@ -21,8 +21,9 @@ Application startup is fail-fast: configuration is validated, PostgreSQL is conn
 | --- | --- | --- |
 | `APP_ENV` | `development` | Set exactly to `production` for HTTPS/config checks and secure cookies. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Compose overrides this with `0.0.0.0:8080`. |
-| `WEB_BASE_URL` | Required | Canonical browser origin without a trailing slash. Serves the landing page, console, management `/api/*`, and health endpoint. Must be HTTPS in production; browser `Origin` must match it exactly. Production value: `https://phenogram.io`. |
-| `API_BASE_URL` | Defaults to `WEB_BASE_URL` | Canonical machine origin without a trailing slash. Used for Telegram ingress, Telegram-compatible bot/file paths, SSE, and signed file URLs. Production requires a distinct HTTPS host. Production value: `https://api.phenogram.io`. |
+| `LANDING_BASE_URL` | Required | Canonical public landing origin without a trailing slash. Production value: `https://phenogram.io`. |
+| `APP_BASE_URL` | Required | Canonical authenticated console and management origin without a trailing slash. Browser `Origin` must match it exactly; health is served here. Production value: `https://app.phenogram.io`. |
+| `API_BASE_URL` | Required | Canonical machine origin without a trailing slash. Used for Telegram ingress, Telegram-compatible bot/file paths, SSE, and signed file URLs. Production value: `https://api.phenogram.io`. |
 | `DATABASE_URL` | Required | PostgreSQL connection URL. The pool uses 2–20 connections per app instance. |
 | `MASTER_KEY` | Required, at least 32 bytes | Encrypts bot tokens and webhook secrets after domain-separated derivation. |
 | `PUBLIC_ID_KEY` | Required, at least 32 bytes | Derives stable bot public IDs used for token lookup and public routes. |
@@ -34,8 +35,9 @@ Application startup is fail-fast: configuration is validated, PostgreSQL is conn
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between sweeps. Do not set to zero. |
 | `RUST_LOG` | application info | Structured stdout log filter. |
 | `POSTGRES_PASSWORD` | development default in Compose | Builds `DATABASE_URL` in the base stack. Never use the default in production. |
-| `PHENOGRAM_WEB_DOMAIN` | `localhost` in Compose | Caddy browser/management site address. Production value: `phenogram.io`. |
-| `PHENOGRAM_API_DOMAIN` | `api.localhost` in Compose | Caddy machine API site address. Production value: `api.phenogram.io`. |
+| `PHENOGRAM_LANDING_DOMAIN` | `http://localhost` in Compose | Caddy landing site address. Production value: `phenogram.io`. |
+| `PHENOGRAM_APP_DOMAIN` | `http://app.localhost` in Compose | Caddy console/management site address. Production value: `app.phenogram.io`. |
+| `PHENOGRAM_API_DOMAIN` | `http://api.localhost` in Compose | Caddy machine API site address. Production value: `api.phenogram.io`. |
 | `PHENOGRAM_HTTP_PORT`, `PHENOGRAM_HTTPS_PORT` | `80`, `443` | Published Caddy ports. |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Premium overlay only | Operator-owned Telegram application credentials for the official local server. |
 
@@ -44,8 +46,8 @@ Generate the three application keys independently. Store them and database crede
 ## Initial production deployment
 
 1. Provision a supported Docker host or equivalent orchestrator, durable PostgreSQL storage, encrypted backups, DNS, and inbound HTTPS.
-2. Copy `.env.example` to an untracked deployment secret file. Set `APP_ENV=production`, `WEB_BASE_URL=https://phenogram.io`, `API_BASE_URL=https://api.phenogram.io`, a strong database password, and three independent application keys.
-3. Set `PHENOGRAM_WEB_DOMAIN=phenogram.io` and `PHENOGRAM_API_DOMAIN=api.phenogram.io`, then expose the included Caddy service, or place an equivalent reverse proxy in front of `app:8080`. Preserve SSE streaming. The web host must reject machine routes; the API host must accept only `/bot*`, `/file[/...]`, `/telegram[/...]`, `/events[/...]`, and `/public[/...]`. The supplied Caddyfile enforces that split, enables compression and security headers, replaces the complete URI in access logs, and deletes cookie, authorization, Telegram secret, and CSRF headers from access logs.
+2. Copy `.env.example` to an untracked deployment secret file. Set `APP_ENV=production`, `LANDING_BASE_URL=https://phenogram.io`, `APP_BASE_URL=https://app.phenogram.io`, `API_BASE_URL=https://api.phenogram.io`, a strong database password, and three independent application keys.
+3. Set `PHENOGRAM_LANDING_DOMAIN=phenogram.io`, `PHENOGRAM_APP_DOMAIN=app.phenogram.io`, and `PHENOGRAM_API_DOMAIN=api.phenogram.io`, then expose the included Caddy service, or place an equivalent reverse proxy in front of `app:8080`. Preserve SSE streaming. The landing host may proxy only `/`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`; the app host must reject machine routes; the API host must accept only `/bot*`, `/file[/...]`, `/telegram[/...]`, `/events[/...]`, and `/public[/...]`. The supplied Caddyfile enforces that split, enables compression and security headers, replaces the complete URI in access logs, and deletes cookie, authorization, Telegram secret, and CSRF headers from access logs.
 4. Restrict direct access to port 8080 and PostgreSQL. Only the reverse proxy should reach the app; only the app and authorized operators should reach the database. The ingress must overwrite, not trust, client-supplied `X-Forwarded-For` and `X-Real-IP`; the bundled Caddyfile does this.
 5. Back up PostgreSQL before every upgrade that contains migrations.
 6. Build and start the base stack:
@@ -53,10 +55,10 @@ Generate the three application keys independently. Store them and database crede
    ```sh
    docker compose up --build -d
    docker compose ps
-   curl -fsS https://phenogram.io/api/health
+   curl -fsS https://app.phenogram.io/api/health
    ```
 
-7. Confirm the response is HTTP 200 with `status: "ok"` and `database: true`. Confirm `https://api.phenogram.io/` and `https://api.phenogram.io/api/health` both return 404, and that a machine route on `https://phenogram.io` returns 404. Then register a test account, connect a test bot, make a proxied `getMe` call through `api.phenogram.io`, deliver a real Telegram update, and confirm it appears in the update journal.
+7. Confirm the response is HTTP 200 with `status: "ok"` and `database: true`. Confirm the landing page loads at `https://phenogram.io/`, `https://phenogram.io/api/health` returns 404, a machine route on `https://app.phenogram.io` returns 404, and both `https://api.phenogram.io/` and `https://api.phenogram.io/api/health` return 404. Then register a test account at `app.phenogram.io`, connect a test bot, make a proxied `getMe` call through `api.phenogram.io`, deliver a real Telegram update, and confirm it appears in the update journal.
 
 The health endpoint checks PostgreSQL only. It does not prove reachability of Telegram, the downstream webhook, SSE fan-out, the optional local server, or disk headroom; keep those as separate checks.
 
@@ -73,7 +75,7 @@ The token-bearing compatibility route intentionally matches Telegram:
 
 Public SSE URLs contain a stream secret, and signed file URLs contain a reusable signature until expiry. Redact the complete request target—including query parameters—at every hop. The included Caddyfile replaces `request.uri` with `/redacted` and drops `Cookie`, `Authorization`, `X-Telegram-Bot-Api-Secret-Token`, and `X-Phenogram-CSRF`. If a CDN, ingress controller, APM agent, packet capture, or upstream application-error logger is added, verify its behavior with synthetic credentials before production use.
 
-Keep both public DNS names as direct, DNS-only records when using Cloudflare in front of this deployment. A proxy/CDN adds another request-log and buffering layer in front of token-bearing Bot API paths, signed URLs, and SSE. If an edge proxy is introduced later, first prove full-URI redaction, disabled buffering for SSE, large upload/download behavior, and forwarding-header overwrites with synthetic credentials.
+Keep all three public DNS names as direct, DNS-only records when using Cloudflare in front of this deployment. A proxy/CDN adds another request-log and buffering layer in front of token-bearing Bot API paths, signed URLs, and SSE. If an edge proxy is introduced later, first prove full-URI redaction, disabled buffering for SSE, large upload/download behavior, and forwarding-header overwrites with synthetic credentials.
 
 Do not log request bodies: updates and Bot API requests may contain personal data. Limit access to application logs because network errors can include destination context even when proxy access logs are scrubbed.
 
@@ -85,7 +87,7 @@ When a connected bot already has a Telegram webhook, its URL is used only in tha
 
 Minimum alerts:
 
-- `https://phenogram.io/api/health` is non-200 or reports `database: false`;
+- `https://app.phenogram.io/api/health` is non-200 or reports `database: false`;
 - application or PostgreSQL container is unhealthy/restarting;
 - sustained HTTP 5xx/502 responses;
 - elevated registration/login 429s or CPU saturation—the built-in limiter and four-slot Argon2 gate are per process;
@@ -247,10 +249,10 @@ The companion service is still an external operational dependency. The Rust appl
 
 ### Health is degraded or PostgreSQL is unavailable
 
-1. Stop rollouts and confirm whether `https://phenogram.io/api/health` is 503.
+1. Stop rollouts and confirm whether `https://app.phenogram.io/api/health` is 503.
 2. Inspect container health, PostgreSQL logs, storage capacity/inodes, connection count, and host pressure.
 3. Preserve logs and take a snapshot before repairing suspected corruption.
-4. Restore connectivity or fail over PostgreSQL, then verify migrations and `https://phenogram.io/api/health`.
+4. Restore connectivity or fail over PostgreSQL, then verify migrations and `https://app.phenogram.io/api/health`.
 5. Check delivery leases. Jobs left `delivering` are automatically returned to `failed` after five minutes by the retention task.
 6. Run a proxied test call and a real update ingress check; database health alone is insufficient.
 
@@ -299,7 +301,7 @@ The companion service is still an external operational dependency. The Rust appl
 
 ## Current production boundaries
 
-- `phenogram.io` is the browser, landing, console, management API, and health surface. `api.phenogram.io` is restricted to Telegram-compatible bot/file paths, Telegram ingress, SSE, and signed public downloads; it intentionally does not expose `/`, `/api/health`, or management endpoints.
+- `phenogram.io` is the public landing surface and exposes only `/`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`. `app.phenogram.io` owns the authenticated console, client routes, management API, and health. `api.phenogram.io` is restricted to Telegram-compatible bot/file paths, Telegram ingress, SSE, and signed public downloads; the landing and API hosts intentionally do not expose `/api/health` or management endpoints.
 - SSE is the only new subscription transport. Kafka, WebSockets, NATS, and similar brokers are not implemented.
 - Live SSE fan-out and its 256-global/four-per-key connection caps are process-local. Replay is durable but capped per connection at 5,000 rows, 8 MiB total, and roughly 2 MiB per event.
 - Downstream delivery uses four workers per app process. Stored `max_connections` is informational in this MVP.

@@ -210,7 +210,7 @@ pub async fn csrf_guard(
         .headers()
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .map(|origin| origin.trim_end_matches('/') == state.config.web_base_url)
+        .map(|origin| origin.trim_end_matches('/') == state.config.app_base_url)
         .unwrap_or(state.config.app_env != "production");
     if !origin_valid {
         return Err(AppError::Forbidden);

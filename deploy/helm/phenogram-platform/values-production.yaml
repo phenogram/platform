@@ -13,7 +13,8 @@ image:
 
 config:
   appEnv: production
-  webBaseUrl: https://phenogram.io
+  landingBaseUrl: https://phenogram.io
+  appBaseUrl: https://app.phenogram.io
   apiBaseUrl: https://api.phenogram.io
 
 secrets:
@@ -22,11 +23,16 @@ secrets:
 ingress:
   enabled: true
   className: traefik
-  web:
+  landing:
     host: phenogram.io
     tls:
       enabled: true
       secretName: phenogram-io-tls
+  app:
+    host: app.phenogram.io
+    tls:
+      enabled: true
+      secretName: app-phenogram-io-tls
   api:
     host: api.phenogram.io
     tls:

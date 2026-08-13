@@ -22,7 +22,21 @@
 	}
 }
 
-{$PHENOGRAM_WEB_DOMAIN:localhost} {
+{$PHENOGRAM_LANDING_DOMAIN:http://localhost} {
+	import phenogram_common
+
+	route {
+		@landing_surface path / /assets/app.css /assets/app.js /assets/runtime.js
+		reverse_proxy @landing_surface app:8080 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+		}
+
+		respond 404
+	}
+}
+
+{$PHENOGRAM_APP_DOMAIN:http://app.localhost} {
 	import phenogram_common
 
 	route {
@@ -36,7 +50,7 @@
 	}
 }
 
-{$PHENOGRAM_API_DOMAIN:api.localhost} {
+{$PHENOGRAM_API_DOMAIN:http://api.localhost} {
 	import phenogram_common
 
 	route {

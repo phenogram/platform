@@ -77,6 +77,7 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(web::index))
         .route("/assets/app.css", get(web::css))
         .route("/assets/app.js", get(web::js))
+        .route("/assets/runtime.js", get(web::runtime_js))
         .fallback(web::fallback)
         .layer(middleware::from_fn_with_state(
             state.clone(),

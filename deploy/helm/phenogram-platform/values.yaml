@@ -39,7 +39,8 @@ securityContext:
 config:
   appEnv: production
   listenAddr: 0.0.0.0:8080
-  webBaseUrl: https://phenogram.io
+  landingBaseUrl: https://phenogram.io
+  appBaseUrl: https://app.phenogram.io
   apiBaseUrl: https://api.phenogram.io
   telegramCloudApiUrl: https://api.telegram.org
   rustLog: phenogram_platform=info,tower_http=info
@@ -69,15 +70,21 @@ ingress:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    # Telegram's compatible route is /bot<TOKEN>/..., so require Traefik's
-    # character-prefix matcher instead of relying on Kubernetes segment rules.
+    # Applied only to the machine API Ingress by the template. Telegram's
+    # compatible route is /bot<TOKEN>/..., so it needs Traefik's character-
+    # prefix matcher instead of Kubernetes segment rules.
     traefik.ingress.kubernetes.io/router.pathmatcher: PathPrefix
     traefik.ingress.kubernetes.io/router.tls: "true"
-  web:
+  landing:
     host: phenogram.io
     tls:
       enabled: true
       secretName: phenogram-io-tls
+  app:
+    host: app.phenogram.io
+    tls:
+      enabled: true
+      secretName: app-phenogram-io-tls
   api:
     host: api.phenogram.io
     tls:

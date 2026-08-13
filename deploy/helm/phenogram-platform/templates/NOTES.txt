@@ -1,7 +1,8 @@
 Phenogram Platform was installed as release {{ .Release.Name }}.
 
-Developer console: {{ .Values.config.webBaseUrl }}
-Management health: {{ .Values.config.webBaseUrl }}/api/health
+Landing page: {{ .Values.config.landingBaseUrl }}
+Developer console: {{ .Values.config.appBaseUrl }}
+Management health: {{ .Values.config.appBaseUrl }}/api/health
 Telegram-compatible API: {{ .Values.config.apiBaseUrl }}
 
 The chart expects the existing Secrets {{ .Values.secrets.existingSecret }} and
