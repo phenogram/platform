@@ -16,6 +16,7 @@ pub struct AppState {
     pub db: PgPool,
     pub crypto: Arc<Crypto>,
     pub telegram: reqwest::Client,
+    pub oauth: reqwest::Client,
     pub events: EventBus,
     pub auth_limiter: AuthLimiter,
     pub stream_limiter: StreamLimiter,
@@ -35,11 +36,19 @@ impl AppState {
             &config.public_id_key,
             &config.link_signing_key,
         );
+        let oauth = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("Phenogram-Platform/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| crate::error::AppError::Config(error.to_string()))?;
         Ok(Self {
             config: Arc::new(config),
             db,
             crypto: Arc::new(crypto),
             telegram,
+            oauth,
             events: EventBus::default(),
             auth_limiter: AuthLimiter::default(),
             stream_limiter: StreamLimiter::default(),
@@ -107,20 +116,18 @@ impl StreamLimiter {
 #[derive(Clone)]
 pub struct AuthLimiter {
     attempts: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
-    hashing_slots: Arc<Semaphore>,
 }
 
 impl Default for AuthLimiter {
     fn default() -> Self {
         Self {
             attempts: Arc::new(Mutex::new(HashMap::new())),
-            hashing_slots: Arc::new(Semaphore::new(4)),
         }
     }
 }
 
 impl AuthLimiter {
-    pub async fn check(&self, source: &str, email: &str) -> crate::error::Result<()> {
+    pub async fn check(&self, source: &str, identity: &str) -> crate::error::Result<()> {
         const WINDOW: Duration = Duration::from_secs(10 * 60);
         let now = Instant::now();
         let mut attempts = self.attempts.lock().await;
@@ -135,7 +142,7 @@ impl AuthLimiter {
         });
         for (key, limit) in [
             (format!("source:{source}"), 30_usize),
-            (format!("source-email:{source}:{email}"), 8_usize),
+            (format!("source-identity:{source}:{identity}"), 8_usize),
         ] {
             let entries = attempts.entry(key).or_default();
             if entries.len() >= limit {
@@ -144,13 +151,6 @@ impl AuthLimiter {
             entries.push_back(now);
         }
         Ok(())
-    }
-
-    pub fn hashing_slot(&self) -> crate::error::Result<OwnedSemaphorePermit> {
-        self.hashing_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| crate::error::AppError::RateLimited)
     }
 }
 

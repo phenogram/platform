@@ -2,7 +2,7 @@ use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use crate::error::{AppError, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub app_env: String,
     pub listen_addr: SocketAddr,
@@ -12,6 +12,10 @@ pub struct Config {
     pub app_base_url: String,
     /// Telegram-compatible, webhook, event stream, and public file origin.
     pub api_base_url: String,
+    pub google_oauth_client_id: Option<String>,
+    pub google_oauth_client_secret: Option<String>,
+    pub github_oauth_client_id: Option<String>,
+    pub github_oauth_client_secret: Option<String>,
     pub database_url: String,
     pub master_key: String,
     pub public_id_key: String,
@@ -66,6 +70,10 @@ impl Config {
             landing_base_url,
             app_base_url,
             api_base_url,
+            google_oauth_client_id: optional("GOOGLE_OAUTH_CLIENT_ID"),
+            google_oauth_client_secret: optional("GOOGLE_OAUTH_CLIENT_SECRET"),
+            github_oauth_client_id: optional("GITHUB_OAUTH_CLIENT_ID"),
+            github_oauth_client_secret: optional("GITHUB_OAUTH_CLIENT_SECRET"),
             database_url: required("DATABASE_URL")?,
             master_key: required("MASTER_KEY")?,
             public_id_key: required("PUBLIC_ID_KEY")?,
@@ -115,6 +123,18 @@ impl Config {
                 }
             }
         }
+        validate_oauth_credentials(
+            "Google",
+            self.google_oauth_client_id.as_deref(),
+            self.google_oauth_client_secret.as_deref(),
+            production,
+        )?;
+        validate_oauth_credentials(
+            "GitHub",
+            self.github_oauth_client_id.as_deref(),
+            self.github_oauth_client_secret.as_deref(),
+            production,
+        )?;
         for (name, secret) in [
             ("MASTER_KEY", &self.master_key),
             ("PUBLIC_ID_KEY", &self.public_id_key),
@@ -255,6 +275,25 @@ fn parse_u64(name: &str, fallback: u64) -> Result<u64> {
         .unwrap_or(Ok(fallback))
 }
 
+fn validate_oauth_credentials(
+    provider: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+    required_in_environment: bool,
+) -> Result<()> {
+    if client_id.is_some() != client_secret.is_some() {
+        return Err(AppError::Config(format!(
+            "{provider} OAuth client ID and secret must be configured together"
+        )));
+    }
+    if required_in_environment && client_id.is_none() {
+        return Err(AppError::Config(format!(
+            "{provider} OAuth credentials are required in production"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_api_origin(name: &str, value: &str, require_https: bool) -> Result<()> {
     let parsed = url::Url::parse(value)
         .map_err(|error| AppError::Config(format!("invalid {name}: {error}")))?;
@@ -334,6 +373,7 @@ fn is_machine_path(path: &str) -> bool {
 
 fn is_landing_path(path: &str) -> bool {
     path == "/"
+        || path == "/privacy"
         || matches!(
             path,
             "/assets/app.css" | "/assets/app.js" | "/assets/runtime.js"
@@ -353,6 +393,10 @@ mod tests {
             landing_base_url: landing.into(),
             app_base_url: app.into(),
             api_base_url: api.into(),
+            google_oauth_client_id: Some("google-client-id".into()),
+            google_oauth_client_secret: Some("google-client-secret".into()),
+            github_oauth_client_id: Some("github-client-id".into()),
+            github_oauth_client_secret: Some("github-client-secret".into()),
             database_url: "postgresql://phenogram:password@localhost/phenogram".into(),
             master_key: "m".repeat(32),
             public_id_key: "p".repeat(32),
@@ -414,6 +458,10 @@ mod tests {
         assert_eq!(
             config.public_request_access(Some("phenogram.io"), "/api/plans"),
             PublicRequestAccess::WrongSurface
+        );
+        assert_eq!(
+            config.public_request_access(Some("phenogram.io"), "/privacy"),
+            PublicRequestAccess::Allowed
         );
         assert_eq!(
             config.public_request_access(Some("phenogram.io"), "/bot123:getMe"),

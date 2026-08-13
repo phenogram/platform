@@ -56,6 +56,10 @@ secrets:
   masterKeyKey: MASTER_KEY
   publicIdKeyKey: PUBLIC_ID_KEY
   linkSigningKeyKey: LINK_SIGNING_KEY
+  googleOauthClientIdKey: GOOGLE_OAUTH_CLIENT_ID
+  googleOauthClientSecretKey: GOOGLE_OAUTH_CLIENT_SECRET
+  githubOauthClientIdKey: GITHUB_OAUTH_CLIENT_ID
+  githubOauthClientSecretKey: GITHUB_OAUTH_CLIENT_SECRET
   telegramApiIdKey: TELEGRAM_API_ID
   telegramApiHashKey: TELEGRAM_API_HASH
 

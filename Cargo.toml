@@ -7,7 +7,6 @@ description = "Telegram Bot API-compatible gateway and operations platform"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-argon2 = "0.5.3"
 async-stream = "0.3.6"
 axum = { version = "0.8.4", features = ["macros", "multipart"] }
 base64 = "0.22.1"

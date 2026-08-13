@@ -3,33 +3,57 @@ set -euo pipefail
 
 base_url="${PHENOGRAM_E2E_URL:-http://127.0.0.1:18080}"
 mock_url="${PHENOGRAM_MOCK_URL:-http://127.0.0.1:18081}"
-cookie_jar="$(mktemp /private/tmp/phenogram-e2e-cookies.XXXXXX)"
-trap 'rm -f "$cookie_jar"' EXIT
+database_url="${PHENOGRAM_E2E_DATABASE_URL:?Set PHENOGRAM_E2E_DATABASE_URL}"
 
-email="e2e-$(date +%s)@example.test"
-password="correct-horse-battery-staple"
+identity_subject="e2e-$(date +%s)-$$"
+session_token="$(openssl rand -hex 32)"
+auth_cookie="phg_session=$session_token"
 bot_token="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+
+cleanup() {
+  psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null || true
+DELETE FROM users
+ WHERE id IN (
+    SELECT user_id FROM oauth_identities
+     WHERE provider = 'github' AND provider_subject = :'subject'
+ );
+SQL
+}
+trap cleanup EXIT
 
 # Keep repeated local runs independent from prior mock deliveries/webhooks.
 curl -fsS -X POST "$mock_url/__reset" | jq -e '.ok == true' >/dev/null
 
-# The test bot is a singleton by design. Clear only prior disposable E2E owners.
-if [[ -n "${PHENOGRAM_E2E_DATABASE_URL:-}" ]]; then
-  psql "$PHENOGRAM_E2E_DATABASE_URL" -v ON_ERROR_STOP=1 \
-    -c "DELETE FROM users WHERE email LIKE 'e2e-%@example.test'" >/dev/null
-fi
-
 health="$(curl -fsS "$base_url/api/health")"
 jq -e '.status == "ok" and .database == true' <<<"$health" >/dev/null
 
-session="$(curl -fsS -c "$cookie_jar" \
-  -H 'content-type: application/json' \
-  -d "{\"email\":\"$email\",\"password\":\"$password\"}" \
-  "$base_url/api/auth/register")"
+# Provider callbacks are exercised separately against the real providers. This
+# service-level test seeds the same provider/user/session rows directly so it
+# remains deterministic and never needs an OAuth client secret.
+psql "$database_url" -v ON_ERROR_STOP=1 \
+  -v subject="$identity_subject" -v session_token="$session_token" <<'SQL' >/dev/null
+WITH new_user AS (
+    INSERT INTO users DEFAULT VALUES RETURNING id
+), new_identity AS (
+    INSERT INTO oauth_identities
+        (user_id, provider, provider_subject, display_name, provider_login)
+    SELECT id, 'github', :'subject', 'Phenogram E2E', 'phenogram-e2e'
+      FROM new_user
+    RETURNING id, user_id
+), new_membership AS (
+    INSERT INTO memberships (user_id, plan_id, status)
+    SELECT user_id, 'free', 'active' FROM new_identity
+)
+INSERT INTO sessions (user_id, identity_id, token_hash, expires_at)
+SELECT user_id, id, digest(:'session_token', 'sha256'), now() + interval '1 hour'
+  FROM new_identity;
+SQL
+
+session="$(curl -fsS -b "$auth_cookie" "$base_url/api/me")"
 csrf="$(jq -er '.csrf_token' <<<"$session")"
 jq -e '.membership.plan_id == "free" and .membership.bot_limit == 1' <<<"$session" >/dev/null
 
-connected="$(curl -fsS -b "$cookie_jar" \
+connected="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d "{\"token\":\"$bot_token\",\"accept_webhook_takeover\":true}" \
@@ -108,24 +132,24 @@ proxied="$(curl -fsS \
   "$base_url/bot$bot_token/sendMessage")"
 jq -e '.ok == true and .result.text == "proxied response"' <<<"$proxied" >/dev/null
 
-operator_reply="$(curl -fsS -b "$cookie_jar" \
+operator_reply="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d '{"chat_id":99,"text":"operator response"}' \
   "$base_url/api/bots/$bot_id/messages")"
 jq -e '.ok == true and .result.text == "operator response"' <<<"$operator_reply" >/dev/null
 
-updates="$(curl -fsS -b "$cookie_jar" "$base_url/api/bots/$bot_id/updates?limit=10")"
+updates="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/updates?limit=10")"
 jq -e '.updates | any(.update_id == 7001 and .event_type == "message" and .chat_id == 99)' <<<"$updates" >/dev/null
 
-conversations="$(curl -fsS -b "$cookie_jar" "$base_url/api/bots/$bot_id/conversations")"
+conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations")"
 jq -e '.conversations[0].chat_id == 99 and .conversations[0].last_message_preview == "You: operator response"' <<<"$conversations" >/dev/null
 
-timeline="$(curl -fsS -b "$cookie_jar" "$base_url/api/bots/$bot_id/conversations/99/messages")"
+timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/99/messages")"
 jq -e '[.messages[].direction] | contains(["incoming"]) and contains(["outgoing"])' <<<"$timeline" >/dev/null
 jq -e '[.messages[].text] | contains(["hello from the e2e test"]) and contains(["operator response"]) and contains(["proxied response"])' <<<"$timeline" >/dev/null
 
-stream="$(curl -fsS -b "$cookie_jar" \
+stream="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d '{"name":"E2E consumer"}' \
@@ -135,7 +159,7 @@ stream_data="$(curl -sS --max-time 2 "$stream_url?after=0" 2>/dev/null || true)"
 grep -q 'event: update' <<<"$stream_data"
 grep -q '"update_id":7001' <<<"$stream_data"
 
-file_link="$(curl -fsS -b "$cookie_jar" \
+file_link="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d '{"file_path":"documents/test file.txt","expires_in_seconds":300}' \
@@ -143,19 +167,19 @@ file_link="$(curl -fsS -b "$cookie_jar" \
 file_url="$(jq -er '.url' <<<"$file_link")"
 test "$(curl -fsS "$file_url")" = "phenogram-test-file"
 
-activity="$(curl -fsS -b "$cookie_jar" "$base_url/api/bots/$bot_id/activity")"
+activity="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/activity")"
 jq -e '[.activity[].source] | contains(["proxy"]) and contains(["bot_view"])' <<<"$activity" >/dev/null
 
-me="$(curl -fsS -b "$cookie_jar" "$base_url/api/me")"
-jq -e --arg email "$email" '.user.email == $email and .membership.retention_days == 30' <<<"$me" >/dev/null
+me="$(curl -fsS -b "$auth_cookie" "$base_url/api/me")"
+jq -e '.user.provider == "github" and .user.provider_login == "phenogram-e2e" and (.user | has("email") | not) and .membership.retention_days == 30' <<<"$me" >/dev/null
 
 # Bot deletion must first clean up Telegram's managed ingress webhook.
-curl -fsS -X DELETE -b "$cookie_jar" \
+curl -fsS -X DELETE -b "$auth_cookie" \
   -H "x-phenogram-csrf: $csrf" \
   "$base_url/api/bots/$bot_id" | jq -e '.ok == true' >/dev/null
 curl -fsS "$mock_url/__state" \
   | jq -e '.calls | any(.method == "deleteWebhook")' >/dev/null
-curl -fsS -b "$cookie_jar" "$base_url/api/bots" \
+curl -fsS -b "$auth_cookie" "$base_url/api/bots" \
   | jq -e --arg bot_id "$bot_id" '.bots | map(.id) | index($bot_id) | not' >/dev/null
 
 printf 'Phenogram E2E passed: auth, bot ownership, proxy, update journal, polling, SSE, Bot View, and signed file access.\n'

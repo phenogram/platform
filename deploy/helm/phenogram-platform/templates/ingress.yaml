@@ -34,6 +34,13 @@ spec:
                 name: {{ $fullname }}
                 port:
                   name: http
+          - path: /privacy
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: http
           - path: /assets
             pathType: Prefix
             backend:

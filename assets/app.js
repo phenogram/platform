@@ -14,6 +14,7 @@
   const surface = ["landing", "app", "combined"].includes(runtime.surface) ? runtime.surface : "combined";
   const appHref = (path = "/") => `${String(runtime.appBaseUrl || window.location.origin).replace(/\/$/, "")}/#${path.startsWith("/") ? path : `/${path}`}`;
   const landingHref = (anchor = "") => `${String(runtime.landingBaseUrl || window.location.origin).replace(/\/$/, "")}/${anchor ? `#${anchor.replace(/^#/, "")}` : ""}`;
+  const privacyHref = () => `${String(runtime.landingBaseUrl || window.location.origin).replace(/\/$/, "")}/privacy`;
 
   const state = {
     phase: "booting",
@@ -46,6 +47,7 @@
     requestSequence: 0,
     requestTickets: {},
     modalReturnFocus: null,
+    authError: null,
   };
 
   const icon = (name, className = "") =>
@@ -61,6 +63,22 @@
   const initials = (value) => {
     const parts = String(value || "Bot").trim().split(/\s+/).filter(Boolean);
     return esc(parts.slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "B");
+  };
+
+  const nonEmailIdentity = (value) => {
+    const text = String(value || "").trim();
+    return text && !/\S+@\S+\.\S+/.test(text) ? text : "";
+  };
+
+  const userProvider = () => String(state.user?.provider || "").trim().toLowerCase();
+  const userProviderLabel = () => ({ github: "GitHub", google: "Google" })[userProvider()] || "Social account";
+  const userDisplayName = () => [state.user?.display_name, state.user?.provider_login]
+    .map(nonEmailIdentity)
+    .find(Boolean) || `${userProviderLabel()} user`;
+  const userProviderLogin = () => nonEmailIdentity(state.user?.provider_login);
+  const userIdentityMeta = () => {
+    const login = userProviderLogin().replace(/^@/, "");
+    return login ? `@${login} on ${userProviderLabel()}` : `Signed in with ${userProviderLabel()}`;
   };
 
   const unwrap = (payload, key) => {
@@ -84,7 +102,7 @@
   const api = async (path, options = {}) => {
     const headers = { Accept: "application/json", ...(options.headers || {}) };
     const method = String(options.method || "GET").toUpperCase();
-    if (!["GET", "HEAD", "OPTIONS"].includes(method) && state.csrfToken && !path.endsWith("/auth/register") && !path.endsWith("/auth/login")) {
+    if (!["GET", "HEAD", "OPTIONS"].includes(method) && state.csrfToken) {
       headers["X-Phenogram-CSRF"] = state.csrfToken;
     }
     let body = options.body;
@@ -221,11 +239,15 @@
   const botPath = (id, section = "overview") => `#/bots/${encodeURIComponent(id)}/${section}`;
 
   const parseRoute = () => {
-    const raw = window.location.hash.replace(/^#/, "") || "/";
+    if (window.location.pathname.replace(/\/+$/, "") === "/privacy") return { name: "privacy", params: {} };
+    const raw = (window.location.hash.replace(/^#/, "") || "/").split("?", 1)[0];
     if (!raw.startsWith("/")) return { name: "landing", params: { anchor: raw } };
-    const parts = raw.split("/").filter(Boolean).map(decodeURIComponent);
+    const parts = raw.split("/").filter(Boolean).map((part) => {
+      try { return decodeURIComponent(part); } catch (_) { return ""; }
+    });
     if (!parts.length) return { name: "landing", params: {} };
-    if (parts[0] === "login" || parts[0] === "register") return { name: "auth", params: { mode: parts[0] } };
+    if (parts[0] === "login") return { name: "auth", params: {} };
+    if (parts[0] === "privacy") return { name: "privacy", params: {} };
     if (parts[0] === "overview") return { name: "overview", params: {} };
     if (parts[0] === "bots" && !parts[1]) return { name: "bots", params: {} };
     if (parts[0] === "bots" && parts[1]) {
@@ -235,6 +257,34 @@
     if (parts[0] === "billing") return { name: "billing", params: {} };
     if (parts[0] === "settings") return { name: "settings", params: {} };
     return { name: state.user ? "overview" : "landing", params: {} };
+  };
+
+  const consumeOAuthError = () => {
+    const url = new URL(window.location.href);
+    const hashParts = url.hash.replace(/^#/, "").split("?");
+    const hashPath = hashParts.shift() || "";
+    const hashParams = new URLSearchParams(hashParts.join("?"));
+    const keys = ["oauth_error", "error", "error_code", "error_description", "provider"];
+    const read = (key) => hashParams.get(key) || url.searchParams.get(key) || "";
+    const code = String(read("oauth_error") || read("error_code") || read("error")).trim().toLowerCase();
+    if (!code) return null;
+
+    const message = ["access_denied", "cancelled", "canceled", "user_cancelled"].includes(code)
+      ? "Sign-in was cancelled. Choose a provider when you’re ready."
+      : ["state_mismatch", "invalid_state", "expired_state", "expired"].includes(code)
+        ? "That sign-in attempt expired. Please try again."
+        : ["provider_not_configured", "oauth_not_configured", "temporarily_unavailable"].includes(code)
+          ? "That sign-in provider is temporarily unavailable. Try the other provider or try again later."
+          : "We couldn’t complete social sign-in. Please try again.";
+
+    keys.forEach((key) => {
+      hashParams.delete(key);
+      url.searchParams.delete(key);
+    });
+    const remainingHashQuery = hashParams.toString();
+    url.hash = hashPath ? `#${hashPath}${remainingHashQuery ? `?${remainingHashQuery}` : ""}` : "";
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    return message;
   };
 
   const navigate = (path) => {
@@ -323,6 +373,7 @@
   };
 
   async function bootstrap() {
+    state.authError = consumeOAuthError();
     state.route = parseRoute();
     if (surface === "landing") {
       state.phase = "guest";
@@ -336,7 +387,6 @@
       state.user = unwrap(payload, "user") || payload?.user || null;
       state.membership = unwrap(payload, "membership") || payload?.membership || null;
       state.csrfToken = payload?.csrf_token || null;
-      if (!state.user && payload?.email) state.user = payload;
       state.phase = state.user ? "ready" : "guest";
     } catch (error) {
       if (error.status !== 401) state.errors.session = errorMessage(error);
@@ -545,8 +595,11 @@
     }
 
     if (!state.user) {
-      if (surface === "landing") state.route = { name: "landing", params: state.route.params };
-      else if (surface === "app" || !['landing', 'auth'].includes(state.route.name)) state.route = { name: "auth", params: { mode: "login" } };
+      if (surface === "landing") {
+        if (state.route.name !== "privacy") state.route = { name: "landing", params: state.route.params };
+      } else if (!(surface === "combined" && state.route.name === "privacy") && (surface === "app" || !["landing", "auth"].includes(state.route.name))) {
+        state.route = { name: "auth", params: {} };
+      }
       render();
       if (state.route.params.anchor) window.setTimeout(() => document.getElementById(state.route.params.anchor)?.scrollIntoView(), 10);
       return;
@@ -577,9 +630,8 @@
   function render() {
     if (state.phase === "booting") return;
     if (!state.user) {
-      app.innerHTML = surface === "landing" || (surface === "combined" && state.route.name !== "auth")
-        ? renderLanding()
-        : renderAuth(state.route.params.mode || "login");
+      const publicSurface = surface === "landing" || (surface === "combined" && state.route.name !== "auth");
+      app.innerHTML = state.route.name === "privacy" && publicSurface ? renderPrivacy() : publicSurface ? renderLanding() : renderAuth();
       document.body.classList.remove("console-open");
     } else {
       app.innerHTML = renderApp();
@@ -600,7 +652,7 @@
           </nav>
           <div class="landing__actions">
             <a class="btn btn--dark-ghost" href="${esc(appHref("/login"))}">Sign in</a>
-            <a class="btn btn--white" href="${esc(appHref("/register"))}">Start free ${icon("arrow")}</a>
+            <a class="btn btn--white" href="${esc(appHref("/login"))}">Start free ${icon("arrow")}</a>
           </div>
         </header>
 
@@ -610,7 +662,7 @@
             <h1>Telegram bots,<br><em>finally observable.</em></h1>
             <p class="hero__lead">Keep the Bot API your code already knows. Add durable updates, real-time debugging, safer file access, and an operator view—with one endpoint change.</p>
             <div class="hero__actions">
-              <a class="btn btn--white btn--lg" href="${esc(appHref("/register"))}">Connect your first bot ${icon("arrow")}</a>
+              <a class="btn btn--white btn--lg" href="${esc(appHref("/login"))}">Connect your first bot ${icon("arrow")}</a>
               <a class="btn btn--dark-ghost btn--lg" href="#workflow">See the 2-minute setup</a>
             </div>
             <p class="hero__note">Free forever for one bot · 30-day update history · No card required</p>
@@ -663,32 +715,46 @@
           <div class="security-copy"><p class="eyebrow">Designed for sensitive credentials</p><h2>Your token proves ownership. It never becomes product UI.</h2><p>Phenogram verifies a bot server-side, encrypts the token at rest, and redacts credentials from request history. Public bot keys identify; they never authorize API calls.</p><div class="security-list"><div>${icon("check")}Encrypted token storage</div><div>${icon("check")}Expiring, scoped file links</div><div>${icon("check")}Audited operator actions</div><div>${icon("check")}Explicit bot deletion controls</div></div></div>
         </div></section>
 
-        <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="${esc(appHref("/register"))}">Start with one free bot ${icon("arrow")}</a></section>
-        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="${esc(landingHref())}"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
+        <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="${esc(appHref("/login"))}">Start with one free bot ${icon("arrow")}</a></section>
+        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="${esc(landingHref())}"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="${esc(privacyHref())}">Privacy</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
       </main>`;
   }
 
-  function landingPrice(name, price, copy, features, featured) {
-    return `<article class="price-card ${featured ? "price-card--featured" : ""}">${featured ? '<span class="price-card__tag">Most popular</span>' : ""}<h3>${esc(name)}</h3><div class="price-card__price">${esc(price)}${price !== "$0" ? "<span> / month</span>" : ""}</div><p>${esc(copy)}</p><ul class="price-list">${features.map((feature) => `<li>${icon("check")}${esc(feature)}</li>`).join("")}</ul><a class="btn ${featured ? "btn--primary" : "btn--secondary"} btn--block" href="${esc(appHref("/register"))}">Start free</a></article>`;
+  function renderPrivacy() {
+    return `<main class="privacy-page" id="main-content" tabindex="-1">
+      <header class="privacy-header"><a class="brand" href="${esc(landingHref())}" aria-label="Phenogram home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a><a class="btn btn--dark-ghost" href="${esc(landingHref())}">${icon("arrow")} Back to Phenogram</a></header>
+      <article class="privacy-document">
+        <p class="eyebrow">Privacy</p><h1>Minimal identity, by design.</h1><p class="privacy-lead">Phenogram uses Google or GitHub only to recognize your account. We do not request, receive, or store your email address.</p>
+        <section><h2>Identity data we use</h2><p>When you choose social sign-in, we store the provider name, its stable account identifier, and the public profile fields needed to show your identity in the console: display name, username, and avatar URL. Your provider password is never shared with Phenogram.</p></section>
+        <section><h2>Why we use it</h2><p>The stable provider identifier lets us return you to the same Phenogram workspace. Public profile fields make that account recognizable to you. We do not use this data for advertising or sell it.</p></section>
+        <section><h2>Operational data</h2><p>Phenogram stores the bot configuration, updates, API activity, and operator actions needed to provide the platform. Bot tokens are encrypted at rest. Retention depends on the selected membership plan.</p></section>
+        <section><h2>Deletion</h2><p>You can delete individual bots and their Phenogram data from the console. Account-deletion support is handled through the public project until an in-app deletion control is available.</p></section>
+        <section><h2>Open development</h2><p>Phenogram is developed publicly. Privacy questions and account-deletion requests can be submitted through the <a href="https://github.com/phenogram/platform/issues" target="_blank" rel="noreferrer">Phenogram platform issue tracker</a>. Do not include bot tokens or other secrets in a public issue.</p></section>
+        <p class="privacy-updated">Effective August 13, 2026</p>
+      </article>
+    </main>`;
   }
 
-  function renderAuth(mode = "login") {
-    const register = mode === "register";
+  function landingPrice(name, price, copy, features, featured) {
+    return `<article class="price-card ${featured ? "price-card--featured" : ""}">${featured ? '<span class="price-card__tag">Most popular</span>' : ""}<h3>${esc(name)}</h3><div class="price-card__price">${esc(price)}${price !== "$0" ? "<span> / month</span>" : ""}</div><p>${esc(copy)}</p><ul class="price-list">${features.map((feature) => `<li>${icon("check")}${esc(feature)}</li>`).join("")}</ul><a class="btn ${featured ? "btn--primary" : "btn--secondary"} btn--block" href="${esc(appHref("/login"))}">Start free</a></article>`;
+  }
+
+  function renderAuth() {
     return `<main class="auth-screen" id="main-content" tabindex="-1">
       <section class="auth-panel">
         <a class="brand" href="${esc(landingHref())}"><span class="brand-mark brand-mark--primary"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
         <div class="auth-panel__body">
-          <p class="eyebrow">${register ? "Create your workspace" : "Developer console"}</p>
-          <h1>${register ? "Start building clearly." : "Welcome back."}</h1>
-          <p class="auth-panel__lead">${register ? "One bot and 30 days of update history are free. No card required." : "Sign in to monitor bots, inspect updates, and operate conversations."}</p>
-          ${state.errors.session ? `<p class="form-error">${esc(state.errors.session)}</p>` : ""}
-          <form class="form-stack" id="auth-form" data-mode="${register ? "register" : "login"}" novalidate>
-            <div class="field"><label for="auth-email">Email address</label><div class="input-wrap">${icon("user")}<input id="auth-email" name="email" type="email" inputmode="email" autocomplete="email" placeholder="you@company.com" required></div></div>
-            <div class="field"><div class="field__row"><label for="auth-password">Password</label>${register ? '<span class="field__hint">12 characters minimum</span>' : ""}</div><div class="input-wrap">${icon("lock")}<input id="auth-password" name="password" type="password" autocomplete="${register ? "new-password" : "current-password"}" minlength="${register ? "12" : "1"}" placeholder="••••••••••••" required></div></div>
-            <div data-form-error aria-live="polite"></div>
-            <button class="btn btn--primary btn--lg btn--block" type="submit">${register ? "Create free account" : "Sign in"} ${icon("arrow")}</button>
-          </form>
-          <p class="auth-switch">${register ? "Already have an account?" : "New to Phenogram?"} <button type="button" data-action="switch-auth" data-mode="${register ? "login" : "register"}">${register ? "Sign in" : "Create a free account"}</button></p>
+          <p class="eyebrow">Developer console</p>
+          <h1>Continue to Phenogram.</h1>
+          <p class="auth-panel__lead">Use Google or GitHub to sign in. Your free workspace is created automatically the first time.</p>
+          ${state.authError || state.errors.session ? `<div class="auth-error" role="alert">${icon("alert")}<span>${esc(state.authError || state.errors.session)}</span></div>` : ""}
+          <div class="oauth-stack" role="group" aria-label="Social sign-in options">
+            <a class="oauth-button oauth-button--google" href="${API}/auth/oauth/google/start"><svg class="social-icon" aria-hidden="true"><use href="#i-google"></use></svg><span>Continue with Google</span></a>
+            <a class="oauth-button oauth-button--github" href="${API}/auth/oauth/github/start"><svg class="social-icon" aria-hidden="true"><use href="#i-github"></use></svg><span>Continue with GitHub</span></a>
+          </div>
+          <div class="auth-privacy">${icon("shield")}<p><strong>No email requested or stored.</strong> Phenogram receives only the provider identity needed to recognize your account, plus your public display name and username.</p></div>
+          <p class="auth-fineprint">By continuing, you authorize the selected provider to confirm your identity. Phenogram never receives your provider password.</p>
+          <p class="auth-policy"><a href="${esc(privacyHref())}">Read the privacy policy</a></p>
         </div>
       </section>
       <aside class="auth-side" aria-hidden="true"><div class="auth-side__content"><p class="eyebrow">Bot operations, made legible</p><h2>Every update has a story.</h2><p>Phenogram keeps the payload, delivery path, API activity, and conversation context together—so production debugging starts with evidence.</p><div class="auth-quote"><span class="auth-quote__event">update.message</span> received<br><span class="auth-quote__delivery">delivery.webhook</span> 200 OK · 36 ms<br><span class="auth-quote__trace">trace</span> phg_01J8F9…</div></div></aside>
@@ -729,7 +795,7 @@
   function renderSidebar(bot) {
     const route = state.route.name;
     const routeActive = (...names) => names.includes(route) ? "active" : "";
-    const email = state.user?.email || state.user?.name || "Account";
+    const identity = userDisplayName();
     return `<aside class="sidebar" id="app-sidebar" aria-label="Application navigation">
       <a class="brand sidebar__brand" href="#/overview"><span class="brand-mark"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
       <button class="bot-switcher" type="button" data-action="open-bot-picker" aria-label="Switch bot">
@@ -741,7 +807,7 @@
       ${bot ? `<p class="sidebar__section-label">Selected bot</p><nav class="side-nav"><a class="${routeActive("bot-overview")}" href="${botPath(botId(bot), "overview")}">${icon("pulse")}Health & activity</a><a class="${routeActive("bot-view")}" href="${botPath(botId(bot), "view")}">${icon("message")}Bot View</a><a class="${routeActive("bot-updates")}" href="${botPath(botId(bot), "updates")}">${icon("terminal")}Update log</a><a class="${routeActive("bot-integration")}" href="${botPath(botId(bot), "integration")}">${icon("link")}Delivery & API</a></nav>` : ""}
       <p class="sidebar__section-label">Manage</p>
       <nav class="side-nav"><a class="${routeActive("billing")}" href="#/billing">${icon("card")}Usage & billing</a><a class="${routeActive("settings", "bot-settings")}" href="#/settings">${icon("settings")}Settings</a></nav>
-      <div class="sidebar__footer"><button class="account-chip" type="button" data-action="logout"><span class="account-chip__avatar">${initials(email)}</span><span class="account-chip__copy"><strong>${esc(email)}</strong><span>${esc(membershipPlan())} plan</span></span>${icon("logout")}</button></div>
+      <div class="sidebar__footer"><button class="account-chip" type="button" data-action="logout"><span class="account-chip__avatar">${initials(identity)}</span><span class="account-chip__copy"><strong>${esc(identity)}</strong><span>${esc(userProviderLabel())} · ${esc(membershipPlan())} plan</span></span>${icon("logout")}</button></div>
     </aside>`;
   }
 
@@ -1037,11 +1103,11 @@
   }
 
   function renderSettings() {
-    const email = state.user?.email || "—";
+    const identity = userDisplayName();
     const bot = currentBot();
     return `<div class="page page--narrow">
       ${pageHeader("Settings", "Manage your account and the currently selected bot.")}
-      <section class="panel"><div class="panel__head"><div><h2>Account</h2><p>Your Phenogram workspace identity</p></div></div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Email address</h3><p>Used to sign in to this workspace.</p></div><div class="identity-card"><span class="account-chip__avatar">${initials(email)}</span><div><strong>${esc(email)}</strong><span>${esc(membershipPlan())} membership</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Session</h3><p>End the current browser session securely.</p></div><div><button class="btn btn--secondary" type="button" data-action="logout">${icon("logout")}Sign out</button></div></div></div></section>
+      <section class="panel"><div class="panel__head"><div><h2>Account</h2><p>Your Phenogram workspace identity</p></div></div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Social identity</h3><p>Authenticated by your provider without sharing an email address.</p></div><div class="identity-card"><span class="account-chip__avatar">${initials(identity)}</span><div><strong>${esc(identity)}</strong><span>${esc(userIdentityMeta())} · ${esc(membershipPlan())} membership</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Privacy</h3><p>Phenogram does not request or store your email address.</p></div><div class="form-note">${icon("shield")}Only the provider’s stable account identifier and the public identity shown above are kept for sign-in.</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Session</h3><p>End the current browser session securely.</p></div><div><button class="btn btn--secondary" type="button" data-action="logout">${icon("logout")}Sign out</button></div></div></div></section>
       ${bot ? `<section class="panel panel--spaced"><div class="panel__head"><div><h2>Selected bot</h2><p>Ownership and data controls for ${esc(botName(bot))}</p></div><a class="btn btn--secondary btn--sm" href="${botPath(botId(bot), "settings")}">Manage bot ${icon("chevron")}</a></div><div class="panel__body"><div class="identity-card"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><div><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></div></div></div></section>` : ""}
     </div>`;
   }
@@ -1123,44 +1189,6 @@
   function surfaceWarnings(payload) {
     const warnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
     warnings.forEach((warning) => toast(String(warning), "warning"));
-  }
-
-  async function submitAuth(form) {
-    formError(form, "");
-    const data = new FormData(form);
-    const email = String(data.get("email") || "").trim();
-    let password = String(data.get("password") || "");
-    const mode = form.dataset.mode === "register" ? "register" : "login";
-    if (!email || !form.elements.email.checkValidity()) { form.elements.email.setAttribute("aria-invalid", "true"); formError(form, "Enter a valid email address."); return; }
-    if (!password || (mode === "register" && password.length < 12)) { form.elements.password.setAttribute("aria-invalid", "true"); formError(form, mode === "register" ? "Use at least 12 characters for your password." : "Enter your password."); return; }
-    setSubmitting(form, true, mode === "register" ? "Creating account…" : "Signing in…");
-    try {
-      const response = await api(`/auth/${mode}`, { method: "POST", body: { email, password } });
-      password = "";
-      form.elements.password.value = "";
-      let me = response;
-      if (!(response?.user || response?.email)) me = await api("/me");
-      clearSensitiveState();
-      state.user = unwrap(me, "user") || me?.user || (me?.email ? me : null);
-      state.membership = unwrap(me, "membership") || me?.membership || null;
-      state.csrfToken = me?.csrf_token || response?.csrf_token || null;
-      if (!state.user) {
-        const canonical = await api("/me");
-        state.user = unwrap(canonical, "user") || canonical?.user || canonical;
-        state.membership = unwrap(canonical, "membership") || canonical?.membership || state.membership;
-        state.csrfToken = canonical?.csrf_token || state.csrfToken;
-      }
-      state.phase = "ready";
-      state.errors.session = null;
-      await loadBots({ silent: true });
-      toast(mode === "register" ? "Workspace created. Connect your first bot." : "Signed in successfully.");
-      navigate("/overview");
-    } catch (error) {
-      password = "";
-      form.elements.password.value = "";
-      formError(form, errorMessage(error));
-      setSubmitting(form, false);
-    }
   }
 
   async function submitConnectBot(form) {
@@ -1396,7 +1424,6 @@
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
-    if (form.id === "auth-form") { event.preventDefault(); submitAuth(form); }
     if (form.id === "connect-bot-form") { event.preventDefault(); submitConnectBot(form); }
     if (form.id === "message-form") { event.preventDefault(); submitMessage(form); }
     if (form.id === "delete-bot-form") { event.preventDefault(); submitDeleteBot(form); }
@@ -1420,8 +1447,7 @@
     if (trigger.tagName === "A") return;
     event.preventDefault();
 
-    if (action === "switch-auth") navigate(`/${trigger.dataset.mode}`);
-    else if (action === "open-connect") setModal("connect");
+    if (action === "open-connect") setModal("connect");
     else if (action === "close-modal") closeModal();
     else if (action === "open-bot-picker") state.bots.length ? setModal("bot-picker") : setModal("connect");
     else if (action === "pick-bot") { const id = trigger.dataset.botId; selectBot(id); closeModal(); navigate(`/bots/${encodeURIComponent(id)}/overview`); }

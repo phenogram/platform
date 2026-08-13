@@ -169,6 +169,10 @@ jobs:
           MASTER_KEY: ${{ secrets.MASTER_KEY }}
           PUBLIC_ID_KEY: ${{ secrets.PUBLIC_ID_KEY }}
           LINK_SIGNING_KEY: ${{ secrets.LINK_SIGNING_KEY }}
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GITHUB_OAUTH_CLIENT_ID: ${{ secrets.PHENOGRAM_GITHUB_OAUTH_CLIENT_ID }}
+          GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           PHENOGRAM_GHCR_PULL_CONFIG_JSON: ${{ secrets.PHENOGRAM_GHCR_PULL_CONFIG_JSON }}
@@ -179,7 +183,7 @@ jobs:
           RESTIC_PASSWORD: ${{ secrets.PHENOGRAM_BACKUP_RESTIC_PASSWORD }}
         run: |
           set -euo pipefail
-          for name in DATABASE_URL POSTGRES_PASSWORD MASTER_KEY PUBLIC_ID_KEY LINK_SIGNING_KEY TELEGRAM_API_ID TELEGRAM_API_HASH PHENOGRAM_GHCR_PULL_CONFIG_JSON BACKUP_ACCESS_KEY BACKUP_SECRET_KEY BACKUP_ENDPOINT BACKUP_BUCKET RESTIC_PASSWORD; do
+          for name in DATABASE_URL POSTGRES_PASSWORD MASTER_KEY PUBLIC_ID_KEY LINK_SIGNING_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET GITHUB_OAUTH_CLIENT_ID GITHUB_OAUTH_CLIENT_SECRET TELEGRAM_API_ID TELEGRAM_API_HASH PHENOGRAM_GHCR_PULL_CONFIG_JSON BACKUP_ACCESS_KEY BACKUP_SECRET_KEY BACKUP_ENDPOINT BACKUP_BUCKET RESTIC_PASSWORD; do
             test -n "${!name}"
           done
           install -d -m 0700 "$RUNNER_TEMP/phenogram-secrets/backup"
@@ -191,6 +195,10 @@ jobs:
             printf 'MASTER_KEY=%s\n' "$MASTER_KEY"
             printf 'PUBLIC_ID_KEY=%s\n' "$PUBLIC_ID_KEY"
             printf 'LINK_SIGNING_KEY=%s\n' "$LINK_SIGNING_KEY"
+            printf 'GOOGLE_OAUTH_CLIENT_ID=%s\n' "$GOOGLE_OAUTH_CLIENT_ID"
+            printf 'GOOGLE_OAUTH_CLIENT_SECRET=%s\n' "$GOOGLE_OAUTH_CLIENT_SECRET"
+            printf 'GITHUB_OAUTH_CLIENT_ID=%s\n' "$GITHUB_OAUTH_CLIENT_ID"
+            printf 'GITHUB_OAUTH_CLIENT_SECRET=%s\n' "$GITHUB_OAUTH_CLIENT_SECRET"
             printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
             printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
           } > "$RUNNER_TEMP/phenogram-secrets/app.env"
@@ -284,6 +292,10 @@ jobs:
             --connect-timeout 10 --max-time 20 \
             --output /dev/null \
             "$LANDING_URL/"
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null \
+            "$LANDING_URL/privacy"
           test "$(curl --silent --show-error \
             --connect-timeout 10 --max-time 20 \
             --output /dev/null --write-out '%{http_code}' \
@@ -304,4 +316,48 @@ jobs:
             --connect-timeout 10 --max-time 20 \
             --output /dev/null --write-out '%{http_code}' \
             "$MACHINE_API_URL/bot0:invalid/getMe")" = "401"
+          google_headers="$RUNNER_TEMP/google-oauth-headers"
+          github_headers="$RUNNER_TEMP/github-oauth-headers"
+          google_redirect="$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --dump-header "$google_headers" \
+            --output /dev/null --write-out '%{redirect_url}' \
+            "$APP_URL/api/auth/oauth/google/start")"
+          case "$google_redirect" in
+            https://accounts.google.com/*) ;;
+            *) printf '%s\n' 'Google OAuth start did not redirect to accounts.google.com.' >&2; exit 1 ;;
+          esac
+          case "$google_redirect" in
+            *scope=openid%20profile*|*scope=openid+profile*) ;;
+            *) printf '%s\n' 'Google OAuth start did not request exactly the identity profile scopes.' >&2; exit 1 ;;
+          esac
+          case "$google_redirect" in
+            *email*) printf '%s\n' 'Google OAuth start unexpectedly requested email.' >&2; exit 1 ;;
+          esac
+          case "$google_redirect" in
+            *redirect_uri=https%3A%2F%2Fapp.phenogram.io%2Fapi%2Fauth%2Foauth%2Fgoogle%2Fcallback*state=*code_challenge=*code_challenge_method=S256*) ;;
+            *) printf '%s\n' 'Google OAuth start is missing its exact callback, state, or S256 PKCE.' >&2; exit 1 ;;
+          esac
+          grep -Eiq '^set-cookie: phg_oauth=.*HttpOnly.*SameSite=Lax.*Max-Age=600.*Secure' "$google_headers"
+          grep -Eiq '^cache-control: no-store' "$google_headers"
+          github_redirect="$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --dump-header "$github_headers" \
+            --output /dev/null --write-out '%{redirect_url}' \
+            "$APP_URL/api/auth/oauth/github/start")"
+          case "$github_redirect" in
+            https://github.com/login/oauth/authorize*) ;;
+            *) printf '%s\n' 'GitHub OAuth start did not redirect to github.com.' >&2; exit 1 ;;
+          esac
+          case "$github_redirect" in
+            *scope=*) printf '%s\n' 'GitHub OAuth start unexpectedly requested a scope.' >&2; exit 1 ;;
+          esac
+          case "$github_redirect" in
+            *redirect_uri=https%3A%2F%2Fapp.phenogram.io%2Fapi%2Fauth%2Foauth%2Fgithub%2Fcallback*state=*code_challenge=*code_challenge_method=S256*) ;;
+            *) printf '%s\n' 'GitHub OAuth start is missing its exact callback, state, or S256 PKCE.' >&2; exit 1 ;;
+          esac
+          grep -Eiq '^set-cookie: phg_oauth=.*HttpOnly.*SameSite=Lax.*Max-Age=600.*Secure' "$github_headers"
+          grep -Eiq '^cache-control: no-store' "$github_headers"
+          rm -f "$google_headers" "$github_headers"
+          unset google_redirect github_redirect
           printf '%s\n' 'Landing, app, and machine API host separation passed.'

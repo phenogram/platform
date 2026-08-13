@@ -5,7 +5,9 @@ database, encrypted off-site logical backups, Traefik ingress, and the official
 Telegram Bot API server as an application sidecar. It targets the `phenogram`
 namespace on Rubase and publishes three deliberately separate origins:
 
-- `https://phenogram.io` serves only the public landing experience.
+- `https://phenogram.io` serves only the public landing experience and the
+  crawlable `https://phenogram.io/privacy` policy required for provider
+  branding.
 - `https://app.phenogram.io` serves the authenticated developer console, its
   assets, and same-origin management `/api/*` routes.
 - `https://api.phenogram.io` serves only Telegram-compatible `/bot*`, `/file/*`,
@@ -41,13 +43,22 @@ reconciles these three external resources before Helm runs:
   `PHENOGRAM_GHCR_PULL_CONFIG_JSON`.
 - `phenogram-secrets`, from repository secrets `DATABASE_URL`,
   `POSTGRES_PASSWORD`, `MASTER_KEY`, `PUBLIC_ID_KEY`, `LINK_SIGNING_KEY`,
-  `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH`.
+  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+  `PHENOGRAM_GITHUB_OAUTH_CLIENT_ID`,
+  `PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET`, `TELEGRAM_API_ID`,
+  and `TELEGRAM_API_HASH`.
 - `phenogram-backup-secrets`, from the five
   `PHENOGRAM_BACKUP_*` repository secrets.
 
 `DATABASE_URL` must address
 `postgresql://phenogram:<encoded-password>@phenogram-postgresql:5432/phenogram`.
 The three application keys are independent random values of at least 32 bytes.
+The OAuth credentials belong to dedicated sign-in-only provider applications:
+Google's callback is
+`https://app.phenogram.io/api/auth/oauth/google/callback` with only
+`openid profile`, and GitHub's callback is
+`https://app.phenogram.io/api/auth/oauth/github/callback` with no OAuth scope.
+Phenogram stores neither email addresses nor provider tokens.
 The deploy credential itself is stored as `RUBASE_PHENOGRAM_KUBECONFIG` and
 must contain a kubeconfig whose current context is fixed to `phenogram`.
 

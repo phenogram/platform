@@ -26,7 +26,7 @@
 	import phenogram_common
 
 	route {
-		@landing_surface path / /assets/app.css /assets/app.js /assets/runtime.js
+		@landing_surface path / /privacy /assets/app.css /assets/app.js /assets/runtime.js
 		reverse_proxy @landing_surface app:8080 {
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Real-IP {remote_host}

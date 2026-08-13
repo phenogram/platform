@@ -7,7 +7,7 @@ This guide describes the runtime that exists in this repository. It assumes a si
 | Component | Responsibility | Persistent state |
 | --- | --- | --- |
 | `app` | API proxy, management API/UI, Telegram ingress, SSE, retention task, four webhook workers | Owns none outside PostgreSQL; optionally reads the local Bot API volume |
-| `postgres` | Accounts, sessions, memberships, encrypted bot credentials, update journal, deliveries, activity and audit data | `postgres-data` volume |
+| `postgres` | Provider identities, sessions, memberships, encrypted bot credentials, update journal, deliveries, activity and audit data | `postgres-data` volume |
 | Caddy or equivalent | TLS, security headers, streaming reverse proxy, access-log redaction | Certificates/logs, depending on deployment |
 | Optional `telegram-bot-api` | Official local Telegram Bot API server for eligible plans | `telegram-bot-api-data` volume |
 
@@ -28,6 +28,8 @@ Application startup is fail-fast: configuration is validated, PostgreSQL is conn
 | `MASTER_KEY` | Required, at least 32 bytes | Encrypts bot tokens and webhook secrets after domain-separated derivation. |
 | `PUBLIC_ID_KEY` | Required, at least 32 bytes | Derives stable bot public IDs used for token lookup and public routes. |
 | `LINK_SIGNING_KEY` | Required, at least 32 bytes | Signs public files and derives CSRF tokens. |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Required in production | Confidential Google Web OAuth client used only for sign-in. Its callback is derived from `APP_BASE_URL`. |
+| `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET` | Required in production | Dedicated GitHub OAuth App used only for sign-in. Its callback is derived from `APP_BASE_URL`. |
 | `TELEGRAM_CLOUD_API_URL` | `https://api.telegram.org` | Cloud Bot API origin; useful to replace only in isolated tests. |
 | `TELEGRAM_LOCAL_API_URL` | Unset | Separate local Bot API origin. Local routing is unavailable when unset. |
 | `TELEGRAM_LOCAL_DATA_DIR` | Unset | Absolute read-only root containing local Bot API files. Required to serve opaque absolute `file_path` references. |
@@ -41,13 +43,34 @@ Application startup is fail-fast: configuration is validated, PostgreSQL is conn
 | `PHENOGRAM_HTTP_PORT`, `PHENOGRAM_HTTPS_PORT` | `80`, `443` | Published Caddy ports. |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Premium overlay only | Operator-owned Telegram application credentials for the official local server. |
 
-Generate the three application keys independently. Store them and database credentials in the deployment secret manager, not in the image, repository, Compose manifest, shell history, or centralized logs. Production validation rejects short secrets and values containing `development`, but it cannot assess entropy.
+Generate the three application keys independently. Store them, database credentials, and OAuth client secrets in the deployment secret manager, not in the image, repository, Compose manifest, shell history, or centralized logs. Production validation rejects short application secrets and values containing `development`, but it cannot assess entropy. OAuth client IDs are not confidential by protocol, but the production workflow keeps each complete provider credential pair together in repository secrets.
+
+## Social OAuth provider setup
+
+Phenogram uses both providers only to authenticate a person. It stores the provider name, stable provider subject ID, display name/handle, and avatar URL required for the console. It does not request, receive, or store an email address or persist a provider token. The callback uses an access token transiently to resolve identity and then drops it. Google requests only `openid profile`; GitHub requests no OAuth scope and uses a field-selective GraphQL query for `databaseId`, `login`, `name`, and `avatarUrl`. Never add an email scope or field or call GitHub's email endpoint.
+
+Configure a dedicated production Google Cloud project and Web application OAuth client according to Google's [web-server OAuth guide](https://developers.google.com/identity/protocols/oauth2/web-server), [OpenID Connect reference](https://developers.google.com/identity/openid-connect/openid-connect), and [production branding requirements](https://support.google.com/cloud/answer/15549049):
+
+1. Set the audience to **External** and publish the app **In production** when it is ready for public users. Google Testing mode is limited to configured test users and their authorizations expire after seven days.
+2. Configure the public app homepage as `https://phenogram.io`, register `phenogram.io` as an authorized domain, verify ownership through Google Search Console, and use `https://phenogram.io/privacy` as the public privacy-policy URL on both the landing page and OAuth branding screen. Google requires operator support/developer contact details in its console; Phenogram does not ingest those addresses.
+3. Create a **Web application** OAuth client. Set the only production authorized redirect URI used by Phenogram to exactly `https://app.phenogram.io/api/auth/oauth/google/callback`, including scheme, host, path, case, and lack of trailing slash. No authorized JavaScript origin is required because this is a server-side authorization-code flow.
+4. Request only `openid profile`. The OIDC `email` scope is optional and is deliberately omitted. Do not enable unrelated Google API scopes.
+5. Save the client ID and secret as GitHub repository secrets `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`.
+
+Create a dedicated OAuth App under a maintained GitHub account, following GitHub's [OAuth App registration](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) and [web authorization flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps). GitHub permits either personal- or organization-owned OAuth Apps; prefer organization ownership when it is available, but do not block production on ownership transfer:
+
+1. Use **Phenogram Platform** as the application name and `https://phenogram.io` as the Homepage URL.
+2. Set the Authorization callback URL to exactly `https://app.phenogram.io/api/auth/oauth/github/callback`. A GitHub OAuth App has one configured callback URL, so use a separate app for development. Leave Device Flow disabled.
+3. Keep this app dedicated to sign-in and request no OAuth scope. In particular, never request `user` or `user:email`; GitHub documents that an empty scope grants read-only access to public identity. If these credentials were previously used to request broader scopes, replace the OAuth App rather than relying on a later empty-scope request, because GitHub can reuse grants previously authorized for the same app.
+4. Save the client ID and secret as GitHub repository secrets `PHENOGRAM_GITHUB_OAUTH_CLIENT_ID` and `PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET`. GitHub reserves repository-secret names beginning with `GITHUB_`; the workflow maps these names to the application's `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` environment variables.
+
+For local development, create separate provider clients and use callbacks derived exactly from the local `APP_BASE_URL`. The default split-host callbacks are `http://app.localhost/api/auth/oauth/google/callback` and `http://app.localhost/api/auth/oauth/github/callback`. If a provider console refuses the `app.localhost` form, use the documented one-origin mode with all three base URLs set to `http://localhost:8080`, register `http://localhost:8080/api/auth/oauth/{provider}/callback`, and start only `postgres` and `app`. Do not reuse the production GitHub OAuth App because it supports only one callback.
 
 ## Initial production deployment
 
 1. Provision a supported Docker host or equivalent orchestrator, durable PostgreSQL storage, encrypted backups, DNS, and inbound HTTPS.
-2. Copy `.env.example` to an untracked deployment secret file. Set `APP_ENV=production`, `LANDING_BASE_URL=https://phenogram.io`, `APP_BASE_URL=https://app.phenogram.io`, `API_BASE_URL=https://api.phenogram.io`, a strong database password, and three independent application keys.
-3. Set `PHENOGRAM_LANDING_DOMAIN=phenogram.io`, `PHENOGRAM_APP_DOMAIN=app.phenogram.io`, and `PHENOGRAM_API_DOMAIN=api.phenogram.io`, then expose the included Caddy service, or place an equivalent reverse proxy in front of `app:8080`. Preserve SSE streaming. The landing host may proxy only `/`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`; the app host must reject machine routes; the API host must accept only `/bot*`, `/file[/...]`, `/telegram[/...]`, `/events[/...]`, and `/public[/...]`. The supplied Caddyfile enforces that split, enables compression and security headers, replaces the complete URI in access logs, and deletes cookie, authorization, Telegram secret, and CSRF headers from access logs.
+2. Copy `.env.example` to an untracked deployment secret file. Set `APP_ENV=production`, `LANDING_BASE_URL=https://phenogram.io`, `APP_BASE_URL=https://app.phenogram.io`, `API_BASE_URL=https://api.phenogram.io`, a strong database password, three independent application keys, and both provider credential pairs. Complete the provider setup above before starting the service; production starts fail-fast if either pair is missing.
+3. Set `PHENOGRAM_LANDING_DOMAIN=phenogram.io`, `PHENOGRAM_APP_DOMAIN=app.phenogram.io`, and `PHENOGRAM_API_DOMAIN=api.phenogram.io`, then expose the included Caddy service, or place an equivalent reverse proxy in front of `app:8080`. Preserve SSE streaming. The landing host may proxy only `/`, `/privacy`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`; the app host must reject machine routes; the API host must accept only `/bot*`, `/file[/...]`, `/telegram[/...]`, `/events[/...]`, and `/public[/...]`. The supplied Caddyfile enforces that split, enables compression and security headers, replaces the complete URI in access logs, and deletes cookie, authorization, Telegram secret, and CSRF headers from access logs.
 4. Restrict direct access to port 8080 and PostgreSQL. Only the reverse proxy should reach the app; only the app and authorized operators should reach the database. The ingress must overwrite, not trust, client-supplied `X-Forwarded-For` and `X-Real-IP`; the bundled Caddyfile does this.
 5. Back up PostgreSQL before every upgrade that contains migrations.
 6. Build and start the base stack:
@@ -58,7 +81,7 @@ Generate the three application keys independently. Store them and database crede
    curl -fsS https://app.phenogram.io/api/health
    ```
 
-7. Confirm the response is HTTP 200 with `status: "ok"` and `database: true`. Confirm the landing page loads at `https://phenogram.io/`, `https://phenogram.io/api/health` returns 404, a machine route on `https://app.phenogram.io` returns 404, and both `https://api.phenogram.io/` and `https://api.phenogram.io/api/health` return 404. Then register a test account at `app.phenogram.io`, connect a test bot, make a proxied `getMe` call through `api.phenogram.io`, deliver a real Telegram update, and confirm it appears in the update journal.
+7. Confirm the response is HTTP 200 with `status: "ok"` and `database: true`. Confirm the landing page loads at `https://phenogram.io/`, `https://phenogram.io/api/health` returns 404, a machine route on `https://app.phenogram.io` returns 404, and both `https://api.phenogram.io/` and `https://api.phenogram.io/api/health` return 404. Confirm each OAuth start endpoint redirects only to its expected provider, complete one real sign-in with each provider, connect a test bot, make a proxied `getMe` call through `api.phenogram.io`, deliver a real Telegram update, and confirm it appears in the update journal.
 
 The health endpoint checks PostgreSQL only. It does not prove reachability of Telegram, the downstream webhook, SSE fan-out, the optional local server, or disk headroom; keep those as separate checks.
 
@@ -73,13 +96,13 @@ The token-bearing compatibility route intentionally matches Telegram:
 /file/bot{token}/{file_path}
 ```
 
-Public SSE URLs contain a stream secret, and signed file URLs contain a reusable signature until expiry. Redact the complete request target—including query parameters—at every hop. The included Caddyfile replaces `request.uri` with `/redacted` and drops `Cookie`, `Authorization`, `X-Telegram-Bot-Api-Secret-Token`, and `X-Phenogram-CSRF`. If a CDN, ingress controller, APM agent, packet capture, or upstream application-error logger is added, verify its behavior with synthetic credentials before production use.
+Public SSE URLs contain a stream secret, signed file URLs contain a reusable signature until expiry, and OAuth callbacks contain short-lived authorization codes and state. Redact the complete request target—including query parameters—at every hop. The included Caddyfile replaces `request.uri` with `/redacted` and drops `Cookie`, `Authorization`, `X-Telegram-Bot-Api-Secret-Token`, and `X-Phenogram-CSRF`. If a CDN, ingress controller, APM agent, packet capture, or upstream application-error logger is added, verify its behavior with synthetic credentials before production use.
 
 Keep all three public DNS names as direct, DNS-only records when using Cloudflare in front of this deployment. A proxy/CDN adds another request-log and buffering layer in front of token-bearing Bot API paths, signed URLs, and SSE. If an edge proxy is introduced later, first prove full-URI redaction, disabled buffering for SSE, large upload/download behavior, and forwarding-header overwrites with synthetic credentials.
 
 Do not log request bodies: updates and Bot API requests may contain personal data. Limit access to application logs because network errors can include destination context even when proxy access logs are scrubbed.
 
-Registration and login allow 30 attempts per source and eight per source/email in a rolling ten-minute window, and at most four Argon2 jobs at once. These controls are in-memory per process. Their source comes from forwarding headers, so a trusted ingress must overwrite those headers; add distributed edge limits before running multiple replicas.
+OAuth state cookies are short-lived and are validated before exchanging a callback code. Add distributed edge limits to OAuth start and callback routes before running multiple replicas or accepting substantial public traffic; provider-side limits are not a substitute for application-edge abuse controls.
 
 When a connected bot already has a Telegram webhook, its URL is used only in that request to show the owner what would be replaced. Current schema does not retain the URL: migration `0006_remove_plaintext_webhook_url.sql` drops the legacy column, and the expiring audit entry records only whether takeover occurred. Backups created before that migration may still contain the old value and should be handled accordingly.
 
@@ -90,7 +113,7 @@ Minimum alerts:
 - `https://app.phenogram.io/api/health` is non-200 or reports `database: false`;
 - application or PostgreSQL container is unhealthy/restarting;
 - sustained HTTP 5xx/502 responses;
-- elevated registration/login 429s or CPU saturation—the built-in limiter and four-slot Argon2 gate are per process;
+- elevated OAuth start/callback errors, state mismatches, provider timeouts, or provider-side throttling;
 - PostgreSQL disk, volume inode, connection, or transaction pressure;
 - failed retention sweeps;
 - growing or old `pending`/`failed` webhook deliveries;
@@ -120,7 +143,7 @@ A usable backup set contains:
 
 1. a consistent PostgreSQL backup;
 2. the exact `MASTER_KEY`, `PUBLIC_ID_KEY`, and `LINK_SIGNING_KEY` versions active at backup time;
-3. deployment configuration and image/source revision metadata;
+3. deployment configuration, OAuth client configuration, and image/source revision metadata;
 4. if used, a consistent snapshot of the local Bot API volume and its Telegram API credentials.
 
 Without the original `MASTER_KEY`, encrypted bot and webhook credentials in PostgreSQL cannot be recovered. Without the original `PUBLIC_ID_KEY`, stored public IDs no longer match token-derived lookups. Restoring with a different `LINK_SIGNING_KEY` invalidates old public file links and changes CSRF values.
@@ -137,7 +160,7 @@ pg_restore --list "$phenogram_backup" >/dev/null
 
 Use encrypted, access-controlled off-host storage and enforce retention independently of the application. A volume snapshot is useful in addition to, not instead of, a logical dump.
 
-Test restores into an isolated PostgreSQL instance with no production traffic. Verify migrations, row counts, a login, decryption through a non-production bot, update history, and signed-link behavior using the backed-up key versions. Never use `--clean` against the live database as a casual restore test.
+Test restores into an isolated PostgreSQL instance with no production traffic. Verify migrations, row counts, a provider sign-in using non-production OAuth clients, decryption through a non-production bot, update history, and signed-link behavior using the backed-up key versions. Never use `--clean` against the live database as a casual restore test.
 
 For the optional local Telegram service, stop or quiesce it while taking a filesystem snapshot of `telegram-bot-api-data`, or use a storage system that provides consistent volume snapshots. Regularly test both service recovery and Telegram re-login; PostgreSQL alone does not contain its local files or runtime state.
 
@@ -160,6 +183,16 @@ Call virtual `setWebhook` through Phenogram with the new `secret_token`, update 
 
 Rotating `LINK_SIGNING_KEY` immediately invalidates every outstanding signed file URL and changes the expected CSRF token for existing sessions. Schedule a maintenance window, rotate the secret, restart all app instances together, and have browser clients reload or fetch `/api/me` before their next mutation.
 
+### OAuth client credentials
+
+Existing Phenogram sessions do not contain or depend on provider access tokens, so rotating a provider client secret affects only new sign-ins and callbacks currently in flight.
+
+For GitHub, generate a new client secret on the dedicated OAuth App, update repository secret `PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET`, deploy, verify a fresh sign-in, and then delete the old secret. GitHub recommends exactly that order after a secret compromise. Do not change the app's no-scope policy during rotation.
+
+For Google, create a replacement Web application client with the same production callback, update both `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`, deploy, verify a fresh sign-in, and then delete the old client. This permits controlled rollback, unlike resetting the existing client's secret. An authorization flow started immediately before the deployment may need to be restarted. Keep `openid profile` as the complete scope set.
+
+In both cases, use GitHub repository secrets and trigger the `master` production workflow. It reconciles the values directly into `phenogram-secrets`; the values are never Helm parameters or Helm release history. Review callback failure rates and remove superseded credentials after verification.
+
 ### Master encryption key
 
 Do not simply change `MASTER_KEY`: the application has no online re-encryption command, and existing bot tokens, ingress/downstream secrets, and outstanding opaque local-file references would become unreadable. A safe rotation requires a purpose-built decrypt/re-encrypt migration while the old key is available, or controlled deletion and reconnection of every bot. Back up first and verify a restore.
@@ -178,17 +211,20 @@ Rotate the PostgreSQL role secret together with `DATABASE_URL` and restart the a
 
 ## Plan administration and retention
 
-Registration assigns the `free` plan. There is no payment provider or admin endpoint in this MVP; the plan-selection UI is informational. Until billing exists, authorized operators assign plans directly in PostgreSQL and should record the approval externally and in the audit log.
+A user's first provider sign-in assigns the `free` plan. There is no payment provider or admin endpoint in this MVP; the plan-selection UI is informational. Until billing exists, authorized operators assign plans directly in PostgreSQL and should record the approval externally and in the audit log.
 
 Inspect before changing a membership:
 
 ```sql
-SELECT users.id, users.email, memberships.plan_id, memberships.status,
+SELECT users.id, identities.provider, identities.provider_login,
+       memberships.plan_id, memberships.status,
        plans.bot_limit, plans.retention_days, plans.local_bot_api
 FROM users
+JOIN oauth_identities identities ON identities.user_id = users.id
 JOIN memberships ON memberships.user_id = users.id
 JOIN plan_definitions plans ON plans.id = memberships.plan_id
-WHERE users.email = 'owner@example.com';
+WHERE identities.provider = 'github'
+  AND identities.provider_login = 'owner-handle';
 ```
 
 Apply a reviewed assignment in a transaction, using `free`, `pro`, or `scale`:
@@ -301,7 +337,7 @@ The companion service is still an external operational dependency. The Rust appl
 
 ## Current production boundaries
 
-- `phenogram.io` is the public landing surface and exposes only `/`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`. `app.phenogram.io` owns the authenticated console, client routes, management API, and health. `api.phenogram.io` is restricted to Telegram-compatible bot/file paths, Telegram ingress, SSE, and signed public downloads; the landing and API hosts intentionally do not expose `/api/health` or management endpoints.
+- `phenogram.io` is the public landing surface and exposes only `/`, `/privacy`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`. `app.phenogram.io` owns the authenticated console, client routes, management API, and health. `api.phenogram.io` is restricted to Telegram-compatible bot/file paths, Telegram ingress, SSE, and signed public downloads; the landing and API hosts intentionally do not expose `/api/health` or management endpoints.
 - SSE is the only new subscription transport. Kafka, WebSockets, NATS, and similar brokers are not implemented.
 - Live SSE fan-out and its 256-global/four-per-key connection caps are process-local. Replay is durable but capped per connection at 5,000 rows, 8 MiB total, and roughly 2 MiB per event.
 - Downstream delivery uses four workers per app process. Stored `max_connections` is informational in this MVP.
@@ -309,7 +345,7 @@ The companion service is still an external operational dependency. The Rust appl
 - Plan retention covers updates, outbound messages, API calls, conversation projections, and bot-scoped audit rows, but changing a plan does not recalculate already stamped expiry times. Account-scoped audit rows use one year.
 - The optional official local Bot API server is a separate operational component. Routing, managed webhook reprovisioning, opaque local paths, and range delivery are integrated, but the platform is not a local-server monitoring or backup control plane.
 - Bot credential replacement is absent. Reconnecting after a BotFather token rotation requires deleting the existing bot record, which cascades its stored history.
-- Authentication has per-process login/registration throttling and a four-job Argon2 gate, but no MFA, email verification, password reset, organization model, or RBAC. The source limiter trusts ingress-supplied forwarding headers and is not distributed across replicas.
+- Authentication depends on Google and GitHub availability and has no MFA policy of its own, organization model, or RBAC. Phenogram requests no email scope or field and receives or stores neither email addresses nor provider tokens. OAuth endpoints still need distributed edge limits before horizontal scaling.
 - Downstream destination pinning and global-address checks reduce SSRF risk, but operator-level egress controls remain required defense in depth.
 - The Helm deployment includes scheduled encrypted PostgreSQL backups to an operator-provisioned S3-compatible bucket, but no built-in metrics endpoint, point-in-time recovery, multi-region failover, or automated disaster recovery.
 - Compatibility has been exercised for the included contract tests, not certified against every Telegram method/content type. Managed update methods intentionally implement a subset of Telegram parameters.

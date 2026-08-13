@@ -31,6 +31,10 @@ services:
       MASTER_KEY: ${MASTER_KEY:-development-only-master-key-change-me}
       PUBLIC_ID_KEY: ${PUBLIC_ID_KEY:-development-only-public-id-key-change-me}
       LINK_SIGNING_KEY: ${LINK_SIGNING_KEY:-development-only-link-key-change-me}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
       TELEGRAM_CLOUD_API_URL: ${TELEGRAM_CLOUD_API_URL:-https://api.telegram.org}
       RUST_LOG: ${RUST_LOG:-phenogram_platform=info,tower_http=info}
     ports:

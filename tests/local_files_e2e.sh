@@ -3,32 +3,61 @@ set -euo pipefail
 
 base_url="${PHENOGRAM_E2E_URL:-http://127.0.0.1:18080}"
 database_url="${PHENOGRAM_E2E_DATABASE_URL:?Set PHENOGRAM_E2E_DATABASE_URL}"
-cookie_jar="$(mktemp /private/tmp/phenogram-local-e2e-cookies.XXXXXX)"
-trap 'rm -f "$cookie_jar"' EXIT
 
-email="e2e-local-$(date +%s)@example.test"
-password="correct-horse-battery-staple"
+identity_subject="e2e-local-$(date +%s)-$$"
+session_token="$(openssl rand -hex 32)"
+auth_cookie="phg_session=$session_token"
 bot_token="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
 
-psql "$database_url" -v ON_ERROR_STOP=1 \
-  -c "DELETE FROM users WHERE email LIKE 'e2e-%@example.test' OR email = 'browser-final@example.test'" >/dev/null
+cleanup() {
+  psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null || true
+DELETE FROM users
+ WHERE id IN (
+    SELECT user_id FROM oauth_identities
+     WHERE provider = 'github' AND provider_subject = :'subject'
+ );
+SQL
+}
+trap cleanup EXIT
 
-session="$(curl -fsS -c "$cookie_jar" \
-  -H 'content-type: application/json' \
-  -d "{\"email\":\"$email\",\"password\":\"$password\"}" \
-  "$base_url/api/auth/register")"
+psql "$database_url" -v ON_ERROR_STOP=1 \
+  -v subject="$identity_subject" -v session_token="$session_token" <<'SQL' >/dev/null
+WITH new_user AS (
+    INSERT INTO users DEFAULT VALUES RETURNING id
+), new_identity AS (
+    INSERT INTO oauth_identities
+        (user_id, provider, provider_subject, display_name, provider_login)
+    SELECT id, 'github', :'subject', 'Phenogram Local E2E', 'phenogram-local-e2e'
+      FROM new_user
+    RETURNING id, user_id
+), new_membership AS (
+    INSERT INTO memberships (user_id, plan_id, status)
+    SELECT user_id, 'free', 'active' FROM new_identity
+)
+INSERT INTO sessions (user_id, identity_id, token_hash, expires_at)
+SELECT user_id, id, digest(:'session_token', 'sha256'), now() + interval '1 hour'
+  FROM new_identity;
+SQL
+
+session="$(curl -fsS -b "$auth_cookie" "$base_url/api/me")"
 csrf="$(jq -er '.csrf_token' <<<"$session")"
-connected="$(curl -fsS -b "$cookie_jar" \
+connected="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d "{\"token\":\"$bot_token\",\"accept_webhook_takeover\":true}" \
   "$base_url/api/bots")"
 bot_id="$(jq -er '.bot.id' <<<"$connected")"
 
-psql "$database_url" -v ON_ERROR_STOP=1 \
-  -c "UPDATE memberships SET plan_id = 'pro', status = 'active' WHERE user_id = (SELECT id FROM users WHERE email = '$email')" >/dev/null
+psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null
+UPDATE memberships
+   SET plan_id = 'pro', status = 'active'
+ WHERE user_id = (
+    SELECT user_id FROM oauth_identities
+     WHERE provider = 'github' AND provider_subject = :'subject'
+ );
+SQL
 
-routed="$(curl -fsS -b "$cookie_jar" \
+routed="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d '{"mode":"local","confirm_migration":true}' \
@@ -43,7 +72,7 @@ file_path="$(jq -er '.result.file_path | select(startswith("__phenogram_local__/
 test "$(curl -fsS "$base_url/file/bot$bot_token/$file_path")" = "phenogram-premium-local-file"
 test "$(curl -fsS -H 'range: bytes=0-8' "$base_url/file/bot$bot_token/$file_path")" = "phenogram"
 
-cloud="$(curl -fsS -b "$cookie_jar" \
+cloud="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d '{"mode":"cloud","confirm_migration":true}' \

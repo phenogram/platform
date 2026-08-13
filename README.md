@@ -8,6 +8,7 @@ This repository is a production-oriented MVP, not a claim of complete Telegram B
 
 - A pass-through Bot API and file gateway for connected bots.
 - Ownership verification with the bot token via Telegram `getMe`.
+- Google and GitHub sign-in using stable provider IDs, without requesting or storing email addresses.
 - Encrypted bot, ingress, and downstream webhook secrets in PostgreSQL.
 - Durable, deduplicated update capture with plan-based expiry.
 - Virtual `getUpdates`, `setWebhook`, `deleteWebhook`, and `getWebhookInfo` methods backed by Phenogram's update journal.
@@ -53,14 +54,14 @@ openssl rand -base64 48
 openssl rand -base64 48
 ```
 
-Put those values in `MASTER_KEY`, `PUBLIC_ID_KEY`, and `LINK_SIGNING_KEY`, set a non-default `POSTGRES_PASSWORD`, then start the stack:
+Put those values in `MASTER_KEY`, `PUBLIC_ID_KEY`, and `LINK_SIGNING_KEY`, set a non-default `POSTGRES_PASSWORD`, and configure development Google and GitHub OAuth clients as described in [the operations guide](docs/operations.md#social-oauth-provider-setup). Then start the stack:
 
 ```sh
 docker compose up --build -d
 curl -fsS http://app.localhost/api/health
 ```
 
-Open `http://localhost` for the landing page or `http://app.localhost` for the developer console, create an account, and connect the bot token. The default Caddy sites deliberately exercise all three public surfaces locally; `*.localhost` resolves to loopback in modern browsers. Phenogram verifies `getMe`, checks for an existing Telegram webhook, encrypts the credential, and asks Telegram to deliver updates to Phenogram.
+Open `http://localhost` for the landing page or `http://app.localhost` for the developer console, sign in with Google or GitHub, and connect the bot token. The default Caddy sites deliberately exercise all three public surfaces locally; `*.localhost` resolves to loopback in modern browsers. Phenogram verifies `getMe`, checks for an existing Telegram webhook, encrypts the credential, and asks Telegram to deliver updates to Phenogram.
 
 Production has three public origins: `LANDING_BASE_URL=https://phenogram.io` serves only the public landing experience, `APP_BASE_URL=https://app.phenogram.io` serves the authenticated console and management API, and `API_BASE_URL=https://api.phenogram.io` serves Telegram-compatible bot/file routes, Telegram ingress, SSE, and signed downloads. Configure all three without a trailing slash. They must be distinct HTTPS hosts in production.
 
@@ -79,14 +80,16 @@ The web console uses the JSON API under `/api` on `app.phenogram.io`; no separat
 
 | Area | Routes |
 | --- | --- |
-| Public | `GET /api/health`, `GET /api/plans`, `POST /api/auth/register`, `POST /api/auth/login` |
+| Public | `GET /api/health`, `GET /api/plans`, `GET /api/auth/oauth/{google\|github}/start`, `GET /api/auth/oauth/{google\|github}/callback` |
 | Session | `POST /api/auth/logout`, `GET /api/me` |
 | Bots | `GET/POST /api/bots`, `GET/DELETE /api/bots/{bot_id}`, `POST /api/bots/{bot_id}/provision` |
 | Journal | `GET /api/bots/{bot_id}/updates`, `GET /api/bots/{bot_id}/activity` |
 | Bot View | `GET /api/bots/{bot_id}/conversations`, `GET /api/bots/{bot_id}/conversations/{chat_id}/messages`, `POST /api/bots/{bot_id}/messages` |
 | Delivery | `GET/POST /api/bots/{bot_id}/stream-keys`, `DELETE /api/bots/{bot_id}/stream-keys/{key_id}`, `POST /api/bots/{bot_id}/file-links`, `POST /api/bots/{bot_id}/routing` |
 
-Registration/login set an HTTP-only session cookie and return a CSRF token. Every other mutating management request requires that cookie plus `X-Phenogram-CSRF`. In production, all management mutations—including registration and login—also require an `Origin` equal to `APP_BASE_URL` (`https://app.phenogram.io`); configure the base URL without a trailing slash.
+The OAuth callback sets an HTTP-only session cookie and redirects to the console; `/api/me` returns the CSRF token for that session. Every mutating management request requires that cookie plus `X-Phenogram-CSRF`. In production, the browser session is scoped to `APP_BASE_URL` (`https://app.phenogram.io`); configure the base URL without a trailing slash.
+
+Phenogram identifies an account by the provider's stable subject ID. Google is requested with only `openid profile`; GitHub is requested with no OAuth scope and a field-selective GraphQL identity query. It does not request an email scope or field, call GitHub's email endpoint, store provider access or refresh tokens, or receive or persist an email address.
 
 ## Point a bot at Phenogram
 
@@ -181,7 +184,7 @@ Outgoing timeline capture is limited to `sendMessage` requests that Phenogram ca
 | Pro | 5 | 90 days | Yes | $29 |
 | Scale | 25 | 365 days | Yes | $99 |
 
-New accounts receive Free membership. Limits are enforced in the API and again by a database trigger. Plan retention is stamped onto updates, outbound messages, API calls, conversation projections, and bot-scoped audit records when they are created or refreshed; a later plan change does not recalculate existing expiry timestamps. Account-scoped audit records expire after one year, sessions use their own TTL, and webhook delivery rows disappear with their parent updates. Each sweep repeatedly drains every expired table in 5,000-row batches.
+New social identities receive Free membership. Limits are enforced in the API and again by a database trigger. Plan retention is stamped onto updates, outbound messages, API calls, conversation projections, and bot-scoped audit records when they are created or refreshed; a later plan change does not recalculate existing expiry timestamps. Account-scoped audit records expire after one year, sessions use their own TTL, and webhook delivery rows disappear with their parent updates. Each sweep repeatedly drains every expired table in 5,000-row batches.
 
 Checkout, invoicing, provider webhooks, self-service upgrades, and automated downgrade handling are not implemented; plans are assigned administratively. The plan-selection UI is informational and never changes membership by itself.
 
@@ -197,19 +200,19 @@ Routing migration is explicitly confirmed, serialized per bot, and invokes Teleg
 
 ## Security model
 
-- Passwords are hashed with Argon2; session secrets and SSE secrets are stored as SHA-256 digests.
+- OAuth access tokens are used only to resolve the provider identity during the callback and are not persisted; session secrets and SSE secrets are stored as SHA-256 digests.
 - Bot tokens and webhook secrets use XChaCha20-Poly1305 with per-record associated data.
 - Bot public IDs are keyed, stable pseudonyms; they are identifiers, not authorization.
 - Session cookies are `HttpOnly` and `SameSite=Strict`, with `Secure` enabled for production/HTTPS.
 - Mutating management requests require an exact-origin check plus `X-Phenogram-CSRF`.
 - Production separates the public landing page on `phenogram.io`, authenticated console and management traffic on `app.phenogram.io`, and token-bearing or public machine routes on `api.phenogram.io`; both the edge and application reject routes on the wrong host.
-- Registration/login use per-process limits of 30 attempts per source and eight per source/email over ten minutes, with four concurrent Argon2 jobs.
+- OAuth state is bound to a short-lived, secure browser cookie, and provider callbacks accept an authorization code only after validating that state.
 - Upstream ingress requires Telegram's secret-token header and update IDs are deduplicated per bot.
 - Downstream webhook delivery disables inherited proxies, rejects non-global production addresses, resolves once per attempt, and pins the request to the validated addresses. Keep infrastructure egress policy as an additional control.
 - Existing Telegram webhook URLs are used only to request explicit takeover confirmation; they are not persisted. Audit metadata stores only whether a migration occurred.
 - The bundled runtime image runs as an unprivileged user. Caddy terminates TLS, adds security headers, and redacts credential-bearing request fields.
 
-The update journal and conversation data are plaintext application data inside PostgreSQL, so disk encryption, access control, network isolation, backups, deletion policy, and applicable privacy obligations remain deployment responsibilities. Authentication and SSE limits are process-local; the authentication source limiter also trusts forwarding headers supplied by the ingress. Multi-replica deployments need distributed/edge enforcement. There is no built-in MFA, email verification, password reset, WAF, or organization/RBAC model in this MVP.
+The update journal and conversation data are plaintext application data inside PostgreSQL, so disk encryption, access control, network isolation, backups, deletion policy, and applicable privacy obligations remain deployment responsibilities. Authentication and SSE limits are process-local; multi-replica deployments need distributed/edge enforcement. There is no built-in MFA, provider-account recovery, WAF, or organization/RBAC model in this MVP.
 
 ## Production handoff
 
