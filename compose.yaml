@@ -24,7 +24,8 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       LISTEN_ADDR: 0.0.0.0:8080
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:8080}
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8080}
       DATABASE_URL: postgresql://phenogram:${POSTGRES_PASSWORD:-phenogram-development}@postgres:5432/phenogram
       MASTER_KEY: ${MASTER_KEY:-development-only-master-key-change-me}
       PUBLIC_ID_KEY: ${PUBLIC_ID_KEY:-development-only-public-id-key-change-me}
@@ -46,7 +47,8 @@ services:
       app:
         condition: service_healthy
     environment:
-      PHENOGRAM_DOMAIN: ${PHENOGRAM_DOMAIN:-localhost}
+      PHENOGRAM_WEB_DOMAIN: ${PHENOGRAM_WEB_DOMAIN:-localhost}
+      PHENOGRAM_API_DOMAIN: ${PHENOGRAM_API_DOMAIN:-api.localhost}
     ports:
       - "${PHENOGRAM_HTTP_PORT:-80}:80"
       - "${PHENOGRAM_HTTPS_PORT:-443}:443"

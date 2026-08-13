@@ -224,7 +224,7 @@ pub async fn connect_bot(
 
     let webhook_url = format!(
         "{}/telegram/webhook/{}",
-        state.config.public_base_url, public_id
+        state.config.api_base_url, public_id
     );
     let webhook_result = raw_telegram_json(
         &state.telegram,
@@ -338,7 +338,7 @@ pub async fn get_bot(
         "membership": membership,
         "stats": {"updates_24h": stats.0, "api_calls_24h": stats.1, "failed_deliveries": stats.2, "average_api_latency_ms": stats.3},
         "integration": {
-            "api_base": format!("{}/bot${{BOT_TOKEN}}", state.config.public_base_url),
+            "api_base": format!("{}/bot${{BOT_TOKEN}}", state.config.api_base_url),
             "public_id": bot.public_id,
             "retention_days": membership.retention_days
         }
@@ -613,7 +613,7 @@ pub async fn create_stream_key(
     .await?;
     let url = format!(
         "{}/events/{}/{}",
-        state.config.public_base_url, bot.public_id, key
+        state.config.api_base_url, bot.public_id, key
     );
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
@@ -701,7 +701,7 @@ pub async fn create_file_link(
     let sig = state
         .crypto
         .sign_file_link(&bot.public_id, &input.file_path, expires);
-    let mut url = url::Url::parse(&state.config.public_base_url).map_err(|_| AppError::Internal)?;
+    let mut url = url::Url::parse(&state.config.api_base_url).map_err(|_| AppError::Internal)?;
     {
         let mut segments = url.path_segments_mut().map_err(|_| AppError::Internal)?;
         segments
@@ -865,7 +865,7 @@ async fn install_managed_webhook(state: &AppState, bot: &BotRecord) -> Result<bo
     };
     let webhook_url = format!(
         "{}/telegram/webhook/{}",
-        state.config.public_base_url, bot.public_id
+        state.config.api_base_url, bot.public_id
     );
     let (_, response) = raw_telegram_json(
         &state.telegram,

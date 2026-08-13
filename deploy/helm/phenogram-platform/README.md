@@ -3,7 +3,12 @@
 This chart deploys one Phenogram application pod, a persistent PostgreSQL 17
 database, encrypted off-site logical backups, Traefik ingress, and the official
 Telegram Bot API server as an application sidecar. It targets the `phenogram`
-namespace on Rubase and publishes `https://api.phenogram.io`.
+namespace on Rubase and publishes two deliberately separate origins:
+
+- `https://phenogram.io` serves the landing page, developer console, assets, and
+  same-origin management `/api/*` routes.
+- `https://api.phenogram.io` serves only Telegram-compatible `/bot*`, `/file/*`,
+  `/telegram/*`, `/events/*`, and `/public/*` machine routes.
 
 The local Bot API server shares a `ReadWriteOnce` file volume with the Rust
 application, which must read premium files directly. The production Deployment
@@ -17,12 +22,14 @@ different shared-file design plus distributed SSE and rate limiting.
 - Traefik in `kube-system`, labeled `app.kubernetes.io/name=traefik`.
 - cert-manager with a `letsencrypt-prod` ClusterIssuer.
 - The default `local-path` StorageClass.
-- A DNS-only `A` record for `api.phenogram.io` pointing to `185.221.212.224`.
+- DNS-only `A` records for both `phenogram.io` and `api.phenogram.io`, each
+  pointing to `185.221.212.224`.
 
-Do not enable Cloudflare proxying for this hostname. Bot API file transfers and
-SSE connections should terminate directly at Traefik, and token-bearing Bot API
-paths must not be recorded by URI access logs. Configure Traefik access-log
-redaction or keep access logging disabled before production traffic arrives.
+Do not enable Cloudflare proxying for either hostname. Bot API file transfers
+and SSE connections should terminate directly at Traefik, and token-bearing
+machine API paths must not be recorded by URI access logs. Configure Traefik
+access-log redaction or keep access logging disabled before production traffic
+arrives.
 
 ## Secret contract
 
@@ -78,5 +85,7 @@ helm template phenogram deploy/helm/phenogram-platform \
 ```
 
 Migrations run during application startup. The workflow uses immutable image
-digests, an atomic Helm upgrade, rollout checks, and a public database-backed
-health check. Take a restorable backup before merging a migration into `master`.
+digests, an atomic Helm upgrade, rollout checks, a database-backed health check
+on the web origin, and negative checks that the machine origin does not expose
+the landing page or management health. Take a restorable backup before merging
+a migration into `master`.

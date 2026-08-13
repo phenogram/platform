@@ -2,9 +2,10 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "phenogram.fullname" . }}
+  name: {{ include "phenogram.fullname" . }}-web
   labels:
     {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web-ingress
   {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -13,21 +14,60 @@ spec:
   {{- with .Values.ingress.className }}
   ingressClassName: {{ . }}
   {{- end }}
-  {{- if .Values.ingress.tls.enabled }}
+  {{- if .Values.ingress.web.tls.enabled }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
-      secretName: {{ .Values.ingress.tls.secretName }}
+        - {{ .Values.ingress.web.host | quote }}
+      secretName: {{ .Values.ingress.web.tls.secretName }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+    - host: {{ .Values.ingress.web.host | quote }}
       http:
         paths:
-          - path: {{ .Values.ingress.path }}
-            pathType: {{ .Values.ingress.pathType }}
+          # The console is a same-origin SPA. Its landing page, assets, client
+          # routes, and management API intentionally share this host.
+          - path: /
+            pathType: Prefix
             backend:
               service:
                 name: {{ include "phenogram.fullname" . }}
                 port:
                   name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "phenogram.fullname" . }}-api
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-ingress
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.api.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.api.host | quote }}
+      secretName: {{ .Values.ingress.api.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.api.host | quote }}
+      http:
+        paths:
+          # No catch-all path is present on the API host. Landing pages,
+          # browser assets, and the management /api tree are web-host only.
+          {{- range list "/bot" "/file" "/telegram" "/events" "/public" }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "phenogram.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
 {{- end }}

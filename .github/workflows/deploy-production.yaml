@@ -16,7 +16,8 @@ env:
   TELEGRAM_IMAGE: ghcr.io/phenogram/telegram-bot-api
   RELEASE_NAME: phenogram
   KUBE_NAMESPACE: phenogram
-  PUBLIC_HEALTH_URL: https://api.phenogram.io/api/health
+  WEB_HEALTH_URL: https://phenogram.io/api/health
+  MACHINE_API_URL: https://api.phenogram.io
 
 jobs:
   validate:
@@ -126,7 +127,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: production
-      url: https://api.phenogram.io
+      url: https://phenogram.io
     permissions:
       contents: read
     steps:
@@ -241,12 +242,28 @@ jobs:
           kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-postgresql --timeout=5m
           kubectl --namespace "$KUBE_NAMESPACE" get pods,service,ingress,pvc
 
-      - name: Verify public health
+      - name: Verify public host separation and health
         run: |
           set -euo pipefail
           response="$(curl --fail --silent --show-error \
             --retry 18 --retry-all-errors --retry-delay 10 \
             --connect-timeout 10 --max-time 20 \
-            "$PUBLIC_HEALTH_URL")"
+            "$WEB_HEALTH_URL")"
           printf '%s' "$response" | grep -q '"status":"ok"'
-          printf '%s\n' 'Public health check passed.'
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null \
+            "https://phenogram.io/"
+          test "$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null --write-out '%{http_code}' \
+            "$MACHINE_API_URL/")" = "404"
+          test "$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null --write-out '%{http_code}' \
+            "$MACHINE_API_URL/api/health")" = "404"
+          test "$(curl --silent --show-error \
+            --connect-timeout 10 --max-time 20 \
+            --output /dev/null --write-out '%{http_code}' \
+            "$MACHINE_API_URL/bot0:invalid/getMe")" = "401"
+          printf '%s\n' 'Both public hosts, health, and ingress separation passed.'

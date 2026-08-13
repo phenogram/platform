@@ -1,27 +1,51 @@
-{$PHENOGRAM_DOMAIN:api.phenogram.io} {
-    encode zstd gzip
-    reverse_proxy app:8080 {
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Real-IP {remote_host}
-    }
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        Permissions-Policy "camera=(), microphone=(), geolocation=()"
-        -Server
-    }
-    log {
-        output stdout
-        format filter {
-            wrap json
-            fields {
-                request>uri replace /redacted
-                request>headers>Cookie delete
-                request>headers>Authorization delete
-                request>headers>X-Telegram-Bot-Api-Secret-Token delete
-                request>headers>X-Phenogram-Csrf delete
-            }
-        }
-    }
+(phenogram_common) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri replace /redacted
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+				request>headers>X-Telegram-Bot-Api-Secret-Token delete
+				request>headers>X-Phenogram-Csrf delete
+			}
+		}
+	}
+}
+
+{$PHENOGRAM_WEB_DOMAIN:localhost} {
+	import phenogram_common
+
+	route {
+		@machine_surface path /bot* /file /file/* /telegram /telegram/* /events /events/* /public /public/*
+		respond @machine_surface 404
+
+		reverse_proxy app:8080 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}
+
+{$PHENOGRAM_API_DOMAIN:api.localhost} {
+	import phenogram_common
+
+	route {
+		@machine_surface path /bot* /file /file/* /telegram /telegram/* /events /events/* /public /public/*
+		reverse_proxy @machine_surface app:8080 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+		}
+
+		respond 404
+	}
 }

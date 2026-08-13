@@ -78,6 +78,10 @@ pub fn app(state: AppState) -> Router {
         .route("/assets/app.css", get(web::css))
         .route("/assets/app.js", get(web::js))
         .fallback(web::fallback)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            web::public_host_guard,
+        ))
         .layer(middleware::from_fn(web::security_headers))
         .layer(CompressionLayer::new())
         .layer(PropagateRequestIdLayer::x_request_id())

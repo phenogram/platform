@@ -599,7 +599,7 @@
           </div>
           <div class="console-preview" aria-label="Phenogram dashboard preview">
             <div class="console-preview__window">
-              <div class="console-preview__bar"><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__url">app.phenogram.io / weather-assistant</span></div>
+              <div class="console-preview__bar"><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__dot"></span><span class="console-preview__url">phenogram.io / weather-assistant</span></div>
               <div class="console-preview__body">
                 <aside class="console-preview__side"><div class="preview-brand"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</div><div class="preview-nav-line active"></div><div class="preview-nav-line"></div><div class="preview-nav-line"></div><div class="preview-nav-line"></div></aside>
                 <div class="console-preview__main">
