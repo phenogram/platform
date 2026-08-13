@@ -646,7 +646,7 @@
         </div></section>
 
         <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="#/register">Start with one free bot ${icon("arrow")}</a></section>
-        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="#/"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
+        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="#/"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
       </main>`;
   }
 

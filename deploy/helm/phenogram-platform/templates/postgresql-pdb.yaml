@@ -1,0 +1,15 @@
+{{- if and .Values.postgresql.enabled .Values.postgresql.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "phenogram.fullname" . }}-postgresql
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  maxUnavailable: {{ .Values.postgresql.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+{{- end }}

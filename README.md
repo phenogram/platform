@@ -203,3 +203,12 @@ The update journal and conversation data are plaintext application data inside P
 ## Production handoff
 
 Read [docs/operations.md](docs/operations.md) before exposing the service. It covers configuration, TLS topology, readiness, monitoring, backup and restore drills, secret rotation constraints, local routing, and incident runbooks.
+
+The production Helm chart and `master` deployment workflow live under
+[`deploy/helm/phenogram-platform`](deploy/helm/phenogram-platform) and
+[`deploy-production.yaml`](.github/workflows/deploy-production.yaml).
+
+## License
+
+Phenogram Platform is free software licensed under the
+[GNU Affero General Public License v3.0 or later](LICENSE).

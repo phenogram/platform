@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: phenogram-backup-policy
+  namespace: minio
+data:
+  policy.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetBucketLocation",
+            "s3:ListBucket",
+            "s3:ListBucketVersions"
+          ],
+          "Resource": ["arn:aws:s3:::phenogram-db"]
+        },
+        {
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+            "s3:PutObject",
+            "s3:DeleteObject"
+          ],
+          "Resource": ["arn:aws:s3:::phenogram-db/*"]
+        }
+      ]
+    }
+  lifecycle.json: |
+    {
+      "Rules": [
+        {
+          "ID": "phenogram-restic-noncurrent-retention",
+          "Status": "Enabled",
+          "Filter": {"Prefix": ""},
+          "Expiration": {"ExpiredObjectDeleteMarker": true},
+          "NoncurrentVersionExpiration": {"NoncurrentDays": 30}
+        }
+      ]
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-phenogram-backup-setup-v1
+  namespace: minio
+  labels:
+    app.kubernetes.io/name: minio-phenogram-backup-setup
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio-phenogram-backup-setup
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              until mc alias set offsite http://minio.minio.svc.cluster.local:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                sleep 5
+              done
+              mc mb --ignore-existing "offsite/$BACKUP_BUCKET"
+              mc version enable "offsite/$BACKUP_BUCKET"
+              mc anonymous set none "offsite/$BACKUP_BUCKET"
+              mc ilm import "offsite/$BACKUP_BUCKET" < /policy/lifecycle.json
+              mc admin user add offsite "$BACKUP_ACCESS_KEY" "$BACKUP_SECRET_KEY"
+              mc admin policy create offsite phenogram-db-backup /policy/policy.json
+              mc admin policy attach offsite phenogram-db-backup --user "$BACKUP_ACCESS_KEY"
+          env:
+            - name: MC_CONFIG_DIR
+              value: /.mc
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: rootUser
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: rootPassword
+            - name: BACKUP_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: phenogram-backup-provisioning
+                  key: access-key
+            - name: BACKUP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: phenogram-backup-provisioning
+                  key: secret-key
+            - name: BACKUP_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: phenogram-backup-provisioning
+                  key: bucket
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: policy
+              mountPath: /policy
+              readOnly: true
+            - name: mc-config
+              mountPath: /.mc
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: policy
+          configMap:
+            name: phenogram-backup-policy
+        - name: mc-config
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi

@@ -1,0 +1,198 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "phenogram.fullname" . }}
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+spec:
+  replicas: {{ ternary 1 .Values.replicaCount .Values.telegramBotApi.enabled }}
+  strategy:
+    {{- if .Values.telegramBotApi.enabled }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: app
+  template:
+    metadata:
+      annotations:
+        phenogram.io/deployment-revision: {{ .Values.deploymentRevision | quote }}
+        phenogram.io/secret-revision: {{ .Values.secretRevision | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "phenogram.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: app
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "phenogram.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: phenogram-platform
+          image: {{ include "phenogram.appImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: APP_ENV
+              value: {{ .Values.config.appEnv | quote }}
+            - name: LISTEN_ADDR
+              value: {{ .Values.config.listenAddr | quote }}
+            - name: PUBLIC_BASE_URL
+              value: {{ .Values.config.publicBaseUrl | quote }}
+            - name: TELEGRAM_CLOUD_API_URL
+              value: {{ .Values.config.telegramCloudApiUrl | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.config.rustLog | quote }}
+            - name: SESSION_TTL_HOURS
+              value: {{ .Values.config.sessionTtlHours | quote }}
+            - name: RETENTION_SWEEP_SECONDS
+              value: {{ .Values.config.retentionSweepSeconds | quote }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.databaseUrlKey }}
+            - name: MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.masterKeyKey }}
+            - name: PUBLIC_ID_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.publicIdKeyKey }}
+            - name: LINK_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.linkSigningKeyKey }}
+            {{- if .Values.telegramBotApi.enabled }}
+            - name: TELEGRAM_LOCAL_API_URL
+              value: http://127.0.0.1:{{ .Values.telegramBotApi.port }}
+            - name: TELEGRAM_LOCAL_DATA_DIR
+              value: {{ .Values.telegramBotApi.dataDir | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.telegramBotApi.enabled }}
+            - name: telegram-data
+              mountPath: {{ .Values.telegramBotApi.dataDir }}
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+        {{- if .Values.telegramBotApi.enabled }}
+        - name: telegram-bot-api
+          image: {{ include "phenogram.telegramImage" . | quote }}
+          imagePullPolicy: {{ .Values.telegramBotApi.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10002
+            runAsGroup: 10002
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: TELEGRAM_API_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.telegramApiIdKey }}
+            - name: TELEGRAM_API_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.telegramApiHashKey }}
+          ports:
+            - name: telegram-http
+              containerPort: {{ .Values.telegramBotApi.port }}
+              protocol: TCP
+          volumeMounts:
+            - name: telegram-data
+              mountPath: {{ .Values.telegramBotApi.dataDir }}
+            - name: telegram-tmp
+              mountPath: /tmp
+          startupProbe:
+            tcpSocket:
+              port: telegram-http
+            failureThreshold: 120
+            periodSeconds: 5
+            timeoutSeconds: 2
+          readinessProbe:
+            tcpSocket:
+              port: telegram-http
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: telegram-http
+            failureThreshold: 3
+            periodSeconds: 30
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml .Values.telegramBotApi.resources | nindent 12 }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.telegramBotApi.enabled }}
+        - name: telegram-data
+          {{- if .Values.telegramBotApi.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "phenogram.fullname" . }}-telegram-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: telegram-tmp
+          emptyDir: {}
+        {{- end }}

@@ -1,0 +1,252 @@
+name: Build and deploy production
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: phenogram-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  APP_IMAGE: ghcr.io/phenogram/platform
+  TELEGRAM_IMAGE: ghcr.io/phenogram/telegram-bot-api
+  RELEASE_NAME: phenogram
+  KUBE_NAMESPACE: phenogram
+  PUBLIC_HEALTH_URL: https://api.phenogram.io/api/health
+
+jobs:
+  validate:
+    name: Validate source and chart
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup show active-toolchain
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Lint Rust
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Check browser application syntax
+        run: node --check assets/app.js
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
+        with:
+          version: v3.17.3
+
+      - name: Lint and render Helm chart
+        run: |
+          helm lint deploy/helm/phenogram-platform \
+            --values deploy/helm/phenogram-platform/values-production.yaml
+          helm template phenogram deploy/helm/phenogram-platform \
+            --namespace phenogram \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            > /tmp/phenogram-manifests.yaml
+          test -s /tmp/phenogram-manifests.yaml
+
+  build:
+    name: Build immutable images
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      app_digest: ${{ steps.build_app.outputs.digest }}
+      telegram_digest: ${{ steps.build_telegram.outputs.digest }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish Phenogram
+        id: build_app
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.APP_IMAGE }}:sha-${{ github.sha }}
+            ${{ env.APP_IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=phenogram-app
+          cache-to: type=gha,mode=max,scope=phenogram-app
+
+      - name: Build and publish the official local Bot API server
+        id: build_telegram
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          file: ./deploy/telegram-bot-api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.TELEGRAM_IMAGE }}:sha-${{ github.sha }}
+            ${{ env.TELEGRAM_IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=telegram-bot-api
+          cache-to: type=gha,mode=max,scope=telegram-bot-api
+
+  deploy:
+    name: Deploy to rubase
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: https://api.phenogram.io
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
+        with:
+          version: v3.17.3
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede
+        with:
+          version: v1.33.5
+
+      - name: Configure Kubernetes access
+        env:
+          RUBASE_PHENOGRAM_KUBECONFIG: ${{ secrets.RUBASE_PHENOGRAM_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          test -n "$RUBASE_PHENOGRAM_KUBECONFIG"
+          install -d -m 0700 "$HOME/.kube"
+          printf '%s' "$RUBASE_PHENOGRAM_KUBECONFIG" > "$HOME/.kube/config"
+          chmod 0600 "$HOME/.kube/config"
+          context_namespace="$(kubectl config view --minify --output 'jsonpath={..namespace}')"
+          test "$context_namespace" = "$KUBE_NAMESPACE"
+          kubectl auth can-i get deployments --namespace "$KUBE_NAMESPACE"
+          if kubectl auth can-i create namespaces >/dev/null 2>&1; then
+            printf '%s\n' 'The deployment kubeconfig is unexpectedly cluster-scoped.' >&2
+            exit 1
+          fi
+
+      - name: Reconcile deployment secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          MASTER_KEY: ${{ secrets.MASTER_KEY }}
+          PUBLIC_ID_KEY: ${{ secrets.PUBLIC_ID_KEY }}
+          LINK_SIGNING_KEY: ${{ secrets.LINK_SIGNING_KEY }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          PHENOGRAM_GHCR_PULL_CONFIG_JSON: ${{ secrets.PHENOGRAM_GHCR_PULL_CONFIG_JSON }}
+          BACKUP_ACCESS_KEY: ${{ secrets.PHENOGRAM_BACKUP_ACCESS_KEY }}
+          BACKUP_SECRET_KEY: ${{ secrets.PHENOGRAM_BACKUP_SECRET_KEY }}
+          BACKUP_ENDPOINT: ${{ secrets.PHENOGRAM_BACKUP_ENDPOINT }}
+          BACKUP_BUCKET: ${{ secrets.PHENOGRAM_BACKUP_BUCKET }}
+          RESTIC_PASSWORD: ${{ secrets.PHENOGRAM_BACKUP_RESTIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in DATABASE_URL POSTGRES_PASSWORD MASTER_KEY PUBLIC_ID_KEY LINK_SIGNING_KEY TELEGRAM_API_ID TELEGRAM_API_HASH PHENOGRAM_GHCR_PULL_CONFIG_JSON BACKUP_ACCESS_KEY BACKUP_SECRET_KEY BACKUP_ENDPOINT BACKUP_BUCKET RESTIC_PASSWORD; do
+            test -n "${!name}"
+          done
+          install -d -m 0700 "$RUNNER_TEMP/phenogram-secrets/backup"
+          umask 077
+          printf '%s' "$PHENOGRAM_GHCR_PULL_CONFIG_JSON" > "$RUNNER_TEMP/phenogram-secrets/ghcr.json"
+          {
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+            printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
+            printf 'MASTER_KEY=%s\n' "$MASTER_KEY"
+            printf 'PUBLIC_ID_KEY=%s\n' "$PUBLIC_ID_KEY"
+            printf 'LINK_SIGNING_KEY=%s\n' "$LINK_SIGNING_KEY"
+            printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
+            printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
+          } > "$RUNNER_TEMP/phenogram-secrets/app.env"
+          printf '%s' "$BACKUP_ACCESS_KEY" > "$RUNNER_TEMP/phenogram-secrets/backup/access-key"
+          printf '%s' "$BACKUP_SECRET_KEY" > "$RUNNER_TEMP/phenogram-secrets/backup/secret-key"
+          printf '%s' "$BACKUP_ENDPOINT" > "$RUNNER_TEMP/phenogram-secrets/backup/endpoint"
+          printf '%s' "$BACKUP_BUCKET" > "$RUNNER_TEMP/phenogram-secrets/backup/bucket"
+          printf '%s' "$RESTIC_PASSWORD" > "$RUNNER_TEMP/phenogram-secrets/backup/restic-password"
+          kubectl --namespace "$KUBE_NAMESPACE" create secret generic phenogram-ghcr \
+            --type=kubernetes.io/dockerconfigjson \
+            --from-file=.dockerconfigjson="$RUNNER_TEMP/phenogram-secrets/ghcr.json" \
+            --dry-run=client -o yaml | kubectl apply --server-side --field-manager=phenogram-deploy -f -
+          kubectl --namespace "$KUBE_NAMESPACE" create secret generic phenogram-secrets \
+            --from-env-file="$RUNNER_TEMP/phenogram-secrets/app.env" \
+            --dry-run=client -o yaml | kubectl apply --server-side --field-manager=phenogram-deploy -f -
+          kubectl --namespace "$KUBE_NAMESPACE" create secret generic phenogram-backup-secrets \
+            --from-file=access-key="$RUNNER_TEMP/phenogram-secrets/backup/access-key" \
+            --from-file=secret-key="$RUNNER_TEMP/phenogram-secrets/backup/secret-key" \
+            --from-file=endpoint="$RUNNER_TEMP/phenogram-secrets/backup/endpoint" \
+            --from-file=bucket="$RUNNER_TEMP/phenogram-secrets/backup/bucket" \
+            --from-file=restic-password="$RUNNER_TEMP/phenogram-secrets/backup/restic-password" \
+            --dry-run=client -o yaml | kubectl apply --server-side --field-manager=phenogram-deploy -f -
+
+      - name: Deploy the immutable release with Helm
+        env:
+          APP_DIGEST: ${{ needs.build.outputs.app_digest }}
+          TELEGRAM_DIGEST: ${{ needs.build.outputs.telegram_digest }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_DIGEST"
+          test -n "$TELEGRAM_DIGEST"
+          secret_revision="$(kubectl --namespace "$KUBE_NAMESPACE" get secret phenogram-secrets --output 'jsonpath={.metadata.resourceVersion}')"
+          test -n "$secret_revision"
+          helm upgrade --install "$RELEASE_NAME" deploy/helm/phenogram-platform \
+            --namespace "$KUBE_NAMESPACE" \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set-string image.digest="$APP_DIGEST" \
+            --set-string telegramBotApi.image.digest="$TELEGRAM_DIGEST" \
+            --set-string deploymentRevision="${GITHUB_SHA}" \
+            --set-string secretRevision="$secret_revision" \
+            --atomic \
+            --wait \
+            --timeout 20m \
+            --history-max 10
+
+      - name: Verify Kubernetes rollout
+        run: |
+          set -euo pipefail
+          kubectl --namespace "$KUBE_NAMESPACE" rollout status deployment/phenogram --timeout=5m
+          kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-postgresql --timeout=5m
+          kubectl --namespace "$KUBE_NAMESPACE" get pods,service,ingress,pvc
+
+      - name: Verify public health
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error \
+            --retry 18 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 20 \
+            "$PUBLIC_HEALTH_URL")"
+          printf '%s' "$response" | grep -q '"status":"ok"'
+          printf '%s\n' 'Public health check passed.'

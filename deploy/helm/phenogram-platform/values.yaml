@@ -1,0 +1,183 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+deploymentRevision: "local"
+secretRevision: "local"
+
+image:
+  repository: ghcr.io/phenogram/platform
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+config:
+  appEnv: production
+  listenAddr: 0.0.0.0:8080
+  publicBaseUrl: https://api.phenogram.io
+  telegramCloudApiUrl: https://api.telegram.org
+  rustLog: phenogram_platform=info,tower_http=info
+  sessionTtlHours: 720
+  retentionSweepSeconds: 3600
+
+secrets:
+  # This Secret is intentionally not created by the chart. The deployment
+  # workflow creates it without putting secret values in Helm release history.
+  existingSecret: phenogram-secrets
+  databaseUrlKey: DATABASE_URL
+  postgresPasswordKey: POSTGRES_PASSWORD
+  masterKeyKey: MASTER_KEY
+  publicIdKeyKey: PUBLIC_ID_KEY
+  linkSigningKeyKey: LINK_SIGNING_KEY
+  telegramApiIdKey: TELEGRAM_API_ID
+  telegramApiHashKey: TELEGRAM_API_HASH
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+  host: api.phenogram.io
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: api-phenogram-io-tls
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+probes:
+  startup:
+    failureThreshold: 60
+    periodSeconds: 5
+    timeoutSeconds: 3
+  readiness:
+    failureThreshold: 3
+    periodSeconds: 5
+    timeoutSeconds: 3
+  liveness:
+    failureThreshold: 3
+    periodSeconds: 15
+    timeoutSeconds: 3
+
+terminationGracePeriodSeconds: 60
+
+pdb:
+  enabled: true
+  # This single-replica MVP cannot guarantee availability during a node drain.
+  # maxUnavailable=1 avoids creating an undrainable cluster.
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+
+postgresql:
+  enabled: true
+  image:
+    repository: postgres
+    tag: 17-bookworm
+    digest: ""
+    pullPolicy: IfNotPresent
+  database: phenogram
+  username: phenogram
+  port: 5432
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  backup:
+    enabled: true
+    schedule: "17 */6 * * *"
+    timeZone: Asia/Yekaterinburg
+    existingSecret: phenogram-backup-secrets
+    stagingSize: 8Gi
+    retention:
+      daily: 14
+      weekly: 8
+      monthly: 12
+    restic:
+      repository: restic/restic
+      tag: 0.18.0
+      pullPolicy: IfNotPresent
+      checkReadDataSubset: 5%
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+telegramBotApi:
+  enabled: true
+  image:
+    repository: ghcr.io/phenogram/telegram-bot-api
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  port: 8081
+  dataDir: /var/lib/telegram-bot-api
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    retain: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi

@@ -135,7 +135,10 @@ Test restores into an isolated PostgreSQL instance with no production traffic. V
 
 For the optional local Telegram service, stop or quiesce it while taking a filesystem snapshot of `telegram-bot-api-data`, or use a storage system that provides consistent volume snapshots. Regularly test both service recovery and Telegram re-login; PostgreSQL alone does not contain its local files or runtime state.
 
-Define and test RPO/RTO for the deployment. The repository does not configure scheduled backups, point-in-time recovery, replication, or cross-region failover.
+The production Helm profile configures six-hourly encrypted off-site Restic
+backups with daily/weekly/monthly retention and repository sampling. It does not
+provide point-in-time recovery, replication, or cross-region failover. Define
+and test RPO/RTO, alert on missed jobs, and repeat isolated restore drills.
 
 ## Secret rotation
 
@@ -301,7 +304,7 @@ The companion service is still an external operational dependency. The Rust appl
 - Bot credential replacement is absent. Reconnecting after a BotFather token rotation requires deleting the existing bot record, which cascades its stored history.
 - Authentication has per-process login/registration throttling and a four-job Argon2 gate, but no MFA, email verification, password reset, organization model, or RBAC. The source limiter trusts ingress-supplied forwarding headers and is not distributed across replicas.
 - Downstream destination pinning and global-address checks reduce SSRF risk, but operator-level egress controls remain required defense in depth.
-- No metrics endpoint, scheduled backup job, object storage, multi-region failover, or automated disaster recovery is included.
+- The Helm deployment includes scheduled encrypted PostgreSQL backups to an operator-provisioned S3-compatible bucket, but no built-in metrics endpoint, point-in-time recovery, multi-region failover, or automated disaster recovery.
 - Compatibility has been exercised for the included contract tests, not certified against every Telegram method/content type. Managed update methods intentionally implement a subset of Telegram parameters.
 - Managed `setWebhook` does not accept multipart custom certificates or implement `ip_address`; `max_connections` is stored/reported but does not control the global four-worker pool.
 

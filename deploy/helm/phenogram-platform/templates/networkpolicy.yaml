@@ -1,0 +1,116 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phenogram.fullname" . }}
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: app
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+      ports:
+        - port: {{ .Values.postgresql.port }}
+          protocol: TCP
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 88
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phenogram.fullname" . }}-postgresql
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: app
+        {{- if .Values.postgresql.backup.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql-backup
+        {{- end }}
+      ports:
+        - port: {{ .Values.postgresql.port }}
+          protocol: TCP
+  egress: []
+{{- if and .Values.postgresql.enabled .Values.postgresql.backup.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phenogram.fullname" . }}-postgresql-backup
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql-backup
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+      ports:
+        - port: {{ .Values.postgresql.port }}
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP
+{{- end }}
+{{- end }}

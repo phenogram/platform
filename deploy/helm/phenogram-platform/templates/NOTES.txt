@@ -1,0 +1,11 @@
+Phenogram Platform was installed as release {{ .Release.Name }}.
+
+Public endpoint: {{ .Values.config.publicBaseUrl }}
+Health endpoint: {{ .Values.config.publicBaseUrl }}/api/health
+
+The chart expects the existing Secrets {{ .Values.secrets.existingSecret }} and
+{{ .Values.postgresql.backup.existingSecret }}. GitHub Actions creates them
+directly so their values never enter Helm values or release history.
+
+Telegram-compatible request paths contain bot tokens. Disable or redact URI
+access logs at the Traefik installation level before routing production traffic.

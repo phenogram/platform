@@ -1,0 +1,22 @@
+{{- if and .Values.telegramBotApi.enabled .Values.telegramBotApi.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "phenogram.fullname" . }}-telegram-data
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+  {{- if .Values.telegramBotApi.persistence.retain }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.telegramBotApi.persistence.accessModes | nindent 4 }}
+  {{- with .Values.telegramBotApi.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.telegramBotApi.persistence.size }}
+{{- end }}

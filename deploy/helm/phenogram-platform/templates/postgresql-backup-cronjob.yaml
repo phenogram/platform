@@ -1,0 +1,131 @@
+{{- if and .Values.postgresql.enabled .Values.postgresql.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "phenogram.fullname" . }}-postgresql-backup
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql-backup
+spec:
+  schedule: {{ .Values.postgresql.backup.schedule | quote }}
+  timeZone: {{ .Values.postgresql.backup.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 7
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 21600
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            {{- include "phenogram.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: postgresql-backup
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: pg-dump
+              image: {{ include "phenogram.postgresImage" . | quote }}
+              imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                readOnlyRootFilesystem: true
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}
+                      key: {{ .Values.secrets.postgresPasswordKey }}
+                - name: PGHOST
+                  value: {{ include "phenogram.fullname" . }}-postgresql
+                - name: PGPORT
+                  value: {{ .Values.postgresql.port | quote }}
+                - name: PGDATABASE
+                  value: {{ .Values.postgresql.database | quote }}
+                - name: PGUSER
+                  value: {{ .Values.postgresql.username | quote }}
+              command:
+                - /bin/sh
+                - -ec
+              args:
+                - |
+                  target=/snapshots/phenogram.dump
+                  pg_dump --format=custom --compress=zstd:level=6 --file="$target"
+                  pg_restore --list "$target" >/dev/null
+              volumeMounts:
+                - name: snapshots
+                  mountPath: /snapshots
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                {{- toYaml .Values.postgresql.backup.resources | nindent 16 }}
+          containers:
+            - name: restic
+              image: {{ printf "%s:%s" .Values.postgresql.backup.restic.repository .Values.postgresql.backup.restic.tag | quote }}
+              imagePullPolicy: {{ .Values.postgresql.backup.restic.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                readOnlyRootFilesystem: true
+              command:
+                - /bin/sh
+                - -ec
+              args:
+                - |
+                  export RESTIC_PASSWORD_FILE=/backup-secrets/restic-password
+                  export RESTIC_CACHE_DIR=/home/nonroot/.cache/restic
+                  export AWS_ACCESS_KEY_ID="$(cat /backup-secrets/access-key)"
+                  export AWS_SECRET_ACCESS_KEY="$(cat /backup-secrets/secret-key)"
+                  export RESTIC_REPOSITORY="s3:$(cat /backup-secrets/endpoint)/$(cat /backup-secrets/bucket)"
+                  if ! restic snapshots >/dev/null 2>&1; then
+                    restic init
+                  fi
+                  restic backup /snapshots --tag phenogram-postgresql --host rubase-phenogram
+                  restic forget \
+                    --keep-daily {{ .Values.postgresql.backup.retention.daily }} \
+                    --keep-weekly {{ .Values.postgresql.backup.retention.weekly }} \
+                    --keep-monthly {{ .Values.postgresql.backup.retention.monthly }} \
+                    --prune
+                  restic check --read-data-subset={{ .Values.postgresql.backup.restic.checkReadDataSubset }}
+              volumeMounts:
+                - name: backup-secrets
+                  mountPath: /backup-secrets
+                  readOnly: true
+                - name: snapshots
+                  mountPath: /snapshots
+                  readOnly: true
+                - name: restic-cache
+                  mountPath: /home/nonroot/.cache/restic
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                {{- toYaml .Values.postgresql.backup.resources | nindent 16 }}
+          volumes:
+            - name: backup-secrets
+              secret:
+                secretName: {{ required "postgresql.backup.existingSecret is required" .Values.postgresql.backup.existingSecret }}
+            - name: snapshots
+              emptyDir:
+                sizeLimit: {{ .Values.postgresql.backup.stagingSize }}
+            - name: restic-cache
+              emptyDir:
+                sizeLimit: 1Gi
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+{{- end }}

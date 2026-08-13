@@ -1,0 +1,47 @@
+fullnameOverride: phenogram
+
+replicaCount: 1
+
+imagePullSecrets:
+  - name: phenogram-ghcr
+
+image:
+  repository: ghcr.io/phenogram/platform
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+config:
+  appEnv: production
+  publicBaseUrl: https://api.phenogram.io
+
+secrets:
+  existingSecret: phenogram-secrets
+
+ingress:
+  enabled: true
+  className: traefik
+  host: api.phenogram.io
+  tls:
+    enabled: true
+    secretName: api-phenogram-io-tls
+
+postgresql:
+  enabled: true
+  image:
+    repository: postgres
+    tag: 17-bookworm
+  persistence:
+    size: 10Gi
+  backup:
+    enabled: true
+    existingSecret: phenogram-backup-secrets
+
+telegramBotApi:
+  enabled: true
+  image:
+    repository: ghcr.io/phenogram/telegram-bot-api
+    tag: ""
+    digest: ""
+  persistence:
+    size: 20Gi
