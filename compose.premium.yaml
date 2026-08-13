@@ -1,0 +1,24 @@
+services:
+  app:
+    environment:
+      TELEGRAM_LOCAL_API_URL: http://telegram-bot-api:8081
+      TELEGRAM_LOCAL_DATA_DIR: /var/lib/telegram-bot-api
+    depends_on:
+      telegram-bot-api:
+        condition: service_started
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: deploy/telegram-bot-api/Dockerfile
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?Set TELEGRAM_API_ID for premium local routing}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH for premium local routing}
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
+volumes:
+  telegram-bot-api-data:
