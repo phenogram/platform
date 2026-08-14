@@ -104,7 +104,7 @@ pub async fn connect_bot(
         )));
     }
 
-    let (_, me) = raw_telegram_json(
+    let (telegram_status, me) = raw_telegram_json(
         &state.telegram,
         &state.config.telegram_cloud_api_url,
         &token,
@@ -112,14 +112,7 @@ pub async fn connect_bot(
         &json!({}),
     )
     .await?;
-    if me.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(AppError::Validation(
-            me.get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Telegram rejected this bot token")
-                .to_owned(),
-        ));
-    }
+    validate_get_me_response(telegram_status, &me)?;
     let identity = me
         .get("result")
         .ok_or_else(|| AppError::Upstream("Telegram returned no bot identity".into()))?;
@@ -1058,11 +1051,31 @@ fn validate_bot_token(token: &str) -> Result<()> {
     }
 }
 
+fn validate_get_me_response(status: StatusCode, response: &Value) -> Result<()> {
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+
+    let message = if status == StatusCode::UNAUTHORIZED
+        || response.get("error_code").and_then(Value::as_u64) == Some(401)
+    {
+        "Telegram rejected this token. Check that it is complete and still active in @BotFather."
+    } else {
+        response
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("Telegram rejected this bot token")
+    };
+    Err(AppError::Validation(message.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::{ConnectBotRequest, existing_webhook, health_payload};
+    use super::{ConnectBotRequest, existing_webhook, health_payload, validate_get_me_response};
+    use crate::error::AppError;
 
     const API_BASE_URL: &str = "https://api.phenogram.io";
 
@@ -1083,6 +1096,43 @@ mod tests {
         }))
         .expect("token-only connect request should deserialize");
         assert_eq!(request.token, "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef");
+    }
+
+    #[test]
+    fn telegram_unauthorized_token_has_actionable_connect_error() {
+        let error = validate_get_me_response(
+            StatusCode::UNAUTHORIZED,
+            &json!({
+                "ok": false,
+                "error_code": 401,
+                "description": "Unauthorized"
+            }),
+        )
+        .expect_err("Telegram 401 must reject the token");
+
+        assert!(matches!(
+            error,
+            AppError::Validation(message)
+                if message == "Telegram rejected this token. Check that it is complete and still active in @BotFather."
+        ));
+    }
+
+    #[test]
+    fn other_telegram_connect_errors_keep_their_description() {
+        let error = validate_get_me_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: test rejection"
+            }),
+        )
+        .expect_err("Telegram rejection must fail the connection");
+
+        assert!(matches!(
+            error,
+            AppError::Validation(message) if message == "Bad Request: test rejection"
+        ));
     }
 
     #[test]
