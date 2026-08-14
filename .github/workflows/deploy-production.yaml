@@ -133,7 +133,7 @@ jobs:
             --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
             --show-only templates/telegram-data-plane-pools.yaml \
             > /tmp/phenogram-pools.yaml
-          test "$(grep -c 'runAsGroup: 10001' /tmp/phenogram-pools.yaml)" -eq 8
+          test "$(grep -c 'runAsGroup: 10001' /tmp/phenogram-pools.yaml)" -eq 6
           test "$(grep -c 'fsGroup: 10001' /tmp/phenogram-pools.yaml)" -eq 2
           test "$(grep -c 'runAsUser: 10002' /tmp/phenogram-pools.yaml)" -eq 2
           test "$(grep -c 'runAsUser: 10001' /tmp/phenogram-pools.yaml)" -eq 2

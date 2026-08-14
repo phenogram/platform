@@ -118,11 +118,10 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      # All pool containers share group 10001 without sharing a UID. This lets
-      # the official process write data/tap.sock and the file sidecar read data.
+      # The pod-level fsGroup makes shared volumes group-accessible. Each
+      # container sets group 10001 alongside its own distinct UID below.
       securityContext:
         runAsNonRoot: true
-        runAsGroup: 10001
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
