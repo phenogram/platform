@@ -82,24 +82,28 @@ telegramBotApi:
     size: 20Gi
 
 dataPlane:
-  # Shadow resources stay off until the internal route snapshot endpoint,
-  # collector image, and a dedicated canary bot have been verified together.
-  enabled: false
+  # Keep the replacement data plane private until its pinned shadow resources
+  # are healthy on Contabo. Public /bot and /file traffic remains unchanged.
+  enabled: true
   publicCutover: false
   gateway:
     image:
       repository: ghcr.io/phenogram/data-plane-gateway
+      digest: sha256:a6e335140960184466f8fcb47f503504e21a4220dc2c0473b4151569d84f751d
     persistence:
       storageClass: standard
   official:
     image:
       repository: ghcr.io/phenogram/telegram-bot-api
+      digest: sha256:f8ec61f69fbfc8eb8d2bd302deaa07245068e3713e0977ca605c9b77348246de
     collector:
       image:
         repository: ghcr.io/phenogram/platform
+        digest: sha256:a3fd7e6802c4dcac49a9fdbcb6d18ac1c19bd2e33cb1fb6a1b1fe71cd846e42f
     fileServer:
       image:
         repository: ghcr.io/phenogram/data-plane-gateway
+        digest: sha256:a6e335140960184466f8fcb47f503504e21a4220dc2c0473b4151569d84f751d
     pools:
       - name: standard
         localMode: false
