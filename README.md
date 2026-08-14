@@ -231,9 +231,7 @@ Read [docs/operations.md](docs/operations.md) before exposing the service. It co
 
 The production Helm chart and `master` deployment workflow live under
 [`deploy/helm/phenogram-platform`](deploy/helm/phenogram-platform) and
-[`deploy-production.yaml`](.github/workflows/deploy-production.yaml). The
-one-time Contabo Flux resources are in
-[`deploy/flux/phenogram-production.yaml`](deploy/flux/phenogram-production.yaml).
+[`deploy-production.yaml`](.github/workflows/deploy-production.yaml).
 
 ## License
 

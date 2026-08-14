@@ -26,9 +26,9 @@ different shared-file design plus distributed SSE and rate limiting.
   `app.kubernetes.io/name=ingress-nginx`.
 - cert-manager with a `letsencrypt-prod` ClusterIssuer.
 - The `standard` StorageClass.
-- Flux source-controller and helm-controller with support for OCIRepository and
-  HelmRelease resources. Apply `deploy/flux/phenogram-production.yaml` once as
-  a cluster administrator.
+- A repository secret named `KUBECONFIG`, following the same direct Helm
+  deployment pattern as the other Contabo applications. Phenogram's credential
+  is restricted to the `phenogram` namespace.
 - DNS-only `A` records for `phenogram.io`, `app.phenogram.io`, and
   `api.phenogram.io`, each pointing to `84.247.177.201`.
 
@@ -41,11 +41,10 @@ arrives.
 ## Secret contract
 
 The chart deliberately renders no Kubernetes Secret. Provision these three
-external resources in the `phenogram` namespace before enabling the
-HelmRelease:
+external resources in the `phenogram` namespace before running Helm:
 
 - `phenogram-ghcr`, a `kubernetes.io/dockerconfigjson` credential that can read
-  the private image and chart packages under `ghcr.io/phenogram`.
+  the private images under `ghcr.io/phenogram`.
 - `phenogram-secrets`, with `DATABASE_URL`, `POSTGRES_PASSWORD`, `MASTER_KEY`,
   `PUBLIC_ID_KEY`, `LINK_SIGNING_KEY`, `GOOGLE_OAUTH_CLIENT_ID`,
   `GOOGLE_OAUTH_CLIENT_SECRET`, `GITHUB_OAUTH_CLIENT_ID`,
@@ -67,11 +66,11 @@ Manage them through a restricted cluster secret workflow or SOPS. After a
 manual secret rotation, restart the application Deployment so its processes
 load the new values.
 
-GitHub Actions needs no Kubernetes, SSH, runtime, database, OAuth, or Telegram
-credential. A push to `master` uses only the ephemeral repository
-`GITHUB_TOKEN` to publish digest-pinned images and a merged production Helm
-chart to `ghcr.io/phenogram/phenogram-platform`. Flux selects the newest chart
-version and helm-controller performs the namespace-scoped upgrade on Contabo.
+GitHub Actions receives only the namespace-limited `KUBECONFIG` deployment
+credential. A push to `master` publishes digest-pinned images and runs Helm
+directly against the `phenogram` namespace. Runtime, database, OAuth, Telegram,
+backup, and TLS secrets remain in Kubernetes and are never copied into the
+workflow.
 
 The chart renders namespace-scoped NetworkPolicy resources. Contabo's current
 Minikube `bridge` CNI does not enforce NetworkPolicy, so these manifests are
@@ -106,7 +105,7 @@ helm template phenogram deploy/helm/phenogram-platform \
 ```
 
 Migrations run during application startup. The workflow uses immutable image
-digests, publishes an immutable OCI chart, waits for Flux to expose the exact
-commit revision on the Contabo origin, and runs positive and negative checks
-across all three hosts. Take a restorable backup before merging a migration
-into `master` when production contains data worth preserving.
+digests, an atomic Helm upgrade, waits for the exact commit revision on the
+Contabo origin, and runs positive and negative checks across all three hosts.
+Take a restorable backup before merging a migration into `master` when
+production contains data worth preserving.
