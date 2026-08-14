@@ -552,11 +552,7 @@ svg { display: block; }
 .social-icon { width: 21px; height: 21px; flex: 0 0 auto; }
 .auth-error { margin: 0 0 18px; padding: 12px 13px; display: flex; align-items: flex-start; gap: 9px; border: 1px solid #f3c2bf; border-radius: 10px; color: #9d2825; background: var(--danger-soft); font-size: 12px; line-height: 1.55; }
 .auth-error .icon { width: 17px; margin-top: 1px; flex: 0 0 auto; }
-.auth-privacy { margin-top: 22px; padding: 14px; display: flex; align-items: flex-start; gap: 10px; border-radius: 11px; color: var(--ink-soft); background: var(--surface-muted); font-size: 12px; line-height: 1.6; }
-.auth-privacy .icon { width: 18px; margin-top: 1px; flex: 0 0 auto; color: var(--mint); }
-.auth-privacy p { margin: 0; }
-.auth-privacy strong { display: block; color: var(--ink); }
-.auth-fineprint { margin: 15px 3px 0; color: var(--ink-faint); font-size: 11px; line-height: 1.55; }
+.auth-fineprint { margin: 18px 3px 0; color: var(--ink-faint); font-size: 11px; line-height: 1.55; }
 .auth-policy { margin: 12px 3px 0; font-size: 12px; }
 .auth-policy a { color: var(--primary); font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
 

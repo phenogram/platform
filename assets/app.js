@@ -641,8 +641,6 @@
   }
 
   function renderLanding() {
-    const healthy = String(state.health?.status || "").toLowerCase();
-    const statusText = healthy === "ok" || healthy === "healthy" ? "All systems operational" : healthy === "down" ? "Service status unavailable" : "Production-ready foundation";
     return `
       <main class="landing" id="main-content" tabindex="-1">
         <header class="landing__header">
@@ -658,7 +656,7 @@
 
         <section class="hero">
           <div class="hero__copy">
-            <div class="hero__badge"><span class="hero__badge-dot"></span>${esc(statusText)}</div>
+            <div class="hero__badge"><span class="hero__badge-dot"></span>Bot API observability platform</div>
             <h1>Telegram bots,<br><em>finally observable.</em></h1>
             <p class="hero__lead">Keep the Bot API your code already knows. Add durable updates, real-time debugging, safer file access, and an operator view—with one endpoint change.</p>
             <div class="hero__actions">
@@ -712,11 +710,11 @@
 
         <section class="landing-section landing-section--dark" id="security"><div class="landing-section__inner security-band">
           <div class="security-orbit">${icon("lock")}</div>
-          <div class="security-copy"><p class="eyebrow">Designed for sensitive credentials</p><h2>Your token proves ownership. It never becomes product UI.</h2><p>Phenogram verifies a bot server-side, encrypts the token at rest, and redacts credentials from request history. Public bot keys identify; they never authorize API calls.</p><div class="security-list"><div>${icon("check")}Encrypted token storage</div><div>${icon("check")}Expiring, scoped file links</div><div>${icon("check")}Audited operator actions</div><div>${icon("check")}Explicit bot deletion controls</div></div></div>
+          <div class="security-copy"><p class="eyebrow">Designed for sensitive credentials</p><h2>Your bot token stays private.</h2><p>Phenogram verifies a bot server-side, encrypts the token at rest, and redacts credentials from request history. Public bot keys identify; they never authorize API calls.</p><div class="security-list"><div>${icon("check")}Encrypted token storage</div><div>${icon("check")}Expiring, scoped file links</div><div>${icon("check")}Audited operator actions</div><div>${icon("check")}Explicit bot deletion controls</div></div></div>
         </div></section>
 
         <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="${esc(appHref("/login"))}">Start with one free bot ${icon("arrow")}</a></section>
-        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="${esc(landingHref())}"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="${esc(privacyHref())}">Privacy</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a><span>Status: ${esc(statusText)}</span></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
+        <footer class="landing-footer"><div class="landing-footer__inner"><a class="brand" href="${esc(landingHref())}"><span class="brand-mark"><span></span><span></span><span></span></span>Phenogram</a><div class="landing-footer__links"><a href="#platform">Platform</a><a href="#pricing">Pricing</a><a href="#security">Security</a><a href="${esc(privacyHref())}">Privacy</a><a href="https://github.com/phenogram/platform" target="_blank" rel="noreferrer">Source</a></div><div class="landing-footer__note">Independent software. Not affiliated with Telegram.</div></div></footer>
       </main>`;
   }
 
@@ -728,7 +726,7 @@
         <section><h2>Identity data we use</h2><p>When you choose social sign-in, we store the provider name, its stable account identifier, and the public profile fields needed to show your identity in the console: display name, username, and avatar URL. Your provider password is never shared with Phenogram.</p></section>
         <section><h2>Why we use it</h2><p>The stable provider identifier lets us return you to the same Phenogram workspace. Public profile fields make that account recognizable to you. We do not use this data for advertising or sell it.</p></section>
         <section><h2>Operational data</h2><p>Phenogram stores the bot configuration, updates, API activity, and operator actions needed to provide the platform. Bot tokens are encrypted at rest. Retention depends on the selected membership plan.</p></section>
-        <section><h2>Deletion</h2><p>You can delete individual bots and their Phenogram data from the console. Account-deletion support is handled through the public project until an in-app deletion control is available.</p></section>
+        <section><h2>Deletion</h2><p>You can delete individual bots and their Phenogram data from the console. Account deletion requests are handled through the public project.</p></section>
         <section><h2>Open development</h2><p>Phenogram is developed publicly. Privacy questions and account-deletion requests can be submitted through the <a href="https://github.com/phenogram/platform/issues" target="_blank" rel="noreferrer">Phenogram platform issue tracker</a>. Do not include bot tokens or other secrets in a public issue.</p></section>
         <p class="privacy-updated">Effective August 13, 2026</p>
       </article>
@@ -744,17 +742,16 @@
       <section class="auth-panel">
         <a class="brand" href="${esc(landingHref())}"><span class="brand-mark brand-mark--primary"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
         <div class="auth-panel__body">
-          <p class="eyebrow">Developer console</p>
-          <h1>Continue to Phenogram.</h1>
-          <p class="auth-panel__lead">Use Google or GitHub to sign in. Your free workspace is created automatically the first time.</p>
+          <p class="eyebrow">Phenogram console</p>
+          <h1>Manage your Telegram bots.</h1>
+          <p class="auth-panel__lead">Inspect updates, trace deliveries, and reply to users from Bot View.</p>
           ${state.authError || state.errors.session ? `<div class="auth-error" role="alert">${icon("alert")}<span>${esc(state.authError || state.errors.session)}</span></div>` : ""}
           <div class="oauth-stack" role="group" aria-label="Social sign-in options">
             <a class="oauth-button oauth-button--google" href="${API}/auth/oauth/google/start"><svg class="social-icon" aria-hidden="true"><use href="#i-google"></use></svg><span>Continue with Google</span></a>
             <a class="oauth-button oauth-button--github" href="${API}/auth/oauth/github/start"><svg class="social-icon" aria-hidden="true"><use href="#i-github"></use></svg><span>Continue with GitHub</span></a>
           </div>
-          <div class="auth-privacy">${icon("shield")}<p><strong>No email requested or stored.</strong> Phenogram receives only the provider identity needed to recognize your account, plus your public display name and username.</p></div>
-          <p class="auth-fineprint">By continuing, you authorize the selected provider to confirm your identity. Phenogram never receives your provider password.</p>
-          <p class="auth-policy"><a href="${esc(privacyHref())}">Read the privacy policy</a></p>
+          <p class="auth-fineprint">New to Phenogram? Your free workspace is created automatically.</p>
+          <p class="auth-policy"><a href="${esc(privacyHref())}">Privacy policy</a></p>
         </div>
       </section>
       <aside class="auth-side" aria-hidden="true"><div class="auth-side__content"><p class="eyebrow">Bot operations, made legible</p><h2>Every update has a story.</h2><p>Phenogram keeps the payload, delivery path, API activity, and conversation context together—so production debugging starts with evidence.</p><div class="auth-quote"><span class="auth-quote__event">update.message</span> received<br><span class="auth-quote__delivery">delivery.webhook</span> 200 OK · 36 ms<br><span class="auth-quote__trace">trace</span> phg_01J8F9…</div></div></aside>
@@ -1107,7 +1104,7 @@
     const bot = currentBot();
     return `<div class="page page--narrow">
       ${pageHeader("Settings", "Manage your account and the currently selected bot.")}
-      <section class="panel"><div class="panel__head"><div><h2>Account</h2><p>Your Phenogram workspace identity</p></div></div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Social identity</h3><p>Authenticated by your provider without sharing an email address.</p></div><div class="identity-card"><span class="account-chip__avatar">${initials(identity)}</span><div><strong>${esc(identity)}</strong><span>${esc(userIdentityMeta())} · ${esc(membershipPlan())} membership</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Privacy</h3><p>Phenogram does not request or store your email address.</p></div><div class="form-note">${icon("shield")}Only the provider’s stable account identifier and the public identity shown above are kept for sign-in.</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Session</h3><p>End the current browser session securely.</p></div><div><button class="btn btn--secondary" type="button" data-action="logout">${icon("logout")}Sign out</button></div></div></div></section>
+      <section class="panel"><div class="panel__head"><div><h2>Account</h2><p>Your Phenogram workspace identity</p></div></div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Sign-in method</h3><p>The provider used to access this workspace.</p></div><div class="identity-card"><span class="account-chip__avatar">${initials(identity)}</span><div><strong>${esc(identity)}</strong><span>${esc(userIdentityMeta())} · ${esc(membershipPlan())} membership</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Session</h3><p>End the current browser session securely.</p></div><div><button class="btn btn--secondary" type="button" data-action="logout">${icon("logout")}Sign out</button></div></div></div></section>
       ${bot ? `<section class="panel panel--spaced"><div class="panel__head"><div><h2>Selected bot</h2><p>Ownership and data controls for ${esc(botName(bot))}</p></div><a class="btn btn--secondary btn--sm" href="${botPath(botId(bot), "settings")}">Manage bot ${icon("chevron")}</a></div><div class="panel__body"><div class="identity-card"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><div><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></div></div></div></section>` : ""}
     </div>`;
   }
