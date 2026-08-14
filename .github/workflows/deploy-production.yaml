@@ -172,8 +172,9 @@ jobs:
             --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
             --set-string deploymentRevision=validation \
             > /tmp/phenogram-cutover-manifests.yaml
-          grep -q 'path: /bot' /tmp/phenogram-cutover-manifests.yaml
-          grep -q 'path: /file' /tmp/phenogram-cutover-manifests.yaml
+          grep -Fq 'nginx.ingress.kubernetes.io/use-regex: "true"' /tmp/phenogram-cutover-manifests.yaml
+          grep -Fq 'path: /bot.*' /tmp/phenogram-cutover-manifests.yaml
+          grep -Fq 'path: /file/bot.*' /tmp/phenogram-cutover-manifests.yaml
           if helm template phenogram deploy/helm/phenogram-platform \
             --values deploy/helm/phenogram-platform/values-production.yaml \
             --set dataPlane.enabled=true \

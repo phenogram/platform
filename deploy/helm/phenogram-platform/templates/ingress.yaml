@@ -2,6 +2,9 @@
 {{- $fullname := include "phenogram.fullname" . -}}
 {{- $appAnnotations := mergeOverwrite (dict) .Values.ingress.annotations .Values.ingress.app.annotations -}}
 {{- $apiAnnotations := mergeOverwrite (dict) .Values.ingress.annotations .Values.ingress.api.annotations -}}
+{{- if and .Values.dataPlane.enabled .Values.dataPlane.publicCutover -}}
+{{- $_ := set $apiAnnotations "nginx.ingress.kubernetes.io/use-regex" "true" -}}
+{{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -115,17 +118,16 @@ spec:
           {{- if and .Values.dataPlane.enabled .Values.dataPlane.publicCutover }}
           # Only the native Telegram API shapes move to the database-independent
           # gateway. /telegram, /events, and /public remain on the control app.
-          # ImplementationSpecific is intentional: ingress-nginx's prefix
-          # location matches Telegram's segment-less /bot<TOKEN> form, whereas
-          # Kubernetes Prefix semantics would only match /bot or /bot/... .
-          - path: /bot
+          # Regex locations are required because Telegram's native API uses the
+          # segment-less /bot<TOKEN> form rather than /bot/<TOKEN>.
+          - path: /bot.*
             pathType: ImplementationSpecific
             backend:
               service:
                 name: {{ $fullname }}-data-plane-gateway
                 port:
                   name: public-http
-          - path: /file
+          - path: /file/bot.*
             pathType: ImplementationSpecific
             backend:
               service:
