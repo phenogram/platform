@@ -104,7 +104,9 @@ Do not log request bodies: updates and Bot API requests may contain personal dat
 
 OAuth state cookies are short-lived and are validated before exchanging a callback code. Add distributed edge limits to OAuth start and callback routes before running multiple replicas or accepting substantial public traffic; provider-side limits are not a substitute for application-edge abuse controls.
 
-When a connected bot already has a Telegram webhook, its URL is used only in that request to show the owner what would be replaced. Current schema does not retain the URL: migration `0006_remove_plaintext_webhook_url.sql` drops the legacy column, and the expiring audit entry records only whether takeover occurred. Backups created before that migration may still contain the old value and should be handled accordingly.
+When a bot already has a Telegram webhook, connection automatically imports its URL, `allowed_updates`, and `max_connections` into `bot_update_state` before Phenogram installs its managed Telegram ingress. This lets Phenogram journal each update and continue delivery to the existing destination without a confirmation/retry step. The downstream URL is retained because it is required for delivery; the expiring audit entry records only whether a transfer occurred. Migration `0006_remove_plaintext_webhook_url.sql` removes the obsolete duplicate URL column from `bots`.
+
+Telegram's `getWebhookInfo` response does not include the existing `secret_token` or uploaded certificate. If the downstream endpoint validates `X-Telegram-Bot-Api-Secret-Token`, call `setWebhook` through Phenogram after connecting to store that secret. A webhook using a custom certificate cannot be transferred automatically and must first move to a publicly trusted HTTPS certificate. Treat downstream webhook URLs as sensitive operational data in database access, exports, and backups.
 
 ## Monitoring and readiness
 

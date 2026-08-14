@@ -1147,10 +1147,7 @@
     modalRoot.dataset.modalName = name;
     if (name === "connect") {
       const atLimit = state.bots.length >= membershipLimit();
-      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-modal-panel><header class="modal__head"><div><h2 id="connect-title">${atLimit ? "Your bot limit is full" : "Connect a Telegram bot"}</h2><p>${atLimit ? `The ${membershipPlan()} plan includes ${membershipLimit()} bot${membershipLimit() === 1 ? "" : "s"}.` : "Paste a BotFather token to prove ownership."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header>${atLimit ? `<div class="modal__body"><div class="form-note">${icon("info")}Your existing bots stay active. Upgrade the workspace before connecting another bot.</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Not now</button><button class="btn btn--primary" type="button" data-action="go-billing">See plans</button></footer>` : `<form id="connect-bot-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="field"><div class="field__row"><label for="bot-token">Telegram bot token</label><span class="field__hint">From @BotFather</span></div><div class="input-wrap">${icon("lock")}<input id="bot-token" name="token" type="password" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="123456789:AA…" required></div><p class="field__hint">The token is sent directly to Phenogram over this secure session. It is never stored in this browser or displayed again.</p></div><div class="form-note">${icon("shield")}Phenogram checks getMe to confirm the Telegram identity, then encrypts the credential at rest.</div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Verify and connect ${icon("arrow")}</button></footer></form>`}</section></div>`;
-      if (!atLimit) {
-        modalRoot.querySelector(".form-note")?.insertAdjacentHTML("beforebegin", `<label class="webhook-consent"><input name="accept_webhook_takeover" type="checkbox"><span><strong>Allow a coordinated webhook migration</strong>If Telegram reports an existing webhook, Phenogram may replace it only after this box is checked. The current destination is shown before you retry.</span></label>`);
-      }
+      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-modal-panel><header class="modal__head"><div><h2 id="connect-title">${atLimit ? "Your bot limit is full" : "Connect a Telegram bot"}</h2><p>${atLimit ? `The ${membershipPlan()} plan includes ${membershipLimit()} bot${membershipLimit() === 1 ? "" : "s"}.` : "Paste the token from @BotFather."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header>${atLimit ? `<div class="modal__body"><div class="form-note">${icon("info")}Your existing bots stay active. Upgrade the workspace before connecting another bot.</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Not now</button><button class="btn btn--primary" type="button" data-action="go-billing">See plans</button></footer>` : `<form id="connect-bot-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="field"><div class="field__row"><label for="bot-token">Telegram bot token</label><span class="field__hint">From @BotFather</span></div><div class="input-wrap">${icon("lock")}<input id="bot-token" name="token" type="password" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="123456789:AA…" required></div><p class="field__hint">Your token is encrypted and will not be shown again.</p></div><div class="form-note">${icon("info")}Connecting transfers this bot’s webhook to Phenogram. If a webhook is already set, Phenogram will keep delivering updates to the same destination.</div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Verify and connect ${icon("arrow")}</button></footer></form>`}</section></div>`;
       return;
     }
     if (name === "bot-picker") {
@@ -1193,11 +1190,10 @@
     const data = new FormData(form);
     const sessionVersion = state.sessionVersion;
     let token = String(data.get("token") || "").trim();
-    const acceptWebhookTakeover = data.get("accept_webhook_takeover") === "on";
     if (!token) { formError(form, "Paste the token provided by BotFather."); return; }
     setSubmitting(form, true, "Verifying with Telegram…");
     try {
-      const payload = await api("/bots", { method: "POST", body: { token, accept_webhook_takeover: acceptWebhookTakeover } });
+      const payload = await api("/bots", { method: "POST", body: { token } });
       if (state.sessionVersion !== sessionVersion || !state.user) return;
       token = "";
       form.reset();
@@ -1213,13 +1209,9 @@
       if (state.sessionVersion !== sessionVersion || !state.user || !form.isConnected) return;
       formError(form, errorMessage(error));
       setSubmitting(form, false);
-      if (error.status === 409 && !acceptWebhookTakeover) {
-        form.elements.accept_webhook_takeover.focus();
-      } else {
-        token = "";
-        form.elements.token.value = "";
-        form.elements.token.focus();
-      }
+      token = "";
+      form.elements.token.value = "";
+      form.elements.token.focus();
     }
   }
 

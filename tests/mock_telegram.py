@@ -45,6 +45,12 @@ class Handler(BaseHTTPRequestHandler):
             STATE["deliveries"] = []
             self.respond(200, {"ok": True})
             return
+        if path == "/__seed_webhook":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b"{}"
+            STATE["webhook"] = json.loads(body)
+            self.respond(200, {"ok": True})
+            return
         if path == "/__downstream":
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b"{}"
@@ -70,7 +76,14 @@ class Handler(BaseHTTPRequestHandler):
             result = {"id": 123456789, "is_bot": True, "first_name": "Phenogram Test", "username": "phenogram_test_bot"}
         elif normalized == "getwebhookinfo":
             webhook = STATE["webhook"]
-            result = {"url": webhook.get("url", ""), "has_custom_certificate": False, "pending_update_count": 0}
+            result = {
+                "url": webhook.get("url", ""),
+                "has_custom_certificate": webhook.get("has_custom_certificate", False),
+                "pending_update_count": 0,
+            }
+            for field in ("allowed_updates", "max_connections"):
+                if field in webhook:
+                    result[field] = webhook[field]
         elif normalized == "setwebhook":
             STATE["webhook"] = params
             result = True

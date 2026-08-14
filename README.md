@@ -61,7 +61,7 @@ docker compose up --build -d
 curl -fsS http://app.localhost/api/health
 ```
 
-Open `http://localhost` for the landing page or `http://app.localhost` for the developer console, sign in with Google or GitHub, and connect the bot token. The default Caddy sites deliberately exercise all three public surfaces locally; `*.localhost` resolves to loopback in modern browsers. Phenogram verifies `getMe`, checks for an existing Telegram webhook, encrypts the credential, and asks Telegram to deliver updates to Phenogram.
+Open `http://localhost` for the landing page or `http://app.localhost` for the developer console, sign in with Google or GitHub, and connect the bot token. The default Caddy sites deliberately exercise all three public surfaces locally; `*.localhost` resolves to loopback in modern browsers. Phenogram verifies `getMe`, imports any existing Telegram webhook as the downstream destination, encrypts the credential, and asks Telegram to deliver updates to Phenogram.
 
 Production has three public origins: `LANDING_BASE_URL=https://phenogram.io` serves only the public landing experience, `APP_BASE_URL=https://app.phenogram.io` serves the authenticated console and management API, and `API_BASE_URL=https://api.phenogram.io` serves Telegram-compatible bot/file routes, Telegram ingress, SSE, and signed downloads. Configure all three without a trailing slash. They must be distinct HTTPS hosts in production.
 
@@ -209,7 +209,7 @@ Routing migration is explicitly confirmed, serialized per bot, and invokes Teleg
 - OAuth state is bound to a short-lived, secure browser cookie, and provider callbacks accept an authorization code only after validating that state.
 - Upstream ingress requires Telegram's secret-token header and update IDs are deduplicated per bot.
 - Downstream webhook delivery disables inherited proxies, rejects non-global production addresses, resolves once per attempt, and pins the request to the validated addresses. Keep infrastructure egress policy as an additional control.
-- Existing Telegram webhook URLs are used only to request explicit takeover confirmation; they are not persisted. Audit metadata stores only whether a migration occurred.
+- Connecting a bot automatically transfers an existing Telegram webhook: Phenogram stores its URL, allowed update types, and connection limit as downstream delivery settings before installing the managed Telegram ingress. Audit metadata records only whether a transfer occurred. Telegram does not reveal an existing webhook `secret_token`, so an endpoint that validates that header must set the webhook again through Phenogram after connecting.
 - The bundled runtime image runs as an unprivileged user. Caddy terminates TLS, adds security headers, and redacts credential-bearing request fields.
 
 The update journal and conversation data are plaintext application data inside PostgreSQL, so disk encryption, access control, network isolation, backups, deletion policy, and applicable privacy obligations remain deployment responsibilities. Authentication and SSE limits are process-local; multi-replica deployments need distributed/edge enforcement. There is no built-in MFA, provider-account recovery, WAF, or organization/RBAC model in this MVP.

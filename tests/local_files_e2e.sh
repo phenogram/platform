@@ -44,7 +44,7 @@ csrf="$(jq -er '.csrf_token' <<<"$session")"
 connected="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
-  -d "{\"token\":\"$bot_token\",\"accept_webhook_takeover\":true}" \
+  -d "{\"token\":\"$bot_token\"}" \
   "$base_url/api/bots")"
 bot_id="$(jq -er '.bot.id' <<<"$connected")"
 

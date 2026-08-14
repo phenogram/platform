@@ -18,7 +18,7 @@ use crate::{
     state::AppState,
     telegram::{
         ALL_UPDATE_TYPES, OutboundMessageRecord, decrypt_token, raw_telegram_json,
-        record_outbound_message, telegram_json_for_bot,
+        record_outbound_message, telegram_json_for_bot, validate_webhook_url,
     },
 };
 
@@ -65,8 +65,13 @@ struct PlanRow {
 #[derive(Debug, Deserialize)]
 pub struct ConnectBotRequest {
     token: String,
-    #[serde(default)]
-    accept_webhook_takeover: bool,
+}
+
+#[derive(Debug)]
+struct ExistingWebhook {
+    url: String,
+    allowed_updates: Value,
+    max_connections: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,18 +156,11 @@ pub async fn connect_bot(
         &json!({}),
     )
     .await?;
-    let previous_webhook = webhook_info
-        .pointer("/result/url")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    if let Some(url) = previous_webhook.as_deref()
-        && !input.accept_webhook_takeover
-    {
-        return Err(AppError::Conflict(format!(
-            "This bot currently delivers updates to {url}. Confirm the migration to Phenogram before continuing."
-        )));
-    }
+    let previous_webhook = existing_webhook(
+        &webhook_info,
+        &state.config.api_base_url,
+        state.config.app_env != "production",
+    )?;
 
     let bot_id = Uuid::new_v4();
     let public_id = state.crypto.bot_public_id(&token);
@@ -202,10 +200,35 @@ pub async fn connect_bot(
         }
         return Err(error.into());
     }
-    sqlx::query("INSERT INTO bot_update_state (bot_id) VALUES ($1)")
-        .bind(bot_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        r#"INSERT INTO bot_update_state
+               (bot_id, allowed_updates, downstream_webhook_url, max_connections)
+           VALUES ($1, $2, $3, $4)"#,
+    )
+    .bind(bot_id)
+    .bind(
+        previous_webhook
+            .as_ref()
+            .map(|webhook| &webhook.allowed_updates),
+    )
+    .bind(
+        previous_webhook
+            .as_ref()
+            .map(|webhook| webhook.url.as_str()),
+    )
+    .bind(
+        previous_webhook
+            .as_ref()
+            .map_or(40, |webhook| webhook.max_connections),
+    )
+    .execute(&mut *tx)
+    .await?;
+    if previous_webhook.is_some() {
+        sqlx::query("UPDATE bots SET update_mode = 'webhook' WHERE id = $1")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
            SELECT $1, bots.id, 'bot.connected', $3,
@@ -249,9 +272,11 @@ pub async fn connect_bot(
         .execute(&state.db)
         .await?;
     let mut warnings: Vec<String> = Vec::new();
-    if previous_webhook.is_some() {
+    if previous_webhook.is_some() && provisioned {
+        // Telegram's getWebhookInfo response deliberately omits secret_token,
+        // so the previous downstream authentication header cannot be recovered.
         warnings.push(
-            "Phenogram replaced the bot's previous Telegram webhook after your confirmation."
+            "Webhook transferred automatically. If the existing receiver validates Telegram's secret-token header, configure that secret again with setWebhook through Phenogram."
                 .into(),
         );
     }
@@ -263,6 +288,91 @@ pub async fn connect_bot(
         StatusCode::CREATED,
         Json(ConnectBotResponse { bot, warnings }),
     ))
+}
+
+fn existing_webhook(
+    webhook_info: &Value,
+    api_base_url: &str,
+    allow_insecure_development: bool,
+) -> Result<Option<ExistingWebhook>> {
+    if webhook_info.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(AppError::Upstream(
+            webhook_info
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Telegram did not return webhook information")
+                .to_owned(),
+        ));
+    }
+    let result = webhook_info
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AppError::Upstream("Telegram returned invalid webhook information".into())
+        })?;
+    let Some(url) = result
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(None);
+    };
+    if is_managed_ingress_url(url, api_base_url) {
+        return Ok(None);
+    }
+    if result
+        .get("has_custom_certificate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(AppError::Validation(
+            "The bot's existing webhook uses a custom certificate that Telegram cannot transfer. Switch it to a publicly trusted certificate and try again."
+                .into(),
+        ));
+    }
+    validate_webhook_url(url, allow_insecure_development).map_err(|_| {
+        AppError::Validation(
+            "The bot's existing webhook cannot be transferred safely. Update it in Telegram and try again."
+                .into(),
+        )
+    })?;
+    let allowed_updates = result
+        .get("allowed_updates")
+        .filter(|value| {
+            value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string))
+        })
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let max_connections = result
+        .get("max_connections")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(40);
+    Ok(Some(ExistingWebhook {
+        url: url.to_owned(),
+        allowed_updates,
+        max_connections,
+    }))
+}
+
+fn is_managed_ingress_url(candidate: &str, api_base_url: &str) -> bool {
+    let (Ok(candidate), Ok(api_base)) = (url::Url::parse(candidate), url::Url::parse(api_base_url))
+    else {
+        return false;
+    };
+    candidate.scheme() == api_base.scheme()
+        && candidate
+            .host_str()
+            .zip(api_base.host_str())
+            .is_some_and(|(candidate, api)| candidate.eq_ignore_ascii_case(api))
+        && candidate.port_or_known_default() == api_base.port_or_known_default()
+        && candidate
+            .path()
+            .strip_prefix("/telegram/webhook/")
+            .is_some_and(|public_id| !public_id.is_empty() && !public_id.contains('/'))
 }
 
 pub async fn provision_bot(
@@ -987,5 +1097,125 @@ fn validate_bot_token(token: &str) -> Result<()> {
         Err(AppError::Validation(
             "Enter a valid Telegram bot token".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ConnectBotRequest, existing_webhook};
+
+    const API_BASE_URL: &str = "https://api.phenogram.io";
+
+    #[test]
+    fn connect_request_needs_only_the_bot_token() {
+        let request: ConnectBotRequest = serde_json::from_value(json!({
+            "token": "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+        }))
+        .expect("token-only connect request should deserialize");
+        assert_eq!(request.token, "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef");
+    }
+
+    #[test]
+    fn imports_supported_existing_webhook_delivery_settings() {
+        let webhook = existing_webhook(
+            &json!({
+                "ok": true,
+                "result": {
+                    "url": "https://receiver.example/telegram",
+                    "has_custom_certificate": false,
+                    "allowed_updates": ["message", "callback_query"],
+                    "max_connections": 73
+                }
+            }),
+            API_BASE_URL,
+            false,
+        )
+        .expect("valid webhook information should be accepted")
+        .expect("non-empty webhook should be imported");
+
+        assert_eq!(webhook.url, "https://receiver.example/telegram");
+        assert_eq!(
+            webhook.allowed_updates,
+            json!(["message", "callback_query"])
+        );
+        assert_eq!(webhook.max_connections, 73);
+    }
+
+    #[test]
+    fn refuses_unsafe_existing_webhook_without_exposing_its_url() {
+        let secret_url = "https://127.0.0.1/private-token-path";
+        let error = existing_webhook(
+            &json!({
+                "ok": true,
+                "result": {
+                    "url": secret_url,
+                    "has_custom_certificate": false
+                }
+            }),
+            API_BASE_URL,
+            false,
+        )
+        .expect_err("private webhook targets must not be imported");
+
+        assert!(!error.to_string().contains(secret_url));
+    }
+
+    #[test]
+    fn imports_telegram_default_filter_when_allowed_updates_are_omitted() {
+        let webhook = existing_webhook(
+            &json!({
+                "ok": true,
+                "result": {
+                    "url": "https://receiver.example/telegram",
+                    "has_custom_certificate": false
+                }
+            }),
+            API_BASE_URL,
+            false,
+        )
+        .expect("valid webhook information should be accepted")
+        .expect("non-empty webhook should be imported");
+
+        assert_eq!(webhook.allowed_updates, json!([]));
+    }
+
+    #[test]
+    fn refuses_webhook_with_an_unrecoverable_custom_certificate() {
+        let error = existing_webhook(
+            &json!({
+                "ok": true,
+                "result": {
+                    "url": "https://receiver.example/telegram",
+                    "has_custom_certificate": true
+                }
+            }),
+            API_BASE_URL,
+            false,
+        )
+        .expect_err("custom certificate cannot be recovered from Telegram");
+
+        assert!(error.to_string().contains("custom certificate"));
+    }
+
+    #[test]
+    fn does_not_import_a_stale_managed_ingress_as_downstream() {
+        let webhook = existing_webhook(
+            &json!({
+                "ok": true,
+                "result": {
+                    "url": "https://api.phenogram.io/telegram/webhook/phg_stale",
+                    "has_custom_certificate": false,
+                    "allowed_updates": ["message"],
+                    "max_connections": 40
+                }
+            }),
+            API_BASE_URL,
+            false,
+        )
+        .expect("stale managed ingress should be handled");
+
+        assert!(webhook.is_none());
     }
 }

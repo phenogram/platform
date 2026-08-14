@@ -23,6 +23,10 @@ trap cleanup EXIT
 
 # Keep repeated local runs independent from prior mock deliveries/webhooks.
 curl -fsS -X POST "$mock_url/__reset" | jq -e '.ok == true' >/dev/null
+curl -fsS -X POST \
+  -H 'content-type: application/json' \
+  -d "{\"url\":\"$mock_url/__downstream\",\"has_custom_certificate\":false,\"allowed_updates\":[\"message\"],\"max_connections\":73}" \
+  "$mock_url/__seed_webhook" | jq -e '.ok == true' >/dev/null
 
 health="$(curl -fsS "$base_url/api/health")"
 jq -e '.status == "ok" and .database == true' <<<"$health" >/dev/null
@@ -56,15 +60,37 @@ jq -e '.membership.plan_id == "free" and .membership.bot_limit == 1' <<<"$sessio
 connected="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
-  -d "{\"token\":\"$bot_token\",\"accept_webhook_takeover\":true}" \
+  -d "{\"token\":\"$bot_token\"}" \
   "$base_url/api/bots")"
 bot_id="$(jq -er '.bot.id' <<<"$connected")"
 public_id="$(jq -er '.bot.public_id' <<<"$connected")"
-jq -e '.bot.username == "phenogram_test_bot" and (.bot | has("token_fingerprint") | not) and (.bot.public_id | length > 20)' <<<"$connected" >/dev/null
+jq -e '.bot.username == "phenogram_test_bot" and .bot.update_mode == "webhook" and (.bot | has("token_fingerprint") | not) and (.bot.public_id | length > 20) and (.warnings | any(contains("transferred")))' <<<"$connected" >/dev/null
 
 upstream_state="$(curl -fsS "$mock_url/__state")"
 ingress_secret="$(jq -er '.webhook.secret_token' <<<"$upstream_state")"
 jq -e --arg public_id "$public_id" '.webhook.url | endswith("/telegram/webhook/" + $public_id)' <<<"$upstream_state" >/dev/null
+
+# Connecting a bot automatically moves its existing Telegram webhook behind
+# Phenogram before replacing Telegram's upstream destination.
+migrated_webhook="$(curl -fsS "$base_url/bot$bot_token/getWebhookInfo")"
+jq -e --arg url "$mock_url/__downstream" '.ok == true and .result.url == $url and .result.allowed_updates == ["message"] and .result.max_connections == 73' <<<"$migrated_webhook" >/dev/null
+migrated_update='{"update_id":7000,"message":{"message_id":40,"date":1786619999,"from":{"id":99,"is_bot":false,"first_name":"Ada"},"chat":{"id":99,"type":"private","first_name":"Ada"},"text":"delivered through migrated webhook"}}'
+curl -fsS \
+  -H 'content-type: application/json' \
+  -H "x-telegram-bot-api-secret-token: $ingress_secret" \
+  -d "$migrated_update" \
+  "$base_url/telegram/webhook/$public_id" | jq -e '.ok == true' >/dev/null
+for _ in $(seq 1 40); do
+  if curl -fsS "$mock_url/__state" | jq -e '.deliveries | any(.update_id == 7000)' >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+curl -fsS "$mock_url/__state" | jq -e '.deliveries | any(.update_id == 7000)' >/dev/null
+curl -fsS \
+  -H 'content-type: application/json' \
+  -d '{"drop_pending_updates":false}' \
+  "$base_url/bot$bot_token/deleteWebhook" | jq -e '.ok == true' >/dev/null
 
 update='{"update_id":7001,"message":{"message_id":41,"date":1786620000,"from":{"id":99,"is_bot":false,"first_name":"Ada","username":"ada"},"chat":{"id":99,"type":"private","first_name":"Ada","username":"ada"},"text":"hello from the e2e test"}}'
 curl -fsS \
