@@ -145,6 +145,7 @@ jobs:
             --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
             --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
             --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.official.fileServer.image.digest= \
             > /tmp/phenogram-missing-file-server-digest.yaml \
             2> /tmp/phenogram-missing-file-server-digest.err; then
             printf '%s\n' 'Enabled data plane unexpectedly accepted an unpinned file server.' >&2
