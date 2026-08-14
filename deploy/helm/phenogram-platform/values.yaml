@@ -81,6 +81,12 @@ ingress:
       secretName: phenogram-io-tls
   app:
     host: app.phenogram.io
+    annotations:
+      # The authenticated update log uses a long-lived same-origin SSE
+      # connection. Keep events flowing immediately through ingress-nginx.
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     tls:
       enabled: true
       secretName: app-phenogram-io-tls

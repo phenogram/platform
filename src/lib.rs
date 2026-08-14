@@ -35,6 +35,7 @@ pub fn app(state: AppState) -> Router {
         .route("/bots/{bot_id}", get(api::get_bot).delete(api::delete_bot))
         .route("/bots/{bot_id}/provision", post(api::provision_bot))
         .route("/bots/{bot_id}/updates", get(api::updates))
+        .route("/bots/{bot_id}/updates/stream", get(api::updates_stream))
         .route("/bots/{bot_id}/activity", get(api::activity))
         .route("/bots/{bot_id}/conversations", get(api::conversations))
         .route(

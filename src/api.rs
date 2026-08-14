@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -17,8 +17,9 @@ use crate::{
     models::{ActivitySummary, BotRecord, BotSummary, ConversationSummary, UpdateSummary},
     state::AppState,
     telegram::{
-        ALL_UPDATE_TYPES, OutboundMessageRecord, decrypt_token, existing_webhook,
-        install_managed_webhook, raw_telegram_json, record_outbound_message, telegram_json_for_bot,
+        ALL_UPDATE_TYPES, OutboundMessageRecord, StreamQuery, console_event_stream, decrypt_token,
+        existing_webhook, install_managed_webhook, raw_telegram_json, record_outbound_message,
+        search_pattern, telegram_json_for_bot,
     },
 };
 
@@ -446,16 +447,24 @@ pub async fn updates(
 ) -> Result<Json<Value>> {
     assert_bot_owner(&state, user.id, bot_id).await?;
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    let search = query
-        .query
-        .as_deref()
-        .map(|value| format!("%{}%", value.chars().take(120).collect::<String>()));
+    let search = query.query.as_deref().map(search_pattern);
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let stream_cursor = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(max(id), 0) FROM updates WHERE bot_id = $1 AND expires_at > now()",
+    )
+    .bind(bot_id)
+    .fetch_one(&mut *tx)
+    .await?;
     let updates = sqlx::query_as::<_, UpdateSummary>(
         r#"SELECT id, update_id, event_type, chat_id, telegram_user_id, payload, received_at, expires_at
              FROM updates
             WHERE bot_id = $1
+              AND expires_at > now()
               AND ($2::text IS NULL OR event_type = $2)
-              AND ($3::text IS NULL OR payload::text ILIKE $3)
+              AND ($3::text IS NULL OR payload::text ILIKE $3 ESCAPE E'\\')
               AND ($4::bigint IS NULL OR chat_id = $4)
               AND ($5::bigint IS NULL OR id < $5)
             ORDER BY id DESC LIMIT $6"#,
@@ -466,11 +475,25 @@ pub async fn updates(
     .bind(query.chat_id)
     .bind(query.before)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(Json(
-        json!({"updates": updates, "next_before": updates.last().map(|update| update.id)}),
-    ))
+    tx.commit().await?;
+    Ok(Json(json!({
+        "updates": updates,
+        "next_before": updates.last().map(|update| update.id),
+        "stream_cursor": stream_cursor.to_string(),
+    })))
+}
+
+pub async fn updates_stream(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(bot_id): Path<Uuid>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    assert_bot_owner(&state, user.id, bot_id).await?;
+    console_event_stream(state, user.id, user.session_id, bot_id, query, headers).await
 }
 
 pub async fn activity(

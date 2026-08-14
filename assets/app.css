@@ -788,8 +788,13 @@ svg { display: block; }
 .toolbar__search .search-input { padding-left: 37px; }
 .toolbar select { min-height: 41px; padding: 8px 30px 8px 11px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--ink-soft); background: var(--surface); font-size: 12px; }
 .toolbar__spacer { flex: 1; }
-.live-state { display: flex; align-items: center; gap: 7px; color: var(--mint); font-size: 10px; font-weight: 700; }
+.live-state { display: flex; align-items: center; gap: 7px; color: var(--ink-faint); font-size: 10px; font-weight: 700; }
 .live-state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.8s infinite; }
+.live-state.is-live { color: var(--mint); }
+.live-state.is-connecting { color: var(--primary); }
+.live-state.is-reconnecting { color: var(--amber); }
+.live-state.is-fallback { color: var(--amber); }
+.live-state.is-fallback::before { animation: none; }
 .live-state.is-paused { color: var(--ink-faint); }
 .live-state.is-paused::before { animation: none; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 6px transparent; } 0% { box-shadow: 0 0 0 0 rgb(17 169 130 / 22%); } }

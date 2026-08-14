@@ -36,6 +36,18 @@
     filters: { type: "", query: "", limit: "50" },
     updatesPaused: false,
     updateTimer: null,
+    updatesStream: null,
+    updatesStreamStatus: "idle",
+    updatesStreamRetryTimer: null,
+    updatesStreamRetryAttempt: 0,
+    updatesStreamGeneration: 0,
+    updatesStreamCursors: {},
+    updatesFilterRefreshTimer: null,
+    updatesFilterRefreshToken: 0,
+    updatesFilterRefreshInFlightToken: null,
+    updatesFilterRefreshPending: false,
+    updatesFilterRefreshRetryAttempt: 0,
+    updatesRenderFrame: null,
     mobileMenu: false,
     modal: null,
     drawer: null,
@@ -411,7 +423,7 @@
     && String(state.selectedBotId) === String(id);
 
   function clearBotState({ clearSelection = false } = {}) {
-    stopUpdatesPolling();
+    stopUpdatesStream({ status: "idle" });
     state.botContextVersion += 1;
     state.requestTickets = {};
     state.bot = null;
@@ -441,6 +453,7 @@
     clearBotState({ clearSelection: true });
     if (scope === "bot") return;
     state.sessionVersion += 1;
+    state.updatesStreamCursors = {};
     state.user = null;
     state.membership = null;
     state.csrfToken = null;
@@ -596,7 +609,7 @@
 
   async function loadUpdates({ silent = false } = {}) {
     const id = state.selectedBotId;
-    if (!id || (silent && state.updatesPaused)) return;
+    if (!id || (silent && state.updatesPaused)) return null;
     const contextVersion = state.botContextVersion;
     const ticket = startRequest("updates");
     if (!silent) { setLoading("updates", true); setError("updates", null); render(); }
@@ -606,17 +619,28 @@
       if (state.filters.type) params.set("type", state.filters.type);
       if (state.filters.query) params.set("query", state.filters.query);
       const payload = await api(`/bots/${encodeURIComponent(id)}/updates?${params}`);
-      if (!botRequestIsCurrent("updates", ticket, id, contextVersion)) return;
-      state.updates = listFrom(payload, "updates");
+      if (!botRequestIsCurrent("updates", ticket, id, contextVersion)) return null;
+      const snapshot = listFrom(payload, "updates");
+      const snapshotCursor = normalizeJournalId(payload?.stream_cursor ?? payload?.data?.stream_cursor)
+        || newestUpdateJournalId(snapshot);
+      const streamedAfterSnapshot = snapshotCursor
+        ? state.updates.filter((item) => compareJournalIds(updateJournalId(item), snapshotCursor) > 0)
+        : [];
+      state.updates = mergeStoredUpdates(snapshot, streamedAfterSnapshot);
+      advanceUpdatesStreamCursor(id, snapshotCursor);
+      refreshDrawerUpdateReference();
+      state.updatesFilterRefreshRetryAttempt = 0;
       setError("updates", null);
+      return true;
     } catch (error) {
-      if (!botRequestIsCurrent("updates", ticket, id, contextVersion)) return;
+      if (!botRequestIsCurrent("updates", ticket, id, contextVersion)) return null;
       setError("updates", errorMessage(error));
       if (!silent) toast(errorMessage(error), "error");
+      return false;
     } finally {
       if (botRequestIsCurrent("updates", ticket, id, contextVersion)) {
         setLoading("updates", false);
-        render();
+        renderUpdatesPanel();
       }
     }
   }
@@ -668,17 +692,379 @@
     toast("Your session expired. Sign in again.", "error");
   }
 
+  const UPDATES_STREAM_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000, 30000];
+  const FILTERED_UPDATES_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000, 30000];
+
+  function normalizeJournalId(value) {
+    const id = String(value ?? "").trim();
+    return /^\d+$/.test(id) ? id.replace(/^0+(?=\d)/, "") : "";
+  }
+
+  function updateJournalId(item) {
+    return normalizeJournalId(item?.id ?? item?.row_id);
+  }
+
+  function compareJournalIds(left, right) {
+    const leftId = normalizeJournalId(left);
+    const rightId = normalizeJournalId(right);
+    if (leftId === rightId) return 0;
+    if (!leftId) return -1;
+    if (!rightId) return 1;
+    try {
+      return BigInt(leftId) > BigInt(rightId) ? 1 : -1;
+    } catch (_) {
+      return leftId.length === rightId.length
+        ? (leftId > rightId ? 1 : -1)
+        : (leftId.length > rightId.length ? 1 : -1);
+    }
+  }
+
+  function newestUpdateJournalId(items = state.updates) {
+    return items.reduce((newest, item) => {
+      const candidate = updateJournalId(item);
+      return compareJournalIds(candidate, newest) > 0 ? candidate : newest;
+    }, "");
+  }
+
+  function updateListLimit() {
+    const limit = Number.parseInt(state.filters.limit, 10);
+    return Number.isFinite(limit) ? Math.min(200, Math.max(1, limit)) : 50;
+  }
+
+  function mergeStoredUpdates(base, incoming = []) {
+    const byId = new Map();
+    [...base, ...incoming].forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const id = updateJournalId(item);
+      const fallback = `${updateId(item)}:${String(updateTime(item) || "")}`;
+      const key = id ? `journal:${id}` : `fallback:${fallback}`;
+      const existing = byId.get(key);
+      byId.set(key, existing ? { ...existing, ...item } : item);
+    });
+    return [...byId.values()]
+      .sort((left, right) => {
+        const byJournal = compareJournalIds(updateJournalId(right), updateJournalId(left));
+        if (byJournal) return byJournal;
+        return String(updateTime(right) || "").localeCompare(String(updateTime(left) || ""));
+      })
+      .slice(0, updateListLimit());
+  }
+
+  function updatesStreamCursor(botIdValue = state.selectedBotId) {
+    return normalizeJournalId(state.updatesStreamCursors[String(botIdValue || "")]);
+  }
+
+  function advanceUpdatesStreamCursor(botIdValue, candidate) {
+    const botKey = String(botIdValue || "");
+    const next = normalizeJournalId(candidate);
+    if (!botKey || !next) return;
+    const current = updatesStreamCursor(botKey);
+    if (compareJournalIds(next, current) > 0) state.updatesStreamCursors[botKey] = next;
+  }
+
+  function updatesViewIsCurrent(botIdValue, sessionVersion, contextVersion) {
+    return state.route.name === "bot-updates"
+      && Boolean(state.user)
+      && state.sessionVersion === sessionVersion
+      && state.botContextVersion === contextVersion
+      && String(state.selectedBotId) === String(botIdValue);
+  }
+
+  function updatesStreamContextIsCurrent(context, source = null) {
+    return updatesViewIsCurrent(context.botId, context.sessionVersion, context.contextVersion)
+      && state.updatesStreamGeneration === context.generation
+      && (!source || state.updatesStream === source);
+  }
+
   function stopUpdatesPolling() {
     if (state.updateTimer) window.clearInterval(state.updateTimer);
     state.updateTimer = null;
   }
 
-  function startUpdatesPolling() {
+  function startUpdatesPolling({ reportFallback = false } = {}) {
     stopUpdatesPolling();
     if (state.route.name !== "bot-updates" || state.updatesPaused) return;
+    if (reportFallback) {
+      state.updatesStreamStatus = "fallback";
+      renderUpdatesLiveStatus();
+    }
     state.updateTimer = window.setInterval(() => {
       if (document.visibilityState === "visible") loadUpdates({ silent: true });
     }, 8000);
+  }
+
+  function resetFilteredUpdatesReload() {
+    if (state.updatesFilterRefreshTimer) window.clearTimeout(state.updatesFilterRefreshTimer);
+    state.updatesFilterRefreshTimer = null;
+    state.updatesFilterRefreshToken += 1;
+    state.updatesFilterRefreshInFlightToken = null;
+    state.updatesFilterRefreshPending = false;
+    state.updatesFilterRefreshRetryAttempt = 0;
+  }
+
+  function stopUpdatesStream({ status = "idle" } = {}) {
+    state.updatesStreamGeneration += 1;
+    if (state.updatesStream) state.updatesStream.close();
+    state.updatesStream = null;
+    if (state.updatesStreamRetryTimer) window.clearTimeout(state.updatesStreamRetryTimer);
+    state.updatesStreamRetryTimer = null;
+    resetFilteredUpdatesReload();
+    if (state.updatesRenderFrame) window.cancelAnimationFrame(state.updatesRenderFrame);
+    state.updatesRenderFrame = null;
+    stopUpdatesPolling();
+    state.updatesStreamStatus = status;
+    if (status !== "reconnecting") state.updatesStreamRetryAttempt = 0;
+    renderUpdatesLiveStatus();
+  }
+
+  function renderUpdatesPanel() {
+    if (state.route.name !== "bot-updates") return;
+    const panel = document.querySelector("#updates-panel");
+    if (panel) panel.innerHTML = renderUpdatesTable();
+    renderUpdatesLiveStatus();
+  }
+
+  function scheduleUpdatesPanelRender() {
+    if (state.updatesRenderFrame) return;
+    state.updatesRenderFrame = window.requestAnimationFrame(() => {
+      state.updatesRenderFrame = null;
+      renderUpdatesPanel();
+    });
+  }
+
+  function updatesLiveView() {
+    if (state.updatesPaused) return { label: "Paused", className: "is-paused" };
+    if (state.updatesStreamStatus === "live") return { label: "Live", className: "is-live" };
+    if (state.updatesStreamStatus === "fallback") return { label: "Auto refresh", className: "is-fallback" };
+    if (state.updatesStreamStatus === "reconnecting") return { label: "Reconnecting", className: "is-reconnecting" };
+    return { label: "Connecting", className: "is-connecting" };
+  }
+
+  function renderUpdatesLiveStatus() {
+    if (state.route.name !== "bot-updates") return;
+    const view = updatesLiveView();
+    const status = document.querySelector("#updates-live-state");
+    if (status) {
+      status.className = `live-state ${view.className}`;
+      status.textContent = view.label;
+    }
+    const toggle = document.querySelector('[data-action="toggle-updates"]');
+    if (toggle) {
+      toggle.setAttribute("aria-label", state.updatesPaused ? "Resume live updates" : "Pause live updates");
+      toggle.innerHTML = icon(state.updatesPaused ? "play" : "pause");
+    }
+  }
+
+  function refreshDrawerUpdateReference() {
+    if (!state.drawer || state.drawer.type !== "update") return;
+    const itemId = normalizeJournalId(state.drawer.itemId || updateJournalId(state.drawer.item));
+    if (!itemId) return;
+    const current = state.updates.find((item) => updateJournalId(item) === itemId);
+    if (current) state.drawer = { ...state.drawer, itemId, item: current };
+  }
+
+  function scheduleFilteredUpdatesReload(context, { retry = false } = {}) {
+    state.updatesFilterRefreshPending = true;
+    if (state.updatesFilterRefreshTimer || state.updatesFilterRefreshInFlightToken != null) return;
+    const delay = retry
+      ? FILTERED_UPDATES_RETRY_DELAYS[Math.min(state.updatesFilterRefreshRetryAttempt, FILTERED_UPDATES_RETRY_DELAYS.length - 1)]
+      : 350;
+    state.updatesFilterRefreshTimer = window.setTimeout(async () => {
+      state.updatesFilterRefreshTimer = null;
+      if (!updatesStreamContextIsCurrent(context) || state.updatesPaused) {
+        state.updatesFilterRefreshPending = false;
+        return;
+      }
+      state.updatesFilterRefreshPending = false;
+      const refreshToken = ++state.updatesFilterRefreshToken;
+      state.updatesFilterRefreshInFlightToken = refreshToken;
+      const loaded = await loadUpdates({ silent: true });
+      if (state.updatesFilterRefreshInFlightToken !== refreshToken) return;
+      state.updatesFilterRefreshInFlightToken = null;
+      if (!updatesStreamContextIsCurrent(context)) return;
+      if (loaded === true) {
+        state.updatesFilterRefreshRetryAttempt = 0;
+        if (state.updatesFilterRefreshPending) scheduleFilteredUpdatesReload(context);
+        return;
+      }
+      state.updatesFilterRefreshPending = true;
+      const retryAttempt = state.updatesFilterRefreshRetryAttempt;
+      scheduleFilteredUpdatesReload(context, { retry: true });
+      state.updatesFilterRefreshRetryAttempt = Math.min(
+        retryAttempt + 1,
+        FILTERED_UPDATES_RETRY_DELAYS.length - 1,
+      );
+    }, delay);
+  }
+
+  function mergeStreamedUpdate(context, event) {
+    if (!updatesStreamContextIsCurrent(context, event.currentTarget)) return;
+    let update;
+    try {
+      update = JSON.parse(event.data);
+    } catch (_) {
+      scheduleUpdatesStreamReconnect(context, { probeSession: false });
+      return;
+    }
+    if (!update || typeof update !== "object" || Array.isArray(update)) return;
+    const eventId = normalizeJournalId(event.lastEventId || update.id || update.row_id);
+    if (!eventId) return;
+    advanceUpdatesStreamCursor(context.botId, eventId);
+    update = { ...update, id: eventId };
+    if (state.filters.type || state.filters.query) {
+      scheduleFilteredUpdatesReload(context);
+      return;
+    }
+    state.updates = mergeStoredUpdates(state.updates, [update]);
+    refreshDrawerUpdateReference();
+    setError("updates", null);
+    scheduleUpdatesPanelRender();
+  }
+
+  async function resyncUpdatesStream(context, event) {
+    if (!updatesStreamContextIsCurrent(context, event.currentTarget)) return;
+    advanceUpdatesStreamCursor(context.botId, event.lastEventId);
+    const { botId, sessionVersion, contextVersion } = context;
+    stopUpdatesStream({ status: "reconnecting" });
+    await loadUpdates({ silent: true });
+    if (updatesViewIsCurrent(botId, sessionVersion, contextVersion) && !state.updatesPaused) {
+      startUpdatesStream({ reconnecting: true });
+    }
+  }
+
+  async function handleUpdatesStreamRevoked(context, event) {
+    if (!updatesStreamContextIsCurrent(context, event.currentTarget)) return;
+    const { botId, sessionVersion, contextVersion } = context;
+    stopUpdatesStream({ status: "reconnecting" });
+    try {
+      await api("/me");
+      if (!updatesViewIsCurrent(botId, sessionVersion, contextVersion)) return;
+      setError("updates", "Live update access ended. Refresh the bot list or choose another bot.");
+      renderUpdatesPanel();
+    } catch (error) {
+      if (error.status !== 401 && updatesViewIsCurrent(botId, sessionVersion, contextVersion)) {
+        scheduleUpdatesStreamReconnect({
+          botId,
+          sessionVersion,
+          contextVersion,
+          generation: state.updatesStreamGeneration,
+        }, { probeSession: false });
+      }
+    }
+  }
+
+  function scheduleUpdatesStreamReconnect(context, { probeSession = true } = {}) {
+    if (!updatesStreamContextIsCurrent(context, context.source || null)) return;
+    if (state.updatesStream) state.updatesStream.close();
+    state.updatesStream = null;
+    state.updatesStreamGeneration += 1;
+    const retryContext = {
+      botId: context.botId,
+      sessionVersion: context.sessionVersion,
+      contextVersion: context.contextVersion,
+      generation: state.updatesStreamGeneration,
+    };
+    state.updatesStreamStatus = state.updateTimer ? "fallback" : "reconnecting";
+    renderUpdatesLiveStatus();
+    const attempt = state.updatesStreamRetryAttempt;
+    state.updatesStreamRetryAttempt = Math.min(attempt + 1, UPDATES_STREAM_RETRY_DELAYS.length - 1);
+    if (attempt >= 3 && !state.updateTimer) startUpdatesPolling({ reportFallback: true });
+    const delay = UPDATES_STREAM_RETRY_DELAYS[Math.min(attempt, UPDATES_STREAM_RETRY_DELAYS.length - 1)];
+
+    const reconnect = () => {
+      if (!updatesStreamContextIsCurrent(retryContext) || state.updatesPaused) return;
+      state.updatesStreamRetryTimer = window.setTimeout(() => {
+        state.updatesStreamRetryTimer = null;
+        if (updatesStreamContextIsCurrent(retryContext) && !state.updatesPaused) {
+          startUpdatesStream({ reconnecting: true });
+        }
+      }, delay);
+    };
+
+    if (!probeSession) {
+      reconnect();
+      return;
+    }
+    api("/me").then(reconnect).catch((error) => {
+      if (error.status !== 401) reconnect();
+    });
+  }
+
+  function startUpdatesStream({ reconnecting = false } = {}) {
+    const botIdValue = state.selectedBotId;
+    if (!botIdValue || state.route.name !== "bot-updates" || state.updatesPaused || !state.user) return;
+    if (typeof window.EventSource !== "function") {
+      startUpdatesPolling({ reportFallback: true });
+      return;
+    }
+    if (state.updatesStream) state.updatesStream.close();
+    state.updatesStream = null;
+    if (state.updatesStreamRetryTimer) window.clearTimeout(state.updatesStreamRetryTimer);
+    state.updatesStreamRetryTimer = null;
+    if (!reconnecting) stopUpdatesPolling();
+    state.updatesStreamGeneration += 1;
+    state.updatesStreamStatus = reconnecting && state.updateTimer ? "fallback" : reconnecting ? "reconnecting" : "connecting";
+    renderUpdatesLiveStatus();
+
+    const cursor = updatesStreamCursor(botIdValue);
+    const suffix = cursor ? `?after=${encodeURIComponent(cursor)}` : "";
+    let source;
+    try {
+      source = new window.EventSource(`${API}/bots/${encodeURIComponent(botIdValue)}/updates/stream${suffix}`);
+    } catch (_) {
+      scheduleUpdatesStreamReconnect({
+        botId: String(botIdValue),
+        sessionVersion: state.sessionVersion,
+        contextVersion: state.botContextVersion,
+        generation: state.updatesStreamGeneration,
+      }, { probeSession: false });
+      return;
+    }
+    const context = {
+      botId: String(botIdValue),
+      sessionVersion: state.sessionVersion,
+      contextVersion: state.botContextVersion,
+      generation: state.updatesStreamGeneration,
+      source,
+    };
+    state.updatesStream = source;
+
+    source.addEventListener("open", () => {
+      if (!updatesStreamContextIsCurrent(context, source)) return;
+      state.updatesStreamStatus = "live";
+      state.updatesStreamRetryAttempt = 0;
+      stopUpdatesPolling();
+      renderUpdatesLiveStatus();
+      if (reconnecting && (state.filters.type || state.filters.query)) {
+        resetFilteredUpdatesReload();
+        scheduleFilteredUpdatesReload(context);
+      }
+    });
+    source.addEventListener("update", (event) => mergeStreamedUpdate(context, event));
+    source.addEventListener("resync", (event) => resyncUpdatesStream(context, event));
+    source.addEventListener("revoked", (event) => handleUpdatesStreamRevoked(context, event));
+    source.addEventListener("error", (event) => {
+      if (!updatesStreamContextIsCurrent(context, source)) return;
+      scheduleUpdatesStreamReconnect(context, { probeSession: !("data" in event && event.data) });
+    });
+  }
+
+  async function toggleUpdatesStream() {
+    if (state.updatesPaused) {
+      state.updatesPaused = false;
+      state.updatesStreamStatus = "connecting";
+      renderUpdatesLiveStatus();
+      const botIdValue = state.selectedBotId;
+      const sessionVersion = state.sessionVersion;
+      const contextVersion = state.botContextVersion;
+      await loadUpdates({ silent: true });
+      if (updatesViewIsCurrent(botIdValue, sessionVersion, contextVersion) && !state.updatesPaused) {
+        startUpdatesStream();
+      }
+      return;
+    }
+    state.updatesPaused = true;
+    stopUpdatesStream({ status: "paused" });
   }
 
   function setMobileMenu(open, { restoreFocus = false } = {}) {
@@ -691,7 +1077,7 @@
   }
 
   async function routeChanged() {
-    stopUpdatesPolling();
+    stopUpdatesStream({ status: "idle" });
     state.route = parseRoute();
     state.mobileMenu = false;
     state.drawer = null;
@@ -718,6 +1104,9 @@
     } else if (routedBot) {
       state.selectedBotId = routedBot;
     }
+    if (state.route.name === "bot-updates") {
+      state.updatesStreamStatus = state.updatesPaused ? "paused" : "connecting";
+    }
     render();
 
     const tasks = [];
@@ -730,7 +1119,7 @@
     if (state.route.name === "bot-integration") tasks.push(loadStreamKeys({ silent: true }));
     await Promise.allSettled(tasks);
     render();
-    startUpdatesPolling();
+    if (state.route.name === "bot-updates" && !state.updatesPaused) startUpdatesStream();
     document.querySelector("#main-content")?.focus({ preventScroll: true });
   }
 
@@ -1194,17 +1583,17 @@
     if (!bot) return `<div class="page">${renderNoBots()}</div>`;
     const days = botRetentionDays(bot);
     const cutoff = new Date(Date.now() - days * 86400000);
-    const action = `<button class="btn btn--secondary" type="button" data-action="refresh-updates">${icon("refresh")}Refresh</button>`;
+    const live = updatesLiveView();
     return `<div class="page">
-      ${pageHeader("Update log", `Search the exact updates received for ${botName(bot)} and inspect their stored payloads.`, action)}
+      ${pageHeader("Update log", `Search the exact updates received for ${botName(bot)} and inspect their stored payloads.`)}
       <div class="status-banner status-banner--info">${icon("clock")}<div class="status-banner__copy"><strong>${esc(retentionLabel(bot))}</strong>Updates received before ${esc(new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(cutoff))} are removed automatically for this bot.</div></div>
       <form class="toolbar" id="update-filter-form">
         <div class="toolbar__search">${icon("search")}<label class="visually-hidden" for="update-query">Search updates</label><input class="search-input" id="update-query" name="query" type="search" value="${esc(state.filters.query)}" placeholder="Update ID, chat, or payload"></div>
         <label class="visually-hidden" for="update-type">Update type</label><select id="update-type" name="type"><option value="">All event types</option>${["message", "edited_message", "callback_query", "inline_query", "chat_member", "poll"].map((type) => `<option value="${type}" ${state.filters.type === type ? "selected" : ""}>${type}</option>`).join("")}</select>
         <button class="btn btn--secondary" type="submit">${icon("filter")}Filter</button>
-        <span class="toolbar__spacer"></span><span class="live-state ${state.updatesPaused ? "is-paused" : ""}">${state.updatesPaused ? "Paused" : "Listening"}</span><button class="btn btn--ghost btn--icon" type="button" data-action="toggle-updates" aria-label="${state.updatesPaused ? "Resume live updates" : "Pause live updates"}">${icon(state.updatesPaused ? "play" : "pause")}</button>
+        <span class="toolbar__spacer"></span><span class="live-state ${live.className}" id="updates-live-state" role="status" aria-live="polite">${live.label}</span><button class="btn btn--ghost btn--icon" type="button" data-action="toggle-updates" aria-label="${state.updatesPaused ? "Resume live updates" : "Pause live updates"}">${icon(state.updatesPaused ? "play" : "pause")}</button>
       </form>
-      <section class="panel">${renderUpdatesTable()}</section>
+      <section class="panel" id="updates-panel">${renderUpdatesTable()}</section>
     </div>`;
   }
 
@@ -1215,7 +1604,7 @@
     return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Received</th><th>Update</th><th>Type</th><th>Chat / user</th><th>Attempts</th><th>Status</th></tr></thead><tbody>${state.updates.map((item, index) => {
       const envelope = telegramEnvelope(item);
       const status = updateStatus(item);
-      return `<tr tabindex="0" role="button" data-action="view-update" data-update-index="${index}" aria-label="Inspect update ${esc(updateId(item))}"><td>${esc(formatDate(updateTime(item)))}</td><td><strong class="mono">${esc(updateId(item) || "—")}</strong></td><td><span class="tag">${esc(envelope.kind)}</span></td><td>${esc(updateChat(item))}</td><td>${esc(item.attempts ?? item.delivery_attempts ?? "—")}</td><td>${statusBadge(status)}</td></tr>`;
+      return `<tr tabindex="0" role="button" data-action="view-update" data-update-id="${esc(updateJournalId(item))}" data-update-index="${index}" aria-label="Inspect update ${esc(updateId(item))}"><td>${esc(formatDate(updateTime(item)))}</td><td><strong class="mono">${esc(updateId(item) || "—")}</strong></td><td><span class="tag">${esc(envelope.kind)}</span></td><td>${esc(updateChat(item))}</td><td>${esc(item.attempts ?? item.delivery_attempts ?? "—")}</td><td>${statusBadge(status)}</td></tr>`;
     }).join("")}</tbody></table></div>`;
   }
 
@@ -1362,7 +1751,9 @@
 
   function renderDrawer() {
     if (!state.drawer || state.drawer.type !== "update") return "";
-    const item = state.drawer.item;
+    const itemId = normalizeJournalId(state.drawer.itemId || updateJournalId(state.drawer.item));
+    const item = state.updates.find((candidate) => updateJournalId(candidate) === itemId) || state.drawer.item;
+    if (!item) return "";
     const envelope = telegramEnvelope(item);
     const payload = updatePayload(item);
     return `<aside class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="update-detail-title"><header class="detail-drawer__head"><div class="detail-drawer__head-copy"><h2 id="update-detail-title">${esc(envelope.kind)}</h2><p>update_id: ${esc(updateId(item) || "unknown")}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-drawer" aria-label="Close update details">${icon("close")}</button></header><div class="detail-drawer__body"><div class="detail-grid"><div class="detail-stat"><span class="stat-label">Received</span><strong>${esc(formatDate(updateTime(item), "full"))}</strong></div><div class="detail-stat"><span class="stat-label">Delivery</span><strong>${esc(updateStatus(item))}</strong></div><div class="detail-stat"><span class="stat-label">Chat</span><strong>${esc(updateChat(item))}</strong></div><div class="detail-stat"><span class="stat-label">Attempts</span><strong>${esc(item.attempts ?? item.delivery_attempts ?? "—")}</strong></div></div><div class="panel__head panel__head--flush"><div><h3>Stored payload</h3><p>Sensitive request headers and credentials are not included.</p></div><button class="btn btn--ghost btn--sm" type="button" data-action="copy-json">${icon("copy")}Copy JSON</button></div><pre class="json-view" id="update-json">${esc(JSON.stringify(payload, null, 2))}</pre></div></aside>`;
@@ -1653,6 +2044,7 @@
     if (form.id === "update-filter-form") {
       event.preventDefault();
       const data = new FormData(form);
+      resetFilteredUpdatesReload();
       state.filters.query = String(data.get("query") || "").trim();
       state.filters.type = String(data.get("type") || "");
       loadUpdates();
@@ -1678,11 +2070,11 @@
     else if (action === "retry-route") routeChanged();
     else if (action === "refresh-updates") loadUpdates();
     else if (action === "retry-conversations") loadConversations();
-    else if (action === "clear-update-filters") { state.filters = { ...state.filters, type: "", query: "" }; loadUpdates(); }
-    else if (action === "toggle-updates") { state.updatesPaused = !state.updatesPaused; state.updatesPaused ? stopUpdatesPolling() : startUpdatesPolling(); render(); }
-    else if (action === "view-update") { const item = state.updates[Number(trigger.dataset.updateIndex)]; if (item) { state.drawer = { type: "update", item }; render(); } }
+    else if (action === "clear-update-filters") { resetFilteredUpdatesReload(); state.filters = { ...state.filters, type: "", query: "" }; loadUpdates(); }
+    else if (action === "toggle-updates") toggleUpdatesStream();
+    else if (action === "view-update") { const itemId = normalizeJournalId(trigger.dataset.updateId); const item = state.updates.find((candidate) => updateJournalId(candidate) === itemId) || state.updates[Number(trigger.dataset.updateIndex)]; if (item) { state.drawer = { type: "update", itemId: updateJournalId(item), item }; render(); } }
     else if (action === "close-drawer") { state.drawer = null; render(); }
-    else if (action === "copy-json") { const item = state.drawer?.item; if (item) copyText(JSON.stringify(updatePayload(item), null, 2)); }
+    else if (action === "copy-json") { const itemId = normalizeJournalId(state.drawer?.itemId || updateJournalId(state.drawer?.item)); const item = state.updates.find((candidate) => updateJournalId(candidate) === itemId) || state.drawer?.item; if (item) copyText(JSON.stringify(updatePayload(item), null, 2)); }
     else if (action === "copy-value") copyText(trigger.dataset.copyValue || "");
     else if (action === "select-conversation") {
       state.selectedConversationId = trigger.dataset.conversationId;
@@ -1732,9 +2124,11 @@
   });
 
   window.addEventListener("hashchange", routeChanged);
-  window.addEventListener("beforeunload", stopUpdatesPolling);
+  window.addEventListener("beforeunload", () => stopUpdatesStream({ status: "idle" }));
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && state.route.name === "bot-updates" && !state.updatesPaused) loadUpdates({ silent: true });
+    if (document.visibilityState === "visible" && state.route.name === "bot-updates" && !state.updatesPaused && !state.updatesStream && !state.updatesStreamRetryTimer) {
+      startUpdatesStream({ reconnecting: state.updatesStreamStatus === "reconnecting" });
+    }
   });
 
   bootstrap();

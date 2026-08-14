@@ -12,8 +12,24 @@ bot_token="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
 child_bot_token="987654321:abcdefghijklmnopqrstuvwxyzABCDEF"
 child_telegram_bot_id=987654321
 child_owner_telegram_user_id=555000111
+live_stream_pid=""
+live_stream_dir=""
+
+cleanup_live_stream() {
+  if [[ -n "$live_stream_pid" ]]; then
+    kill "$live_stream_pid" 2>/dev/null || true
+    wait "$live_stream_pid" 2>/dev/null || true
+    live_stream_pid=""
+  fi
+  if [[ -n "$live_stream_dir" && -d "$live_stream_dir" ]]; then
+    rm -f -- "$live_stream_dir/events" "$live_stream_dir/headers"
+    rmdir -- "$live_stream_dir"
+    live_stream_dir=""
+  fi
+}
 
 cleanup() {
+  cleanup_live_stream
   psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null || true
 DELETE FROM users
  WHERE id IN (
@@ -316,6 +332,33 @@ jq -e '.ok == true and .result.text == "operator response"' <<<"$operator_reply"
 
 updates="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/updates?limit=10")"
 jq -e '.updates | any(.update_id == 7001 and .event_type == "message" and .chat_id == 99)' <<<"$updates" >/dev/null
+jq -e '.stream_cursor | type == "string" and test("^[0-9]+$")' <<<"$updates" >/dev/null
+stream_cursor="$(jq -er '.stream_cursor' <<<"$updates")"
+
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+  "$base_url/api/bots/$bot_id/updates/stream?after=0")" = "401"
+test "$(curl -sS -b "$auth_cookie" -o /dev/null -w '%{http_code}' \
+  "$base_url/api/bots/00000000-0000-0000-0000-000000000000/updates/stream?after=0")" = "404"
+
+console_stream="$(curl -i -sS -b "$auth_cookie" --max-time 2 \
+  "$base_url/api/bots/$bot_id/updates/stream?after=0" 2>/dev/null || true)"
+grep -qi '^x-accel-buffering: no' <<<"$console_stream"
+grep -q 'event: update' <<<"$console_stream"
+grep -q '"id":' <<<"$console_stream"
+grep -q '"update_id":7001' <<<"$console_stream"
+grep -q '"chat_id":99' <<<"$console_stream"
+grep -q '"received_at":' <<<"$console_stream"
+grep -q '"expires_at":' <<<"$console_stream"
+
+# Native EventSource reconnects retain the original query string while adding
+# Last-Event-ID. The header must win or every reconnect replays from `after=0`.
+reconnected_stream="$(curl -sS -b "$auth_cookie" --max-time 1 \
+  -H "Last-Event-ID: $stream_cursor" \
+  "$base_url/api/bots/$bot_id/updates/stream?after=0" 2>/dev/null || true)"
+if grep -q 'event: update' <<<"$reconnected_stream"; then
+  echo "Last-Event-ID did not override the query cursor" >&2
+  exit 1
+fi
 
 conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations")"
 jq -e '.conversations[0].chat_id == 99 and .conversations[0].last_message_preview == "You: operator response"' <<<"$conversations" >/dev/null
@@ -323,6 +366,44 @@ jq -e '.conversations[0].chat_id == 99 and .conversations[0].last_message_previe
 timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/99/messages")"
 jq -e '[.messages[].direction] | contains(["incoming"]) and contains(["outgoing"])' <<<"$timeline" >/dev/null
 jq -e '[.messages[].text] | contains(["hello from the e2e test"]) and contains(["operator response"]) and contains(["proxied response"])' <<<"$timeline" >/dev/null
+
+# Prove that an already-connected authenticated stream receives a newly
+# committed journal row, not only replayed history.
+live_stream_dir="$(mktemp -d)"
+curl -sS --no-buffer -b "$auth_cookie" --max-time 8 \
+  -D "$live_stream_dir/headers" \
+  -o "$live_stream_dir/events" \
+  "$base_url/api/bots/$bot_id/updates/stream?after=$stream_cursor" &
+live_stream_pid="$!"
+for _ in $(seq 1 40); do
+  if grep -qi '^content-type: text/event-stream' "$live_stream_dir/headers" 2>/dev/null; then
+    break
+  fi
+  kill -0 "$live_stream_pid" 2>/dev/null
+  sleep 0.05
+done
+grep -qi '^content-type: text/event-stream' "$live_stream_dir/headers"
+
+live_update='{"update_id":7004,"message":{"message_id":44,"date":1786620003,"from":{"id":99,"is_bot":false,"first_name":"Ada"},"chat":{"id":99,"type":"private","first_name":"Ada"},"text":"live stream push"}}'
+curl -fsS \
+  -H 'content-type: application/json' \
+  -H "x-telegram-bot-api-secret-token: $ingress_secret" \
+  -d "$live_update" \
+  "$base_url/telegram/webhook/$public_id" | jq -e '.ok == true' >/dev/null
+for _ in $(seq 1 80); do
+  if grep -q '"update_id":7004' "$live_stream_dir/events" 2>/dev/null; then
+    break
+  fi
+  kill -0 "$live_stream_pid" 2>/dev/null
+  sleep 0.05
+done
+grep -q 'event: update' "$live_stream_dir/events"
+grep -Eq '^id: [0-9]+' "$live_stream_dir/events"
+grep -q '"update_id":7004' "$live_stream_dir/events"
+grep -q '"chat_id":99' "$live_stream_dir/events"
+grep -q '"received_at":' "$live_stream_dir/events"
+grep -q '"expires_at":' "$live_stream_dir/events"
+cleanup_live_stream
 
 stream="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \

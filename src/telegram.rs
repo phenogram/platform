@@ -16,7 +16,7 @@ use axum::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -1678,29 +1678,44 @@ pub async fn webhook_ingress(
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
     let projection = conversation_projection(&payload);
+    let projected_chat_id = projection.as_ref().map(|value| value.chat_id);
+    let projected_telegram_user_id = projection.as_ref().and_then(|value| value.user_id);
 
+    // PostgreSQL sequence values are allocated before commit. Serialize each
+    // bot's ingestion through publication so DB row cursors and live events
+    // cannot be observed out of order by reconnecting SSE consumers.
+    let _ingestion_guard = state.events.lock_ingestion(bot.id).await;
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let inserted = sqlx::query_scalar::<_, i64>(
+    let inserted = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ),
+    >(
         r#"INSERT INTO updates (bot_id, update_id, event_type, chat_id, telegram_user_id, payload, expires_at)
            SELECT bots.id, $2, $3, $4, $5, $6,
                   now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-            WHERE bots.id = $1
+           WHERE bots.id = $1
            ON CONFLICT (bot_id, update_id) DO NOTHING
-           RETURNING id"#,
+           RETURNING id, chat_id, telegram_user_id, received_at, expires_at"#,
     )
     .bind(bot.id)
     .bind(update_id)
     .bind(&event_type)
-    .bind(projection.as_ref().map(|value| value.chat_id))
-    .bind(projection.as_ref().and_then(|value| value.user_id))
+    .bind(projected_chat_id)
+    .bind(projected_telegram_user_id)
     .bind(&payload)
     .fetch_optional(&mut *tx)
     .await;
-    let row_id = match inserted {
+    let (row_id, chat_id, telegram_user_id, received_at, expires_at) = match inserted {
         Ok(Some(value)) => value,
         Ok(None) => {
             if let Some(identity) = &managed_identity {
@@ -1842,7 +1857,11 @@ pub async fn webhook_ingress(
                 row_id,
                 update_id,
                 event_type,
+                chat_id,
+                telegram_user_id,
                 payload,
+                received_at,
+                expires_at,
             },
         )
         .await;
@@ -1851,7 +1870,18 @@ pub async fn webhook_ingress(
 
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
-    after: Option<i64>,
+    pub(crate) after: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+enum StreamEventShape {
+    Public,
+    Console,
+}
+
+enum StreamAccess {
+    Key(Vec<u8>),
+    Console { user_id: Uuid, session_id: Uuid },
 }
 
 pub async fn event_stream(
@@ -1886,23 +1916,70 @@ pub async fn event_stream(
         .bind(&digest)
         .execute(&state.db)
         .await;
+    let after = stream_after(&headers, query.after);
+    update_stream_response(
+        state,
+        bot_id,
+        after,
+        permit,
+        StreamAccess::Key(digest),
+        StreamEventShape::Public,
+    )
+    .await
+}
+
+pub async fn console_event_stream(
+    state: AppState,
+    user_id: Uuid,
+    session_id: Uuid,
+    bot_id: Uuid,
+    query: StreamQuery,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let limiter_key =
+        crate::crypto::Crypto::digest_secret(format!("console:{session_id}:{bot_id}").as_bytes());
+    let permit = state.console_stream_limiter.try_acquire(&limiter_key)?;
+    let after = stream_after(&headers, query.after);
+    Ok(update_stream_response(
+        state,
+        bot_id,
+        after,
+        permit,
+        StreamAccess::Console {
+            user_id,
+            session_id,
+        },
+        StreamEventShape::Console,
+    )
+    .await)
+}
+
+async fn update_stream_response(
+    state: AppState,
+    bot_id: Uuid,
+    after: i64,
+    permit: crate::state::StreamPermit,
+    access: StreamAccess,
+    shape: StreamEventShape,
+) -> Response {
     // Subscribe before querying replay so updates committed during the query are
-    // held by the live receiver and then de-duplicated by row id.
+    // held by the live receiver and then de-duplicated by the monotonic DB row id.
     let mut receiver = state.events.subscribe(bot_id).await;
-    let header_after = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok());
-    let after = query.after.or(header_after).unwrap_or(0);
-    let key_digest = digest;
     let database = state.db.clone();
     let stream = async_stream::stream! {
         let _permit = permit;
-        let mut replay_last_id = after;
+        let mut last_seen_id = after;
         let mut replay_truncated = false;
+        let mut access_check = tokio::time::interval(Duration::from_secs(15));
+        access_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        access_check.tick().await;
         {
-            let replay = sqlx::query_as::<_, (i64, i64, String, Value)>(
-                "SELECT id, update_id, event_type, payload FROM updates WHERE bot_id = $1 AND id > $2 ORDER BY id ASC LIMIT $3",
+            let replay = sqlx::query_as::<_, (i64, i64, String, Option<i64>, Option<i64>, Value, DateTime<Utc>, DateTime<Utc>)>(
+                r#"SELECT id, update_id, event_type, chat_id, telegram_user_id,
+                          payload, received_at, expires_at
+                     FROM updates
+                    WHERE bot_id = $1 AND id > $2 AND expires_at > now()
+                    ORDER BY id ASC LIMIT $3"#,
             )
             .bind(bot_id)
             .bind(after)
@@ -1912,18 +1989,39 @@ pub async fn event_stream(
             let mut replay_rows = 0_usize;
             let mut replay_bytes = 0_usize;
             loop {
-                let row = match replay.try_next().await {
+                let row = loop {
+                    tokio::select! {
+                        row = replay.try_next() => break row,
+                        _ = access_check.tick() => {
+                            if !stream_access_active(&database, bot_id, &access).await {
+                                yield Ok::<Event, Infallible>(Event::default().event("revoked").data(stream_revocation_message(&access)));
+                                return;
+                            }
+                            yield Ok::<Event, Infallible>(Event::default().comment("keepalive"));
+                        }
+                    }
+                };
+                let row = match row {
                     Ok(row) => row,
                     Err(_) => {
                         yield Ok::<Event, Infallible>(Event::default().event("error").data("replay storage is temporarily unavailable"));
                         return;
                     }
                 };
-                let Some((row_id, update_id, event_type, payload)) = row else {
+                let Some((row_id, update_id, event_type, chat_id, telegram_user_id, payload, received_at, expires_at)) = row else {
                     break;
                 };
-                let data = json!({"row_id": row_id, "update_id": update_id, "event_type": event_type, "payload": payload});
-                let serialized = match serde_json::to_string(&data) {
+                let update = StoredUpdate {
+                    row_id,
+                    update_id,
+                    event_type,
+                    chat_id,
+                    telegram_user_id,
+                    payload,
+                    received_at,
+                    expires_at,
+                };
+                let serialized = match serialize_stream_update(&update, shape) {
                     Ok(serialized) => serialized,
                     Err(_) => {
                         yield Ok::<Event, Infallible>(Event::default().event("error").data("update serialization failed"));
@@ -1942,52 +2040,49 @@ pub async fn event_stream(
                 }
                 replay_rows += 1;
                 replay_bytes = replay_bytes.saturating_add(serialized.len());
-                replay_last_id = row_id;
+                last_seen_id = row_id;
                 yield Ok::<Event, Infallible>(Event::default().id(row_id.to_string()).event("update").data(serialized));
             }
         }
         if replay_truncated {
-            yield Ok::<Event, Infallible>(Event::default().id(replay_last_id.to_string()).event("resync").data("reconnect with this Last-Event-ID to continue replay"));
+            yield Ok::<Event, Infallible>(Event::default().id(last_seen_id.to_string()).event("resync").data("reconnect with this Last-Event-ID to continue replay"));
             return;
         }
-        let mut key_check = tokio::time::interval(Duration::from_secs(15));
-        key_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        key_check.tick().await;
         loop {
             tokio::select! {
                 next = receiver.recv() => match next {
                 Ok(update) => {
-                    if update.row_id <= replay_last_id {
+                    if update.row_id <= last_seen_id {
                         continue;
                     }
                     let row_id = update.row_id;
-                    yield Ok::<Event, Infallible>(Event::default().id(row_id.to_string()).event("update").json_data(update).unwrap_or_else(|_| Event::default().event("error").data("serialization failed")));
+                    last_seen_id = row_id;
+                    if update.expires_at <= Utc::now() {
+                        continue;
+                    }
+                    let serialized = match serialize_stream_update(&update, shape) {
+                        Ok(serialized) if serialized.len() <= SSE_REPLAY_EVENT_BYTE_LIMIT => serialized,
+                        Ok(_) => {
+                            yield Ok::<Event, Infallible>(Event::default().event("error").data("stored update exceeds the replay event limit"));
+                            return;
+                        }
+                        Err(_) => {
+                            yield Ok::<Event, Infallible>(Event::default().event("error").data("update serialization failed"));
+                            return;
+                        }
+                    };
+                    yield Ok::<Event, Infallible>(Event::default().id(row_id.to_string()).event("update").data(serialized));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok::<Event, Infallible>(Event::default().event("resync").data("consumer lagged; reconnect with Last-Event-ID"));
+                    yield Ok::<Event, Infallible>(Event::default().id(last_seen_id.to_string()).event("resync").data("consumer lagged; reconnect with Last-Event-ID"));
+                    return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
-                _ = key_check.tick() => {
-                    let active = sqlx::query_scalar::<_, bool>(
-                        r#"SELECT EXISTS(
-                               SELECT 1
-                                 FROM event_stream_keys keys
-                                 JOIN bots ON bots.id = keys.bot_id
-                                 JOIN memberships ON memberships.user_id = bots.user_id
-                                WHERE keys.secret_hash = $1
-                                  AND keys.revoked_at IS NULL
-                                  AND (memberships.status IN ('active', 'trialing') OR
-                                       (memberships.status IN ('past_due', 'canceled') AND
-                                        memberships.current_period_ends_at > now()))
-                           )"#,
-                    )
-                    .bind(&key_digest)
-                    .fetch_one(&database)
-                    .await
-                    .unwrap_or(false);
+                _ = access_check.tick() => {
+                    let active = stream_access_active(&database, bot_id, &access).await;
                     if !active {
-                        yield Ok::<Event, Infallible>(Event::default().event("revoked").data("stream key revoked"));
+                        yield Ok::<Event, Infallible>(Event::default().event("revoked").data(stream_revocation_message(&access)));
                         break;
                     }
                     yield Ok::<Event, Infallible>(Event::default().comment("keepalive"));
@@ -1995,7 +2090,116 @@ pub async fn event_stream(
             }
         }
     };
-    Sse::new(stream).into_response()
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
+}
+
+fn stream_revocation_message(access: &StreamAccess) -> &'static str {
+    match access {
+        StreamAccess::Key(_) => "stream key revoked",
+        StreamAccess::Console { .. } => "console access revoked",
+    }
+}
+
+async fn stream_access_active(
+    database: &sqlx::PgPool,
+    bot_id: Uuid,
+    access: &StreamAccess,
+) -> bool {
+    match access {
+        StreamAccess::Key(digest) => sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1
+                     FROM event_stream_keys keys
+                     JOIN bots ON bots.id = keys.bot_id
+                     JOIN memberships ON memberships.user_id = bots.user_id
+                    WHERE keys.bot_id = $1 AND keys.secret_hash = $2
+                      AND keys.revoked_at IS NULL
+                      AND (memberships.status IN ('active', 'trialing') OR
+                           (memberships.status IN ('past_due', 'canceled') AND
+                            memberships.current_period_ends_at > now()))
+               )"#,
+        )
+        .bind(bot_id)
+        .bind(digest)
+        .fetch_one(database)
+        .await
+        .unwrap_or(false),
+        StreamAccess::Console {
+            user_id,
+            session_id,
+        } => sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1
+                     FROM sessions
+                     JOIN bots ON bots.user_id = sessions.user_id
+                    WHERE sessions.id = $1 AND sessions.user_id = $2
+                      AND sessions.expires_at > now() AND bots.id = $3
+               )"#,
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(bot_id)
+        .fetch_one(database)
+        .await
+        .unwrap_or(false),
+    }
+}
+
+fn stream_after(headers: &HeaderMap, query_after: Option<i64>) -> i64 {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .or(query_after)
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn serialize_stream_update(
+    update: &StoredUpdate,
+    shape: StreamEventShape,
+) -> serde_json::Result<String> {
+    let value = match shape {
+        StreamEventShape::Public => json!({
+            "row_id": update.row_id,
+            "update_id": update.update_id,
+            "event_type": update.event_type,
+            "payload": update.payload,
+        }),
+        StreamEventShape::Console => json!({
+            "id": update.row_id,
+            "update_id": update.update_id,
+            "event_type": update.event_type,
+            "chat_id": update.chat_id,
+            "telegram_user_id": update.telegram_user_id,
+            "payload": update.payload,
+            "received_at": update.received_at,
+            "expires_at": update.expires_at,
+        }),
+    };
+    serde_json::to_string(&value)
+}
+
+pub(crate) fn search_pattern(value: &str) -> String {
+    let value = value.chars().take(120).collect::<String>();
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('%');
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped.push('%');
+    escaped
 }
 
 #[derive(Debug)]
@@ -2878,14 +3082,67 @@ fn is_globally_routable_v6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod destination_tests {
     use super::{
-        ALL_UPDATE_TYPES, byte_range, is_globally_routable, managed_bot_identity,
-        managed_child_routing, take_managed_bot_token, validate_webhook_url,
+        ALL_UPDATE_TYPES, StreamEventShape, byte_range, is_globally_routable, managed_bot_identity,
+        managed_child_routing, search_pattern, serialize_stream_update, stream_after,
+        take_managed_bot_token, validate_webhook_url,
     };
+    use crate::state::StoredUpdate;
+    use axum::http::{HeaderMap, HeaderValue};
+    use chrono::{TimeZone, Utc};
     use serde_json::{Value, json};
     use std::net::IpAddr;
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("valid test address")
+    }
+
+    #[test]
+    fn last_event_id_takes_precedence_over_query_cursor() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", HeaderValue::from_static("42"));
+
+        assert_eq!(stream_after(&headers, Some(7)), 42);
+        assert_eq!(stream_after(&HeaderMap::new(), Some(7)), 7);
+    }
+
+    #[test]
+    fn console_stream_update_matches_update_summary_shape() {
+        let received_at = Utc
+            .with_ymd_and_hms(2026, 8, 14, 9, 30, 0)
+            .single()
+            .expect("valid received timestamp");
+        let expires_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 9, 30, 0)
+            .single()
+            .expect("valid expiry timestamp");
+        let update = StoredUpdate {
+            row_id: 51,
+            update_id: 7001,
+            event_type: "message".into(),
+            chat_id: Some(99),
+            telegram_user_id: Some(100),
+            payload: json!({"update_id": 7001, "message": {"text": "hello"}}),
+            received_at,
+            expires_at,
+        };
+
+        let serialized = serialize_stream_update(&update, StreamEventShape::Console)
+            .expect("console update serializes");
+        let value: Value = serde_json::from_str(&serialized).expect("valid event JSON");
+
+        assert_eq!(value["id"], 51);
+        assert_eq!(value["update_id"], 7001);
+        assert_eq!(value["event_type"], "message");
+        assert_eq!(value["chat_id"], 99);
+        assert_eq!(value["telegram_user_id"], 100);
+        assert_eq!(value["received_at"], "2026-08-14T09:30:00Z");
+        assert_eq!(value["expires_at"], "2026-09-13T09:30:00Z");
+        assert!(value.get("row_id").is_none());
+    }
+
+    #[test]
+    fn list_search_escapes_like_wildcards() {
+        assert_eq!(search_pattern(r"100%_ready\now"), r"%100\%\_ready\\now%");
     }
 
     #[test]
