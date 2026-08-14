@@ -14,6 +14,9 @@ child_telegram_bot_id=987654321
 child_owner_telegram_user_id=555000111
 live_stream_pid=""
 live_stream_dir=""
+tap_collector_pid=""
+tap_collector_dir=""
+tap_ack_listener_pid=""
 
 cleanup_live_stream() {
   if [[ -n "$live_stream_pid" ]]; then
@@ -30,6 +33,22 @@ cleanup_live_stream() {
 
 cleanup() {
   cleanup_live_stream
+  if [[ -n "$tap_ack_listener_pid" ]]; then
+    kill "$tap_ack_listener_pid" 2>/dev/null || true
+    wait "$tap_ack_listener_pid" 2>/dev/null || true
+    tap_ack_listener_pid=""
+  fi
+  if [[ -n "$tap_collector_pid" ]]; then
+    kill "$tap_collector_pid" 2>/dev/null || true
+    wait "$tap_collector_pid" 2>/dev/null || true
+    tap_collector_pid=""
+  fi
+  if [[ -n "$tap_collector_dir" && -d "$tap_collector_dir" ]]; then
+    rm -f -- "$tap_collector_dir/tap.sock" "$tap_collector_dir/ack.sock" \
+      "$tap_collector_dir/lifecycle-acks.jsonl" "$tap_collector_dir/collector.log"
+    rmdir -- "$tap_collector_dir"
+    tap_collector_dir=""
+  fi
   psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null || true
 DELETE FROM users
  WHERE id IN (
@@ -44,7 +63,7 @@ trap cleanup EXIT
 curl -fsS -X POST "$mock_url/__reset" | jq -e '.ok == true' >/dev/null
 curl -fsS -X POST \
   -H 'content-type: application/json' \
-  -d "{\"url\":\"$mock_url/__downstream\",\"has_custom_certificate\":false,\"allowed_updates\":[\"message\"],\"max_connections\":73}" \
+  -d "{\"url\":\"$mock_url/__downstream\",\"has_custom_certificate\":false,\"allowed_updates\":[\"message\"],\"max_connections\":73,\"ip_address\":\"203.0.113.17\"}" \
   "$mock_url/__seed_webhook" | jq -e '.ok == true' >/dev/null
 
 health="$(curl -fsS "$base_url/api/health")"
@@ -76,14 +95,190 @@ session="$(curl -fsS -b "$auth_cookie" "$base_url/api/me")"
 csrf="$(jq -er '.csrf_token' <<<"$session")"
 jq -e '.membership.plan_id == "free" and .membership.bot_limit == 1' <<<"$session" >/dev/null
 
-connected="$(curl -fsS -b "$auth_cookie" \
+secret_required="$(curl -sS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
   -d "{\"token\":\"$bot_token\"}" \
+  -w $'\n%{http_code}' \
   "$base_url/api/bots")"
+secret_required_status="${secret_required##*$'\n'}"
+secret_required_body="${secret_required%$'\n'*}"
+test "$secret_required_status" = "409"
+jq -e '.error.code == "webhook_secret_required"
+  and .error.requires_webhook_secret == true
+  and (.error.destination_host | length > 0)' <<<"$secret_required_body" >/dev/null
+
+ip_resolution="$(curl -sS -b "$auth_cookie" \
+  -H 'content-type: application/json' \
+  -H "x-phenogram-csrf: $csrf" \
+  -d "{\"token\":\"$bot_token\",\"existing_webhook_has_no_secret\":true}" \
+  -w $'\n%{http_code}' \
+  "$base_url/api/bots")"
+ip_resolution_status="${ip_resolution##*$'\n'}"
+ip_resolution_body="${ip_resolution%$'\n'*}"
+if [[ "$ip_resolution_status" = "409" ]]; then
+  jq -e '.error.code == "webhook_ip_address_resolution_required"
+    and .error.requires_webhook_ip_address_resolution == true
+    and .error.reported_ip_address == "203.0.113.17"
+    and (.error.destination_host | length > 0)' <<<"$ip_resolution_body" >/dev/null
+  connected="$(curl -fsS -b "$auth_cookie" \
+    -H 'content-type: application/json' \
+    -H "x-phenogram-csrf: $csrf" \
+    -d "{\"token\":\"$bot_token\",\"existing_webhook_has_no_secret\":true,\"existing_webhook_ip_address\":\"203.0.113.17\"}" \
+    "$base_url/api/bots")"
+else
+  test "$ip_resolution_status" = "201"
+  connected="$ip_resolution_body"
+fi
 bot_id="$(jq -er '.bot.id' <<<"$connected")"
 public_id="$(jq -er '.bot.public_id' <<<"$connected")"
-jq -e '.bot.username == "phenogram_test_bot" and .bot.update_mode == "webhook" and (.bot | has("token_fingerprint") | not) and (.bot.public_id | length > 20) and (.warnings | any(contains("transferred")))' <<<"$connected" >/dev/null
+jq -e '.bot.username == "phenogram_test_bot" and .bot.update_mode == "webhook" and (.bot | has("token_fingerprint") | not) and (.bot.public_id | length > 20)' <<<"$connected" >/dev/null
+if jq -e '.bot.data_plane_pool != null' <<<"$connected" >/dev/null; then
+  jq -e '.webhook_ip_address_preserved == true
+    and (.warnings | any(contains("chose fixed-IP continuity")))' \
+    <<<"$connected" >/dev/null
+else
+  jq -e '.webhook_ip_address_preserved == false' <<<"$connected" >/dev/null
+fi
+
+route_generation_before="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")"
+if jq -e '.bot.data_plane_pool != null' <<<"$connected" >/dev/null; then
+  psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+UPDATE bots SET data_plane_pool = NULL WHERE id = :'bot_id'::uuid;
+SQL
+  route_generation_withdrawn="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+    -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")"
+  test "$route_generation_withdrawn" -gt "$route_generation_before"
+else
+  route_generation_withdrawn="$route_generation_before"
+fi
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+UPDATE bots SET data_plane_pool = 'standard' WHERE id = :'bot_id'::uuid;
+SQL
+route_generation_active="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")"
+test "$route_generation_active" -gt "$route_generation_withdrawn"
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+UPDATE bots SET data_plane_pool = 'standard' WHERE id = :'bot_id'::uuid;
+SQL
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")" = "$route_generation_active"
+
+if [[ -n "${PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN:-}" ]]; then
+  route_snapshot="$(curl -fsS \
+    -H 'host: phenogram' \
+    -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
+    "$base_url/api/internal/data-plane/routes")"
+  token_lookup_hash="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT token_lookup_hash FROM bots WHERE id = :'bot_id'::uuid;
+SQL
+)"
+  jq -e --argjson generation "$route_generation_active" --arg hash "$token_lookup_hash" \
+    '.schema_version == 1 and .generation == $generation
+      and .routes == [{token_lookup_hash: $hash, pool: "standard"}]' \
+    <<<"$route_snapshot" >/dev/null
+  case "$route_snapshot" in *"$bot_token"*) exit 1 ;; esac
+
+  observed_at_unix_ms="$(($(date +%s) * 1000))"
+  telemetry_response="$(curl -fsS -X POST \
+    -H 'host: phenogram' \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"getMe\",\"upstream_status\":200,\"latency_ms\":5,\"observed_at_unix_ms\":$observed_at_unix_ms},{\"schema_version\":1,\"token_lookup_hash\":\"phg_AAAAAAAAAAAAAAAAAAAAAAAA\",\"pool\":\"standard\",\"method\":\"getMe\",\"upstream_status\":200,\"latency_ms\":5,\"observed_at_unix_ms\":$observed_at_unix_ms}]}" \
+    "$base_url/api/internal/data-plane/telemetry")"
+  jq -e '.ok == true and .accepted == 1 and .unknown == 1' \
+    <<<"$telemetry_response" >/dev/null
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM api_calls
+ WHERE bot_id = :'bot_id'::uuid
+   AND source = 'data_plane'
+   AND data_plane_pool = 'standard'
+   AND method = 'getMe';
+SQL
+)" = "1"
+fi
+
+tap_collector_bin="${PHENOGRAM_TAP_COLLECTOR_BIN:-target/debug/phenogram-tap-collector}"
+test -x "$tap_collector_bin"
+tap_collector_dir="$(mktemp -d)"
+tap_socket="$tap_collector_dir/tap.sock"
+tap_ack_socket="$tap_collector_dir/ack.sock"
+DATABASE_URL="$database_url" \
+PHENOGRAM_TAP_POOL=standard \
+PHENOGRAM_TAP_SOCKET_PATH="$tap_socket" \
+PHENOGRAM_TAP_ACK_SOCKET_PATH="$tap_ack_socket" \
+RUST_LOG="phenogram_platform=info" \
+  "$tap_collector_bin" >"$tap_collector_dir/collector.log" 2>&1 &
+tap_collector_pid="$!"
+for _ in $(seq 1 100); do
+  if [[ -S "$tap_socket" ]]; then
+    break
+  fi
+  kill -0 "$tap_collector_pid" 2>/dev/null
+  sleep 0.05
+done
+test -S "$tap_socket"
+
+# A collector is tied to the official server pool beside it. It may observe a
+# bot already active in that pool or one whose login migration targets it, but
+# must drop a same-numbered event emitted by the other pool.
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+UPDATE bots
+   SET data_plane_pool = NULL, data_plane_target_pool = 'standard'
+ WHERE id = :'bot_id'::uuid;
+SQL
+printf '%s' '{"update_id":6900,"poll":{"id":"target-pool-observer-copy"}}' \
+  | python3 tests/send_tap_frame.py "$tap_socket" update 123456789 6900
+for _ in $(seq 1 40); do
+  target_pool_update_count="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates
+ WHERE bot_id = :'bot_id'::uuid AND update_id = 6900;
+SQL
+)"
+  if [[ "$target_pool_update_count" = "1" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+test "$target_pool_update_count" = "1"
+
+# A tap is an observer copy from an official Bot API server. That server owns
+# the developer webhook, so stale legacy delivery state must never make
+# Phenogram send the same update a second time.
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*)
+  FROM webhook_deliveries deliveries
+  JOIN updates ON updates.id = deliveries.update_row_id
+ WHERE deliveries.bot_id = :'bot_id'::uuid
+   AND updates.update_id = 6900;
+SQL
+)" = "0"
+curl -fsS \
+  -H 'content-type: application/json' \
+  -d '{"update_id":6900,"poll":{"id":"native-official-delivery"}}' \
+  "$mock_url/__downstream" | jq -e '.ok == true' >/dev/null
+test "$(curl -fsS "$mock_url/__state" \
+  | jq '[.deliveries[] | select(.update_id == 6900)] | length')" = "1"
+
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+UPDATE bots
+   SET data_plane_pool = 'local', data_plane_target_pool = NULL
+ WHERE id = :'bot_id'::uuid;
+SQL
+printf '%s' '{"update_id":6901,"poll":{"id":"wrong-pool-observer-copy"}}' \
+  | python3 tests/send_tap_frame.py "$tap_socket" update 123456789 6901
+sleep 0.2
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates
+ WHERE bot_id = :'bot_id'::uuid AND update_id = 6901;
+SQL
+)" = "0"
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+UPDATE bots
+   SET data_plane_pool = NULL, data_plane_target_pool = 'standard'
+ WHERE id = :'bot_id'::uuid;
+SQL
 
 upstream_state="$(curl -fsS "$mock_url/__state")"
 ingress_secret="$(jq -er '.webhook.secret_token' <<<"$upstream_state")"
@@ -93,30 +288,144 @@ jq -e --arg public_id "$public_id" '.webhook.url | endswith("/telegram/webhook/"
 # Phenogram before replacing Telegram's upstream destination.
 migrated_webhook="$(curl -fsS "$base_url/bot$bot_token/getWebhookInfo")"
 jq -e --arg url "$mock_url/__downstream" '.ok == true and .result.url == $url and .result.allowed_updates == ["message"] and .result.max_connections == 73' <<<"$migrated_webhook" >/dev/null
+if jq -e '.bot.data_plane_pool != null' <<<"$connected" >/dev/null; then
+  jq -e '.result.ip_address == "203.0.113.17"' <<<"$migrated_webhook" >/dev/null
+fi
 
 # Telegram sends this canonical lifecycle update to the manager. Phenogram must
 # durably discover the child, fetch its credential from the manager context,
 # and provision the child's own upstream webhook without user opt-in.
-managed_update="$(jq -cn \
-  --argjson child_bot_id "$child_telegram_bot_id" \
+lifecycle_producer_id=7000001
+lifecycle_observer_event_id=710001
+lifecycle_expiry="$(($(date +%s) + 3600))"
+lifecycle_delivery_nonce=7200000001
+lifecycle_ack_output="$tap_collector_dir/lifecycle-acks.jsonl"
+python3 tests/send_tap_frame.py "$tap_ack_socket" ack-listen 2 \
+  >"$lifecycle_ack_output" &
+tap_ack_listener_pid="$!"
+for _ in $(seq 1 100); do
+  if [[ -S "$tap_ack_socket" ]]; then
+    break
+  fi
+  kill -0 "$tap_ack_listener_pid" 2>/dev/null
+  sleep 0.01
+done
+test -S "$tap_ack_socket"
+
+PHENOGRAM_TAP_PRODUCER_ID="$lifecycle_producer_id" \
+PHENOGRAM_TAP_EVENT_SEQUENCE=1 \
+PHENOGRAM_TAP_OBSERVER_EVENT_ID="$lifecycle_observer_event_id" \
+PHENOGRAM_TAP_EVENT_EXPIRY="$lifecycle_expiry" \
+PHENOGRAM_TAP_DELIVERY_NONCE="$lifecycle_delivery_nonce" \
+  python3 tests/send_tap_frame.py \
+  "$tap_socket" lifecycle 123456789 \
+  "$child_owner_telegram_user_id" "$child_telegram_bot_id"
+
+# The receipt and managed-job mutation commit atomically before ACK. Replaying
+# the same durable observer record with a new wire sequence must produce a new
+# exact ACK without changing the already committed job generation or state.
+lifecycle_receipt_count=0
+lifecycle_job_count=0
+for _ in $(seq 1 100); do
+  lifecycle_receipt_count="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+    -v bot_id="$bot_id" -v delivery_nonce="$lifecycle_delivery_nonce" <<'SQL'
+SELECT count(*)
+  FROM managed_bot_lifecycle_receipts
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND delivery_nonce = :'delivery_nonce'::bigint;
+SQL
+)"
+  lifecycle_job_count="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+    -v bot_id="$bot_id" -v child_bot_id="$child_telegram_bot_id" <<'SQL'
+SELECT count(*)
+  FROM managed_bot_sync_jobs
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND managed_telegram_bot_id = :'child_bot_id'::bigint;
+SQL
+)"
+  if [[ "$lifecycle_receipt_count" = "1" && "$lifecycle_job_count" = "1" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+test "$lifecycle_receipt_count" = "1"
+test "$lifecycle_job_count" = "1"
+
+psql "$database_url" -v ON_ERROR_STOP=1 \
+  -v bot_id="$bot_id" -v child_bot_id="$child_telegram_bot_id" <<'SQL' >/dev/null
+UPDATE managed_bot_sync_jobs
+   SET state = 'conflict', attempt = 77, locked_at = NULL,
+       error_summary = 'durable-replay-sentinel', completed_at = NULL,
+       updated_at = '2000-01-01 00:00:00+00'
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND managed_telegram_bot_id = :'child_bot_id'::bigint;
+SQL
+lifecycle_job_before="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -v bot_id="$bot_id" -v child_bot_id="$child_telegram_bot_id" <<'SQL'
+SELECT source_generation, state, attempt, error_summary, updated_at
+  FROM managed_bot_sync_jobs
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND managed_telegram_bot_id = :'child_bot_id'::bigint;
+SQL
+)"
+
+PHENOGRAM_TAP_PRODUCER_ID="$lifecycle_producer_id" \
+PHENOGRAM_TAP_EVENT_SEQUENCE=2 \
+PHENOGRAM_TAP_OBSERVER_EVENT_ID="$lifecycle_observer_event_id" \
+PHENOGRAM_TAP_EVENT_EXPIRY="$lifecycle_expiry" \
+PHENOGRAM_TAP_DELIVERY_NONCE="$lifecycle_delivery_nonce" \
+  python3 tests/send_tap_frame.py \
+  "$tap_socket" lifecycle 123456789 \
+  "$child_owner_telegram_user_id" "$child_telegram_bot_id"
+wait "$tap_ack_listener_pid"
+tap_ack_listener_pid=""
+
+jq -s -e \
+  --argjson producer "$lifecycle_producer_id" \
+  --argjson observer_event_id "$lifecycle_observer_event_id" \
+  --argjson expiry "$lifecycle_expiry" \
+  --argjson delivery_nonce "$lifecycle_delivery_nonce" \
   --argjson owner_id "$child_owner_telegram_user_id" \
-  '{
-    update_id: 7100,
-    managed_bot: {
-      user: {id: $owner_id, is_bot: false, first_name: "Managed Owner"},
-      bot: {
-        id: $child_bot_id,
-        is_bot: true,
-        first_name: "Managed E2E Child",
-        username: "managed_e2e_child_bot"
-      }
-    }
-  }')"
-curl -fsS \
-  -H 'content-type: application/json' \
-  -H "x-telegram-bot-api-secret-token: $ingress_secret" \
-  -d "$managed_update" \
-  "$base_url/telegram/webhook/$public_id" | jq -e '.ok == true' >/dev/null
+  --argjson child_bot_id "$child_telegram_bot_id" \
+  'length == 2
+    and (map(.producer) == [$producer, $producer])
+    and (map(.sequence) == [1, 2])
+    and all(.[ ];
+      .parent_bot_id == 123456789
+      and .observer_event_id == $observer_event_id
+      and .expiry == $expiry
+      and .delivery_nonce == $delivery_nonce
+      and .owner_id == $owner_id
+      and .child_id == $child_bot_id)' \
+  "$lifecycle_ack_output" >/dev/null
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -v bot_id="$bot_id" -v delivery_nonce="$lifecycle_delivery_nonce" <<'SQL'
+SELECT count(*)
+  FROM managed_bot_lifecycle_receipts
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND delivery_nonce = :'delivery_nonce'::bigint;
+SQL
+)" = "1"
+lifecycle_job_after="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -v bot_id="$bot_id" -v child_bot_id="$child_telegram_bot_id" <<'SQL'
+SELECT source_generation, state, attempt, error_summary, updated_at
+  FROM managed_bot_sync_jobs
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND managed_telegram_bot_id = :'child_bot_id'::bigint;
+SQL
+)"
+test "$lifecycle_job_after" = "$lifecycle_job_before"
+
+# Release the sentinel so the existing end-to-end assertions can observe the
+# worker provisioning the child after the idempotency check.
+psql "$database_url" -v ON_ERROR_STOP=1 \
+  -v bot_id="$bot_id" -v child_bot_id="$child_telegram_bot_id" <<'SQL' >/dev/null
+UPDATE managed_bot_sync_jobs
+   SET state = 'pending', attempt = 0, next_attempt_at = now(), locked_at = NULL,
+       error_summary = NULL, completed_at = NULL, updated_at = now()
+ WHERE manager_bot_id = :'bot_id'::uuid
+   AND managed_telegram_bot_id = :'child_bot_id'::bigint;
+SQL
 
 bots=""
 for _ in $(seq 1 100); do
@@ -170,6 +479,7 @@ jq -e \
 jq -e \
   --argjson all_update_types "$all_update_types" \
   --argjson child_bot_id "$child_telegram_bot_id" \
+  --argjson owner_id "$child_owner_telegram_user_id" \
   '.child_webhook.allowed_updates == $all_update_types
     and .child_webhook.drop_pending_updates == false
     and (.calls | any(
@@ -204,6 +514,123 @@ SELECT token_ciphertext <> convert_to(:'child_token', 'UTF8')
 SQL
 )"
 test "$credential_encrypted" = "t"
+
+child_data_plane_pool="$(jq -r --arg child_bot_id "$child_bot_id" \
+  '.bots[] | select(.id == $child_bot_id) | (.data_plane_pool // "")' <<<"$bots")"
+if [[ -n "$child_data_plane_pool" ]]; then
+  # Native setWebhook remains canonical on the official pool. Rotate the
+  # managed token after installing a secret-bearing webhook: the worker must
+  # withdraw and drain Phenogram admission, refetch the native webhook under
+  # that fence, expose recovery, and preserve the exact webhook when the
+  # operator supplies its current secret and IP intent.
+  rotation_webhook_secret="Managed_rotation_secret-1"
+  rotation_webhook_url="$mock_url/__downstream"
+  curl -fsS \
+    -H 'content-type: application/json' \
+    -d "{\"url\":\"$rotation_webhook_url\",\"secret_token\":\"$rotation_webhook_secret\",\"allowed_updates\":[\"message\"],\"max_connections\":61,\"ip_address\":\"203.0.113.19\"}" \
+    "$base_url/bot$child_bot_token/setWebhook" | jq -e '.ok == true' >/dev/null
+  blocked_route_generation="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+    -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")"
+  blocked_token_lookup_hash="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+    -v child_bot_id="$child_bot_id" <<'SQL'
+SELECT token_lookup_hash FROM bots WHERE id = :'child_bot_id'::uuid;
+SQL
+)"
+  curl -fsS -X POST "$mock_url/__rotate_managed_token" | jq -e '.ok == true' >/dev/null
+  python3 tests/send_tap_frame.py \
+    "$tap_socket" lifecycle 123456789 \
+    "$child_owner_telegram_user_id" "$child_telegram_bot_id"
+  blocked_bots=""
+  for _ in $(seq 1 100); do
+    blocked_bots="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots")"
+    if jq -e --arg child_bot_id "$child_bot_id" \
+      '.bots | any(.id == $child_bot_id and .status == "degraded" and .webhook_secret_required == true)' \
+      <<<"$blocked_bots" >/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  jq -e --arg child_bot_id "$child_bot_id" \
+    '.bots | any(.id == $child_bot_id
+      and .status == "degraded"
+      and .data_plane_pool == null
+      and .webhook_secret_required == true)' \
+    <<<"$blocked_bots" >/dev/null
+  blocked_mock_state="$(curl -fsS "$mock_url/__state")"
+  blocked_child_get_me_calls="$(jq '[.calls[] | select(.bot == "child" and (.method | ascii_downcase) == "getme")] | length' <<<"$blocked_mock_state")"
+  blocked_child_webhook="$(jq -c '.child_webhook' <<<"$blocked_mock_state")"
+  jq -e --arg url "$rotation_webhook_url" --arg secret "$rotation_webhook_secret" \
+    '.child_webhook.url == $url
+      and .child_webhook.secret_token == $secret
+      and .child_webhook.allowed_updates == ["message"]
+      and .child_webhook.max_connections == 61
+      and .child_webhook.ip_address == "203.0.113.19"
+      and ([.calls[] | select(.bot == "child" and ((.method | ascii_downcase) == "deletewebhook" or (.method | ascii_downcase) == "close" or .credential == "rotated"))] | length) == 0' \
+    <<<"$blocked_mock_state" >/dev/null
+  blocked_provision="$(curl -sS -X POST -b "$auth_cookie" \
+    -H "x-phenogram-csrf: $csrf" \
+    -w $'\n%{http_code}' \
+    "$base_url/api/bots/$child_bot_id/provision")"
+  blocked_provision_status="${blocked_provision##*$'\n'}"
+  blocked_provision_body="${blocked_provision%$'\n'*}"
+  test "$blocked_provision_status" = "409"
+  jq -e '.error.code == "conflict"
+    and (.error.message | contains("native webhook remains active and unchanged"))' \
+    <<<"$blocked_provision_body" >/dev/null
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v child_bot_id="$child_bot_id" <<'SQL'
+SELECT status FROM bots WHERE id = :'child_bot_id'::uuid;
+SQL
+)" = "degraded"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+    -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")" -gt "$blocked_route_generation"
+  blocked_mock_state_after="$(curl -fsS "$mock_url/__state")"
+  test "$(jq '[.calls[] | select(.bot == "child" and (.method | ascii_downcase) == "getme")] | length' <<<"$blocked_mock_state_after")" = "$blocked_child_get_me_calls"
+  test "$(jq -c '.child_webhook' <<<"$blocked_mock_state_after")" = "$blocked_child_webhook"
+
+  recovery_ip_required="$(curl -sS -X POST -b "$auth_cookie" \
+    -H 'content-type: application/json' \
+    -H "x-phenogram-csrf: $csrf" \
+    -d "{\"existing_webhook_secret\":\"$rotation_webhook_secret\"}" \
+    -w $'\n%{http_code}' \
+    "$base_url/api/bots/$child_bot_id/managed-webhook-recovery")"
+  test "${recovery_ip_required##*$'\n'}" = "409"
+  jq -e '.error.code == "webhook_ip_address_resolution_required"
+    and .error.requires_webhook_ip_address_resolution == true
+    and .error.reported_ip_address == "203.0.113.19"' \
+    <<<"${recovery_ip_required%$'\n'*}" >/dev/null
+  recovered_rotation="$(curl -fsS -X POST -b "$auth_cookie" \
+    -H 'content-type: application/json' \
+    -H "x-phenogram-csrf: $csrf" \
+    -d "{\"existing_webhook_secret\":\"$rotation_webhook_secret\",\"existing_webhook_ip_address\":\"203.0.113.19\"}" \
+    "$base_url/api/bots/$child_bot_id/managed-webhook-recovery")"
+  jq -e '.bot.status == "healthy" and .bot.webhook_secret_required == false' \
+    <<<"$recovered_rotation" >/dev/null
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v child_bot_id="$child_bot_id" <<'SQL'
+SELECT token_lookup_hash FROM bots WHERE id = :'child_bot_id'::uuid;
+SQL
+)" != "$blocked_token_lookup_hash"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v child_bot_id="$child_bot_id" <<'SQL'
+SELECT jobs.state || ':' || COALESCE(jobs.error_summary, '')
+  FROM managed_bot_sync_jobs jobs
+  JOIN bots child
+    ON child.manager_bot_id = jobs.manager_bot_id
+   AND child.telegram_bot_id = jobs.managed_telegram_bot_id
+ WHERE child.id = :'child_bot_id'::uuid;
+SQL
+)" = "completed:"
+  recovered_mock_state="$(curl -fsS "$mock_url/__state")"
+  jq -e --arg url "$rotation_webhook_url" --arg secret "$rotation_webhook_secret" \
+    '.child_webhook.url == $url
+      and .child_webhook.secret_token == $secret
+      and .child_webhook.allowed_updates == ["message"]
+      and .child_webhook.max_connections == 61
+      and .child_webhook.ip_address == "203.0.113.19"
+      and (.calls | any(.bot == "child" and .credential == "current" and (.method | ascii_downcase) == "deletewebhook"))
+      and (.calls | any(.bot == "child" and .credential == "current" and (.method | ascii_downcase) == "close"))
+      and (.calls | any(.bot == "child" and .credential == "rotated" and (.method | ascii_downcase) == "getme"))
+      and (.calls | any(.bot == "child" and .credential == "rotated" and (.method | ascii_downcase) == "setwebhook"))' \
+    <<<"$recovered_mock_state" >/dev/null
+fi
 
 child_update='{"update_id":8100,"message":{"message_id":51,"date":1786620100,"from":{"id":707,"is_bot":false,"first_name":"Grace","username":"grace"},"chat":{"id":707,"type":"private","first_name":"Grace","username":"grace"},"text":"hello managed child"}}'
 curl -fsS \
@@ -268,7 +695,7 @@ polled="$(curl -fsS \
   -H 'content-type: application/json' \
   -d '{"limit":10,"timeout":0}' \
   "$base_url/bot$bot_token/getUpdates")"
-jq -e '.ok == true and .result[0].update_id == 7001' <<<"$polled" >/dev/null
+jq -e '.ok == true and (.result | any(.update_id == 7001))' <<<"$polled" >/dev/null
 
 # Positive offsets consume earlier polling updates.
 curl -fsS \
@@ -385,11 +812,8 @@ done
 grep -qi '^content-type: text/event-stream' "$live_stream_dir/headers"
 
 live_update='{"update_id":7004,"message":{"message_id":44,"date":1786620003,"from":{"id":99,"is_bot":false,"first_name":"Ada"},"chat":{"id":99,"type":"private","first_name":"Ada"},"text":"live stream push"}}'
-curl -fsS \
-  -H 'content-type: application/json' \
-  -H "x-telegram-bot-api-secret-token: $ingress_secret" \
-  -d "$live_update" \
-  "$base_url/telegram/webhook/$public_id" | jq -e '.ok == true' >/dev/null
+printf '%s' "$live_update" \
+  | python3 tests/send_tap_frame.py "$tap_socket" update 123456789 7004
 for _ in $(seq 1 80); do
   if grep -q '"update_id":7004' "$live_stream_dir/events" 2>/dev/null; then
     break
@@ -404,6 +828,21 @@ grep -q '"chat_id":99' "$live_stream_dir/events"
 grep -q '"received_at":' "$live_stream_dir/events"
 grep -q '"expires_at":' "$live_stream_dir/events"
 cleanup_live_stream
+
+# During shadow rollout the managed webhook and official tap may observe the
+# same Update. They must converge on one journal row without a second SSE wake.
+curl -fsS \
+  -H 'content-type: application/json' \
+  -H "x-telegram-bot-api-secret-token: $ingress_secret" \
+  -d "$live_update" \
+  "$base_url/telegram/webhook/$public_id" | jq -e '.ok == true' >/dev/null
+shadow_state="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*)::text || ':' || min(ingestion_source)
+  FROM updates
+ WHERE bot_id = :'bot_id'::uuid AND update_id = 7004;
+SQL
+)"
+test "$shadow_state" = "1:both"
 
 stream="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
@@ -433,6 +872,9 @@ jq -e '.user.provider == "github" and .user.provider_login == "phenogram-e2e" an
 curl -fsS -X DELETE -b "$auth_cookie" \
   -H "x-phenogram-csrf: $csrf" \
   "$base_url/api/bots/$bot_id" | jq -e '.ok == true' >/dev/null
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -c "SELECT generation FROM data_plane_route_state WHERE singleton = TRUE")" \
+  -gt "$route_generation_active"
 curl -fsS "$mock_url/__state" \
   | jq -e '.calls | any(.bot == "manager" and (.method | ascii_downcase) == "deletewebhook")' >/dev/null
 

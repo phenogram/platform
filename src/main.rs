@@ -25,10 +25,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listen_addr = config.listen_addr;
     let state = AppState::new(config, pool)?;
 
+    let _update_notifications =
+        phenogram_platform::ingestion::start_update_notification_listener(state.clone()).await?;
     tokio::spawn(phenogram_platform::retention::run(state.clone()));
     tokio::spawn(phenogram_platform::telegram::run_managed_bot_sync_worker(
         state.clone(),
     ));
+    tokio::spawn(phenogram_platform::lifecycle::run_worker(state.clone()));
     for _ in 0..4 {
         tokio::spawn(phenogram_platform::telegram::run_delivery_worker(
             state.clone(),

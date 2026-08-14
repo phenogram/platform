@@ -1,0 +1,35 @@
+[package]
+name = "phenogram-data-plane-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+axum = "0.8.4"
+base64 = "0.22.1"
+futures-util = "0.3.31"
+hmac = "0.12.1"
+hyper = { version = "1.11.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["server", "service", "tokio"] }
+libc = "0.2.189"
+percent-encoding = "2.3.2"
+reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+sha2 = "0.10.9"
+tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+tower = { version = "0.5.2", features = ["util"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+
+[patch.crates-io]
+http = { path = "vendor/http" }
+hyper = { path = "vendor/hyper" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

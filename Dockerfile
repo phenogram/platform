@@ -12,6 +12,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --uid 10001 phenogram
 COPY --from=builder /build/target/release/phenogram-platform /usr/local/bin/phenogram-platform
+COPY --from=builder /build/target/release/phenogram-tap-collector /usr/local/bin/phenogram-tap-collector
 USER phenogram
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/phenogram-platform"]

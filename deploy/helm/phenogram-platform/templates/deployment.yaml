@@ -75,6 +75,25 @@ spec:
               value: {{ .Values.config.sessionTtlHours | quote }}
             - name: RETENTION_SWEEP_SECONDS
               value: {{ .Values.config.retentionSweepSeconds | quote }}
+            {{- if .Values.dataPlane.enabled }}
+            - name: DATA_PLANE_ENABLED
+              value: "true"
+            - name: DATA_PLANE_GATEWAY_URL
+              value: {{ printf "http://%s-data-plane-gateway:%v" (include "phenogram.fullname" .) .Values.dataPlane.gateway.publicPort | quote }}
+            - name: DATA_PLANE_GATEWAY_ADMIN_URL
+              value: {{ printf "http://%s-data-plane-gateway:%v" (include "phenogram.fullname" .) .Values.dataPlane.gateway.adminPort | quote }}
+            - name: DATA_PLANE_STANDARD_API_URL
+              value: {{ printf "http://%s-telegram-standard:%v" (include "phenogram.fullname" .) .Values.dataPlane.official.port | quote }}
+            - name: DATA_PLANE_LOCAL_API_URL
+              value: {{ printf "http://%s-telegram-local:%v" (include "phenogram.fullname" .) .Values.dataPlane.official.port | quote }}
+            - name: DATA_PLANE_OFFICIAL_DATA_DIR
+              value: {{ .Values.dataPlane.official.dataDir | quote }}
+            - name: DATA_PLANE_SYNC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.dataPlaneSyncTokenKey }}
+            {{- end }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

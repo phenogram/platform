@@ -71,17 +71,20 @@ impl Crypto {
         Ok(Zeroizing::new(bytes))
     }
 
-    pub fn bot_public_id(&self, token: &str) -> String {
+    pub fn bot_public_id(&self, token: &str, telegram_test_dc: bool) -> String {
         let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.public_id_key)
             .expect("HMAC accepts a 32-byte key");
-        mac.update(b"bot:");
+        mac.update(telegram_credential_domain(telegram_test_dc));
         mac.update(token.as_bytes());
         let digest = mac.finalize().into_bytes();
         format!("phg_{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
     }
 
-    pub fn token_fingerprint(token: &str) -> String {
-        let digest = Sha256::digest(token.as_bytes());
+    pub fn token_fingerprint(token: &str, telegram_test_dc: bool) -> String {
+        let mut digest = Sha256::new();
+        digest.update(telegram_credential_domain(telegram_test_dc));
+        digest.update(token.as_bytes());
+        let digest = digest.finalize();
         format!(
             "{}…{}",
             &token[..token.len().min(5)],
@@ -140,6 +143,14 @@ impl Crypto {
     }
 }
 
+fn telegram_credential_domain(telegram_test_dc: bool) -> &'static [u8] {
+    if telegram_test_dc {
+        b"telegram-dc:v1:test\0"
+    } else {
+        b"telegram-dc:v1:prod\0"
+    }
+}
+
 fn derive_key(value: &str, domain: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(domain);
@@ -167,10 +178,28 @@ mod tests {
     #[test]
     fn public_ids_are_stable_but_do_not_contain_the_token() {
         let crypto = crypto();
-        let id = crypto.bot_public_id("123:secret");
-        assert_eq!(id, crypto.bot_public_id("123:secret"));
+        let id = crypto.bot_public_id("123:secret", false);
+        assert_eq!(id, crypto.bot_public_id("123:secret", false));
         assert!(id.starts_with("phg_"));
         assert!(!id.contains("secret"));
+        assert_ne!(id, crypto.bot_public_id("123:secret", true));
+    }
+
+    #[test]
+    fn credential_identifiers_are_domain_separated_by_telegram_environment() {
+        let crypto = crypto();
+        assert_eq!(
+            crypto.bot_public_id("123:secret", false),
+            "phg_8nXOV-QrC3mmm517ijpZlMjV"
+        );
+        assert_eq!(
+            crypto.bot_public_id("123:secret", true),
+            "phg_kD1sFex4hdK1HJcOC4JG4E5k"
+        );
+        assert_ne!(
+            Crypto::token_fingerprint("123:secret", false),
+            Crypto::token_fingerprint("123:secret", true)
+        );
     }
 
     #[test]

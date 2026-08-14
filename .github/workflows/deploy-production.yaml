@@ -14,6 +14,7 @@ env:
   REGISTRY: ghcr.io
   APP_IMAGE: ghcr.io/phenogram/platform
   TELEGRAM_IMAGE: ghcr.io/phenogram/telegram-bot-api
+  GATEWAY_IMAGE: ghcr.io/phenogram/data-plane-gateway
   RELEASE_NAME: phenogram
   KUBE_NAMESPACE: phenogram
   CONTABO_INGRESS_IP: 84.247.177.201
@@ -45,8 +46,17 @@ jobs:
       - name: Test Rust
         run: cargo test --all-targets --all-features --locked
 
+      - name: Check the isolated data-plane gateway
+        run: |
+          cargo fmt --manifest-path deploy/gateway/Cargo.toml --all -- --check
+          cargo clippy --manifest-path deploy/gateway/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path deploy/gateway/Cargo.toml --all-targets --locked
+
       - name: Check browser application syntax
         run: node --check assets/app.js
+
+      - name: Lint GitHub Actions
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
@@ -62,9 +72,117 @@ jobs:
             --values deploy/helm/phenogram-platform/values-production.yaml \
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
             --set-string deploymentRevision=validation \
             > /tmp/phenogram-manifests.yaml
           test -s /tmp/phenogram-manifests.yaml
+          if grep -q 'DATA_PLANE_SYNC_TOKEN' /tmp/phenogram-manifests.yaml; then
+            printf '%s\n' 'Disabled data plane unexpectedly requires its new Secret key.' >&2
+            exit 1
+          fi
+          if grep -Eq 'DATA_PLANE_(GATEWAY(_ADMIN)?|STANDARD_API|LOCAL_API)_URL' /tmp/phenogram-manifests.yaml; then
+            printf '%s\n' 'Disabled data plane unexpectedly exposes lifecycle origins.' >&2
+            exit 1
+          fi
+
+          helm template phenogram deploy/helm/phenogram-platform \
+            --namespace phenogram \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set dataPlane.enabled=true \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
+            --set-string deploymentRevision=validation \
+            > /tmp/phenogram-shadow-manifests.yaml
+          test "$(grep -c 'publishNotReadyAddresses: true' /tmp/phenogram-shadow-manifests.yaml)" -ge 4
+          test "$(grep -c -- '--update-tap-socket=/run/phenogram-tap/tap.sock' /tmp/phenogram-shadow-manifests.yaml)" -eq 2
+          test "$(grep -c 'name: PHENOGRAM_TAP_POOL' /tmp/phenogram-shadow-manifests.yaml)" -eq 2
+          grep -q 'value: "standard"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "local"' /tmp/phenogram-shadow-manifests.yaml
+          test "$(grep -c -- '^[[:space:]]*- --local$' /tmp/phenogram-shadow-manifests.yaml)" -eq 1
+          grep -q 'value: "33554432"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'nginx.ingress.kubernetes.io/enable-access-log: "false"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'nginx.ingress.kubernetes.io/proxy-body-size: "0"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'error_log /dev/null crit;' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'merge_slashes off;' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'large_client_header_buffers 4 256k;' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'client_header_timeout 500s;' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'client_body_timeout 500s;' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "http://phenogram-data-plane-gateway:8080"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "http://phenogram-data-plane-gateway:9090"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "http://phenogram-telegram-standard:8081"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "http://phenogram-telegram-local:8081"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "http://phenogram-telegram-standard:8082"' /tmp/phenogram-shadow-manifests.yaml
+          grep -q 'value: "http://phenogram-telegram-local:8082"' /tmp/phenogram-shadow-manifests.yaml
+          helm template phenogram deploy/helm/phenogram-platform \
+            --namespace phenogram \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set dataPlane.enabled=true \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
+            --show-only templates/telegram-data-plane-pools.yaml \
+            > /tmp/phenogram-pools.yaml
+          test "$(grep -c 'runAsGroup: 10001' /tmp/phenogram-pools.yaml)" -eq 8
+          test "$(grep -c 'fsGroup: 10001' /tmp/phenogram-pools.yaml)" -eq 2
+          test "$(grep -c 'runAsUser: 10002' /tmp/phenogram-pools.yaml)" -eq 2
+          test "$(grep -c 'runAsUser: 10001' /tmp/phenogram-pools.yaml)" -eq 2
+          test "$(grep -c 'runAsUser: 10003' /tmp/phenogram-pools.yaml)" -eq 2
+          test "$(grep -c 'name: FILE_SERVER_MODE' /tmp/phenogram-pools.yaml)" -eq 2
+          if helm template phenogram deploy/helm/phenogram-platform \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set dataPlane.enabled=true \
+            --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            > /tmp/phenogram-missing-file-server-digest.yaml \
+            2> /tmp/phenogram-missing-file-server-digest.err; then
+            printf '%s\n' 'Enabled data plane unexpectedly accepted an unpinned file server.' >&2
+            exit 1
+          fi
+          grep -q 'requires an independently pinned dataPlane.official.fileServer.image.digest' \
+            /tmp/phenogram-missing-file-server-digest.err
+          if grep -q 'path: /bot' /tmp/phenogram-shadow-manifests.yaml; then
+            printf '%s\n' 'Shadow mode unexpectedly moved public Bot API traffic.' >&2
+            exit 1
+          fi
+
+          helm template phenogram deploy/helm/phenogram-platform \
+            --namespace phenogram \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set dataPlane.enabled=true \
+            --set dataPlane.publicCutover=true \
+            --set telegramBotApi.enabled=false \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
+            --set-string deploymentRevision=validation \
+            > /tmp/phenogram-cutover-manifests.yaml
+          grep -q 'path: /bot' /tmp/phenogram-cutover-manifests.yaml
+          grep -q 'path: /file' /tmp/phenogram-cutover-manifests.yaml
+          if helm template phenogram deploy/helm/phenogram-platform \
+            --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set dataPlane.enabled=true \
+            --set dataPlane.publicCutover=true \
+            --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string dataPlane.official.fileServer.image.digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
+            > /tmp/phenogram-invalid-cutover.yaml 2> /tmp/phenogram-invalid-cutover.err; then
+            printf '%s\n' 'Unsafe cutover with the legacy sidecar unexpectedly rendered.' >&2
+            exit 1
+          fi
+          grep -q 'requires telegramBotApi.enabled=false' /tmp/phenogram-invalid-cutover.err
 
   build:
     name: Build immutable images
@@ -76,6 +194,7 @@ jobs:
     outputs:
       app_digest: ${{ steps.build_app.outputs.digest }}
       telegram_digest: ${{ steps.build_telegram.outputs.digest }}
+      gateway_digest: ${{ steps.build_gateway.outputs.digest }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -124,6 +243,23 @@ jobs:
           cache-from: type=gha,scope=telegram-bot-api
           cache-to: type=gha,mode=max,scope=telegram-bot-api
 
+      - name: Build and publish the streaming data-plane gateway
+        id: build_gateway
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          file: ./deploy/gateway/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.GATEWAY_IMAGE }}:sha-${{ github.sha }}
+            ${{ env.GATEWAY_IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=data-plane-gateway
+          cache-to: type=gha,mode=max,scope=data-plane-gateway
+
   deploy:
     name: Deploy with Helm to Contabo
     needs: build
@@ -167,14 +303,34 @@ jobs:
             exit 1
           fi
 
+      - name: Reconcile the data-plane control credential
+        env:
+          DATA_PLANE_SYNC_TOKEN: ${{ secrets.DATA_PLANE_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          token_file="$RUNNER_TEMP/data-plane-sync-token"
+          encoded_file="$RUNNER_TEMP/data-plane-sync-token.b64"
+          patch_file="$RUNNER_TEMP/data-plane-sync-token-patch.json"
+          trap 'rm -f "$token_file" "$encoded_file" "$patch_file"' EXIT
+          umask 077
+          printf '%s' "$DATA_PLANE_SYNC_TOKEN" > "$token_file"
+          test "$(wc -c < "$token_file" | tr -d ' ')" -ge 32
+          base64 < "$token_file" | tr -d '\n' > "$encoded_file"
+          jq --rawfile encoded "$encoded_file" -n \
+            '{data:{DATA_PLANE_SYNC_TOKEN:$encoded}}' > "$patch_file"
+          kubectl --namespace "$KUBE_NAMESPACE" patch secret phenogram-secrets \
+            --type=merge --patch-file "$patch_file" >/dev/null
+
       - name: Deploy the immutable release
         env:
           APP_DIGEST: ${{ needs.build.outputs.app_digest }}
           TELEGRAM_DIGEST: ${{ needs.build.outputs.telegram_digest }}
+          GATEWAY_DIGEST: ${{ needs.build.outputs.gateway_digest }}
         run: |
           set -euo pipefail
           case "$APP_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
           case "$TELEGRAM_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
+          case "$GATEWAY_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
           for secret_name in phenogram-secrets phenogram-backup-secrets phenogram-ghcr phenogram-io-tls app-phenogram-io-tls api-phenogram-io-tls; do
             kubectl --namespace "$KUBE_NAMESPACE" get secret "$secret_name" >/dev/null
           done
@@ -197,6 +353,11 @@ jobs:
           set -euo pipefail
           kubectl --namespace "$KUBE_NAMESPACE" rollout status deployment/phenogram --timeout=5m
           kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-postgresql --timeout=5m
+          if kubectl --namespace "$KUBE_NAMESPACE" get statefulset/phenogram-data-plane-gateway >/dev/null 2>&1; then
+            kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-data-plane-gateway --timeout=10m
+            kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-telegram-standard --timeout=10m
+            kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-telegram-local --timeout=10m
+          fi
           kubectl --namespace "$KUBE_NAMESPACE" get pods,service,ingress,pvc
 
       - name: Verify the Contabo origin

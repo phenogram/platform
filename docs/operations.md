@@ -1,373 +1,291 @@
 # Phenogram Platform operations guide
 
-This guide describes the runtime that exists in this repository. It assumes a single application instance for the initial production deployment, PostgreSQL with durable storage, and TLS termination in front of the Rust service.
+This guide describes the production architecture deployed to the `phenogram` namespace on Contabo. The central invariant is simple: the pinned official Telegram Bot API server owns polling and webhook delivery, while Phenogram's journal is a nonblocking observer. PostgreSQL, the collector, and the console must be able to fail without becoming prerequisites for native update delivery.
 
 ## Runtime inventory
 
 | Component | Responsibility | Persistent state |
 | --- | --- | --- |
-| `app` | API proxy, management API/UI, Telegram ingress, SSE, retention task, four webhook workers | Owns none outside PostgreSQL; optionally reads the local Bot API volume |
-| `postgres` | Provider identities, sessions, memberships, encrypted bot credentials, update journal, deliveries, activity and audit data | `postgres-data` volume |
-| Caddy or equivalent | TLS, security headers, streaming reverse proxy, access-log redaction | Certificates/logs, depending on deployment |
-| Optional `telegram-bot-api` | Official local Telegram Bot API server for eligible plans | `telegram-bot-api-data` volume |
+| `phenogram` application | Landing page, authenticated console, management API, OAuth, lifecycle jobs, retention, SSE replay, Bot View calls | PostgreSQL only |
+| PostgreSQL | Provider identities, sessions, memberships, encrypted control-plane bot credentials, observer journal, projections, API activity, audit data | 10 GiB PVC in production |
+| Data-plane gateway | Authenticates token-derived routes from an in-memory last-good snapshot and streams `/bot*` requests/responses | 256 MiB snapshot PVC; no raw-token list |
+| Official `standard` pool | Pinned `tdlib/telegram-bot-api` without `--local`; owns normal Bot API sessions, `TQueue`, polling, webhooks, retries, and acknowledgements | 20 GiB native Bot API PVC |
+| Official `local` pool | Same pinned binary with Telegram `--local`; owns local-mode sessions and files | 100 GiB native Bot API PVC |
+| File sidecar, one per pool | Authenticated read-only HTTP bridge for `/file`, because the official binary has no public file endpoint | None; reads its pool PVC |
+| Tap collector, one per pool | Reassembles best-effort update mirrors, commits ACKed managed-lifecycle receipts, and writes journal/projections | None outside PostgreSQL |
+| ingress-nginx | TLS, strict host routing, request streaming, token-path log suppression | Kubernetes TLS Secrets |
 
-The base Compose file contains PostgreSQL, the application, and Caddy. The application port is published only on loopback; Caddy publishes HTTP/HTTPS and reaches `app:8080` on the Compose network. `deploy/Caddyfile` reads `PHENOGRAM_LANDING_DOMAIN` (default `http://localhost`), `PHENOGRAM_APP_DOMAIN` (default `http://app.localhost`), and `PHENOGRAM_API_DOMAIN` (default `http://api.localhost`) and enforces the same three-host split as production. Direct local access to port 8080 remains a supported one-origin development mode when all three base URLs are `http://localhost:8080`; in that mode start only `postgres` and `app`, not Caddy. `compose.premium.yaml` is an optional overlay for the separate official Telegram service.
+Each official pool has one replica and is the only writer to its PVC. Collector and file-sidecar health are deliberately excluded from the official service's readiness: an observer or download-sidecar failure must not remove the official Bot API endpoint.
 
-Application startup is fail-fast: configuration is validated, PostgreSQL is connected, migrations are applied, background tasks are started, and only then is the HTTP listener bound. `SIGTERM` and `SIGINT` stop the HTTP server gracefully. A delivery interrupted after the lease is taken is marked retryable by the retention task once its five-minute lease expires.
+## Public topology
 
-## Configuration
+- `https://phenogram.io` serves the landing page and privacy policy.
+- `https://app.phenogram.io` serves the console, same-origin management API, and health endpoint.
+- `https://api.phenogram.io` serves `/bot*`, `/file*`, `/telegram/*`, `/events/*`, and `/public/*` only.
 
-| Variable | Required/default | Operational meaning |
-| --- | --- | --- |
-| `APP_ENV` | `development` | Set exactly to `production` for HTTPS/config checks and secure cookies. |
-| `LISTEN_ADDR` | `127.0.0.1:8080` | Compose overrides this with `0.0.0.0:8080`. |
-| `LANDING_BASE_URL` | Required | Canonical public landing origin without a trailing slash. Production value: `https://phenogram.io`. |
-| `APP_BASE_URL` | Required | Canonical authenticated console and management origin without a trailing slash. Browser `Origin` must match it exactly; health is served here. Production value: `https://app.phenogram.io`. |
-| `API_BASE_URL` | Required | Canonical machine origin without a trailing slash. Used for Telegram ingress, Telegram-compatible bot/file paths, SSE, and signed file URLs. Production value: `https://api.phenogram.io`. |
-| `DATABASE_URL` | Required | PostgreSQL connection URL. The pool uses 2–20 connections per app instance. |
-| `MASTER_KEY` | Required, at least 32 bytes | Encrypts bot tokens and webhook secrets after domain-separated derivation. |
-| `PUBLIC_ID_KEY` | Required, at least 32 bytes | Derives stable bot public IDs used for token lookup and public routes. |
-| `LINK_SIGNING_KEY` | Required, at least 32 bytes | Signs public files and derives CSRF tokens. |
-| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Required in production | Confidential Google Web OAuth client used only for sign-in. Its callback is derived from `APP_BASE_URL`. |
-| `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET` | Required in production | Dedicated GitHub OAuth App used only for sign-in. Its callback is derived from `APP_BASE_URL`. |
-| `TELEGRAM_CLOUD_API_URL` | `https://api.telegram.org` | Cloud Bot API origin; useful to replace only in isolated tests. |
-| `TELEGRAM_LOCAL_API_URL` | Unset | Separate local Bot API origin. Local routing is unavailable when unset. |
-| `TELEGRAM_LOCAL_DATA_DIR` | Unset | Absolute read-only root containing local Bot API files. Required to serve opaque absolute `file_path` references. |
-| `SESSION_TTL_HOURS` | `720` | New session lifetime. |
-| `RETENTION_SWEEP_SECONDS` | `3600` | Interval between sweeps. Do not set to zero. |
-| `RUST_LOG` | application info | Structured stdout log filter. |
-| `POSTGRES_PASSWORD` | development default in Compose | Builds `DATABASE_URL` in the base stack. Never use the default in production. |
-| `PHENOGRAM_LANDING_DOMAIN` | `http://localhost` in Compose | Caddy landing site address. Production value: `phenogram.io`. |
-| `PHENOGRAM_APP_DOMAIN` | `http://app.localhost` in Compose | Caddy console/management site address. Production value: `app.phenogram.io`. |
-| `PHENOGRAM_API_DOMAIN` | `http://api.localhost` in Compose | Caddy machine API site address. Production value: `api.phenogram.io`. |
-| `PHENOGRAM_HTTP_PORT`, `PHENOGRAM_HTTPS_PORT` | `80`, `443` | Published Caddy ports. |
-| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Premium overlay only | Operator-owned Telegram application credentials for the official local server. |
+The three Cloudflare records stay DNS-only and point to the Contabo ingress. Do not introduce another proxy until full-URI redaction, disabled buffering, long polling, multipart uploads, large downloads, SSE, and forwarding-header handling have been verified with synthetic credentials.
 
-Generate the three application keys independently. Store them, database credentials, and OAuth client secrets in the deployment secret manager, not in the image, repository, Compose manifest, shell history, or centralized logs. Production validation rejects short application secrets and values containing `development`, but it cannot assess entropy. OAuth client IDs are not confidential by protocol, but keep each complete provider credential pair together in the restricted runtime Secret.
-
-## Social OAuth provider setup
-
-Phenogram uses both providers only to authenticate a person. It stores the provider name, stable provider subject ID, display name/handle, and avatar URL required for the console. It does not request, receive, or store an email address or persist a provider token. The callback uses an access token transiently to resolve identity and then drops it. Google requests only `openid profile`; GitHub requests no OAuth scope and uses a field-selective GraphQL query for `databaseId`, `login`, `name`, and `avatarUrl`. Never add an email scope or field or call GitHub's email endpoint.
-
-Configure a dedicated production Google Cloud project and Web application OAuth client according to Google's [web-server OAuth guide](https://developers.google.com/identity/protocols/oauth2/web-server), [OpenID Connect reference](https://developers.google.com/identity/openid-connect/openid-connect), and [production branding requirements](https://support.google.com/cloud/answer/15549049):
-
-1. Set the audience to **External** and publish the app **In production** when it is ready for public users. Google Testing mode is limited to configured test users and their authorizations expire after seven days.
-2. Configure the public app homepage as `https://phenogram.io`, register `phenogram.io` as an authorized domain, verify ownership through Google Search Console, and use `https://phenogram.io/privacy` as the public privacy-policy URL on both the landing page and OAuth branding screen. Google requires operator support/developer contact details in its console; Phenogram does not ingest those addresses.
-3. Create a **Web application** OAuth client. Set the only production authorized redirect URI used by Phenogram to exactly `https://app.phenogram.io/api/auth/oauth/google/callback`, including scheme, host, path, case, and lack of trailing slash. No authorized JavaScript origin is required because this is a server-side authorization-code flow.
-4. Request only `openid profile`. The OIDC `email` scope is optional and is deliberately omitted. Do not enable unrelated Google API scopes.
-5. Store the client ID and secret as `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in the restricted `phenogram-secrets` Kubernetes Secret.
-
-Create a dedicated OAuth App under a maintained GitHub account, following GitHub's [OAuth App registration](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) and [web authorization flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps). GitHub permits either personal- or organization-owned OAuth Apps; prefer organization ownership when it is available, but do not block production on ownership transfer:
-
-1. Use **Phenogram Platform** as the application name and `https://phenogram.io` as the Homepage URL.
-2. Set the Authorization callback URL to exactly `https://app.phenogram.io/api/auth/oauth/github/callback`. A GitHub OAuth App has one configured callback URL, so use a separate app for development. Leave Device Flow disabled.
-3. Keep this app dedicated to sign-in and request no OAuth scope. In particular, never request `user` or `user:email`; GitHub documents that an empty scope grants read-only access to public identity. If these credentials were previously used to request broader scopes, replace the OAuth App rather than relying on a later empty-scope request, because GitHub can reuse grants previously authorized for the same app.
-4. Store the client ID and secret as `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` in the restricted `phenogram-secrets` Kubernetes Secret. They are runtime credentials and are not needed by GitHub Actions.
-
-For local development, create separate provider clients and use callbacks derived exactly from the local `APP_BASE_URL`. The default split-host callbacks are `http://app.localhost/api/auth/oauth/google/callback` and `http://app.localhost/api/auth/oauth/github/callback`. If a provider console refuses the `app.localhost` form, use the documented one-origin mode with all three base URLs set to `http://localhost:8080`, register `http://localhost:8080/api/auth/oauth/{provider}/callback`, and start only `postgres` and `app`. Do not reuse the production GitHub OAuth App because it supports only one callback.
-
-## Initial production deployment
-
-1. Provision a supported Docker host or equivalent orchestrator, durable PostgreSQL storage, encrypted backups, DNS, and inbound HTTPS.
-2. Copy `.env.example` to an untracked deployment secret file. Set `APP_ENV=production`, `LANDING_BASE_URL=https://phenogram.io`, `APP_BASE_URL=https://app.phenogram.io`, `API_BASE_URL=https://api.phenogram.io`, a strong database password, three independent application keys, and both provider credential pairs. Complete the provider setup above before starting the service; production starts fail-fast if either pair is missing.
-3. Set `PHENOGRAM_LANDING_DOMAIN=phenogram.io`, `PHENOGRAM_APP_DOMAIN=app.phenogram.io`, and `PHENOGRAM_API_DOMAIN=api.phenogram.io`, then expose the included Caddy service, or place an equivalent reverse proxy in front of `app:8080`. Preserve SSE streaming. The landing host may proxy only `/`, `/privacy`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`; the app host must reject machine routes; the API host must accept only `/bot*`, `/file[/...]`, `/telegram[/...]`, `/events[/...]`, and `/public[/...]`. The supplied Caddyfile enforces that split, enables compression and security headers, replaces the complete URI in access logs, and deletes cookie, authorization, Telegram secret, and CSRF headers from access logs.
-4. Restrict direct access to port 8080 and PostgreSQL. Only the reverse proxy should reach the app; only the app and authorized operators should reach the database. The ingress must overwrite, not trust, client-supplied `X-Forwarded-For` and `X-Real-IP`; the bundled Caddyfile does this.
-5. Back up PostgreSQL before every upgrade that contains migrations.
-6. Build and start the base stack:
-
-   ```sh
-   docker compose up --build -d
-   docker compose ps
-   curl -fsS https://app.phenogram.io/api/health
-   ```
-
-7. Confirm the response is HTTP 200 with `status: "ok"` and `database: true`. Confirm the landing page loads at `https://phenogram.io/`, `https://phenogram.io/api/health` returns 404, a machine route on `https://app.phenogram.io` returns 404, and both `https://api.phenogram.io/` and `https://api.phenogram.io/api/health` return 404. Confirm each OAuth start endpoint redirects only to its expected provider, complete one real sign-in with each provider, connect a test bot, make a proxied `getMe` call through `api.phenogram.io`, deliver a real Telegram update, and confirm it appears in the update journal.
-
-The health endpoint checks PostgreSQL only. It does not prove reachability of Telegram, the downstream webhook, SSE fan-out, the optional local server, or disk headroom; keep those as separate checks.
-
-Migrations run automatically on application startup. There is no automated schema downgrade. Review migrations and take a restorable backup before deploying a new binary.
-
-## TLS and log handling
-
-The token-bearing compatibility route intentionally matches Telegram:
+Telegram-compatible paths contain the raw bot token:
 
 ```text
 /bot{token}/{method}
+/bot{token}/test/{method}
 /file/bot{token}/{file_path}
+/file/bot{token}/test/{file_path}
 ```
 
-Public SSE URLs contain a stream secret, signed file URLs contain a reusable signature until expiry, and OAuth callbacks contain short-lived authorization codes and state. Redact the complete request target—including query parameters—at every hop. The included Caddyfile replaces `request.uri` with `/redacted` and drops `Cookie`, `Authorization`, `X-Telegram-Bot-Api-Secret-Token`, and `X-Phenogram-CSRF`. If a CDN, ingress controller, APM agent, packet capture, or upstream application-error logger is added, verify its behavior with synthetic credentials before production use.
+The API ingress disables access logging and sends its nginx error log to `/dev/null`. It also disables request and response buffering, has no aggregate body-size cap, preserves double slashes required by absolute local-mode paths, and permits the larger request head used by official Bot API clients. Keep this behavior when changing ingress-nginx.
 
-Keep all three public DNS names as direct, DNS-only records when using Cloudflare in front of this deployment. A proxy/CDN adds another request-log and buffering layer in front of token-bearing Bot API paths, signed URLs, and SSE. If an edge proxy is introduced later, first prove full-URI redaction, disabled buffering for SSE, large upload/download behavior, and forwarding-header overwrites with synthetic credentials.
+## Configuration and secret contract
 
-Do not log request bodies: updates and Bot API requests may contain personal data. Limit access to application logs because network errors can include destination context even when proxy access logs are scrubbed.
+The control application validates these public and application settings:
 
-OAuth state cookies are short-lived and are validated before exchanging a callback code. Add distributed edge limits to OAuth start and callback routes before running multiple replicas or accepting substantial public traffic; provider-side limits are not a substitute for application-edge abuse controls.
+| Variable | Production meaning |
+| --- | --- |
+| `APP_ENV=production` | Enables production origin checks and secure cookies. |
+| `LANDING_BASE_URL=https://phenogram.io` | Canonical landing origin. |
+| `APP_BASE_URL=https://app.phenogram.io` | Canonical console/management origin and exact browser Origin. |
+| `API_BASE_URL=https://api.phenogram.io` | Canonical Bot API, file, SSE, and public-link origin. |
+| `DATABASE_URL` | PostgreSQL connection URL. |
+| `MASTER_KEY` | At least 32 bytes; encrypts the application-database copy of bot and lifecycle secrets. |
+| `PUBLIC_ID_KEY` | At least 32 bytes; derives production/test-domain-separated token lookup IDs. |
+| `LINK_SIGNING_KEY` | At least 32 bytes; signs public files and derives CSRF tokens. |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Dedicated sign-in-only Google Web application. |
+| `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET` | Dedicated sign-in-only GitHub OAuth App. |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Operator Telegram application credentials used by both official pools. |
+| `DATA_PLANE_SYNC_TOKEN` | Independent random bearer value of at least 32 bytes for route snapshots, telemetry, and internal file hops. |
 
-When a bot already has a Telegram webhook, connection automatically imports its URL, `allowed_updates`, and `max_connections` into `bot_update_state` before Phenogram installs its managed Telegram ingress. This lets Phenogram journal each update and continue delivery to the existing destination without a confirmation/retry step. The downstream URL is retained because it is required for delivery; the expiring audit entry records only whether a transfer occurred. Migration `0006_remove_plaintext_webhook_url.sql` removes the obsolete duplicate URL column from `bots`.
+Helm expects existing Secrets rather than rendering secret values:
 
-Telegram's `getWebhookInfo` response does not include the existing `secret_token` or uploaded certificate. If the downstream endpoint validates `X-Telegram-Bot-Api-Secret-Token`, call `setWebhook` through Phenogram after connecting to store that secret. A webhook using a custom certificate cannot be transferred automatically and must first move to a publicly trusted HTTPS certificate. Treat downstream webhook URLs as sensitive operational data in database access, exports, and backups.
+- `phenogram-secrets` contains the variables above plus `POSTGRES_PASSWORD`;
+- `phenogram-ghcr` permits image pulls from `ghcr.io/phenogram`;
+- `phenogram-backup-secrets` contains the currently enabled PostgreSQL Restic target credentials;
+- `phenogram-io-tls`, `app-phenogram-io-tls`, and `api-phenogram-io-tls` are managed by cert-manager.
 
-### Managed bot discovery
+GitHub Actions receives the namespace-scoped `KUBECONFIG` and repository secret `DATA_PLANE_SYNC_TOKEN`. The workflow writes the data-plane value to a protected temporary file, patches only that key into `phenogram-secrets`, and removes the file. The value is never passed as a Helm parameter or stored in Helm release history.
 
-Phenogram subscribes every upstream manager webhook to Telegram's `managed_bot` lifecycle update. In the same transaction that journals that update, it enqueues an idempotent synchronization job; downstream `allowed_updates` never suppresses this internal control-plane action. The worker uses the manager credential to call `getManagedBotToken`, validates the returned child token with `getMe`, encrypts it, imports a transferable child webhook, and installs the child's own Phenogram webhook. Ordinary child updates do not arrive through the manager, so the separate child webhook is required.
+The chart renders NetworkPolicy resources, but Contabo's current Minikube bridge CNI does not enforce them. Treat `DATA_PLANE_SYNC_TOKEN` as the actual internal authorization boundary until a policy-capable CNI is installed; do not claim that the rendered policies provide live isolation.
 
-The job table never contains the child token. The plaintext returned by Telegram exists only while it is validated and encrypted, and errors exposed to logs or clients must remain generic. A token-change update refreshes the encrypted credential and its keyed lookup digest while preserving the child's stable public ID and ingress URL. Never use `replaceManagedBotToken` for synchronization because that method revokes the current token.
+## Social OAuth setup
 
-Discovery is not subject to the hard direct-connection limit. The hierarchy is keyed by both the Phenogram manager record and its stable Telegram bot ID so deleting a manager leaves its children intact and reconnecting the same manager repairs the relationship. A child claimed by a manager in another Phenogram account must be treated as an ownership conflict; do not move its history or credential automatically.
+Phenogram authenticates a person by provider plus stable provider subject ID. It stores the display name/handle and avatar URL needed by the console. It does not request, receive, or persist email addresses, access tokens, or refresh tokens.
 
-An actively managed child cannot be deleted independently through the management API: it is part of Telegram's manager relationship and would otherwise vanish from Phenogram until another lifecycle update happened to recreate it. Disconnecting the manager leaves its children as manager-missing bots; those orphans can then be deleted explicitly.
+Google configuration:
 
-## Monitoring and readiness
+1. Create a dedicated Web application OAuth client.
+2. Set the homepage to `https://phenogram.io` and privacy policy to `https://phenogram.io/privacy`.
+3. Register exactly `https://app.phenogram.io/api/auth/oauth/google/callback`.
+4. Request only `openid profile`; do not add `email`.
+5. Store the client ID and secret in `phenogram-secrets`.
 
-Minimum alerts:
+GitHub configuration:
 
-- `https://app.phenogram.io/api/health` is non-200 or reports `database: false`;
-- application or PostgreSQL container is unhealthy/restarting;
-- sustained HTTP 5xx/502 responses;
-- elevated OAuth start/callback errors, state mismatches, provider timeouts, or provider-side throttling;
-- PostgreSQL disk, volume inode, connection, or transaction pressure;
-- failed retention sweeps;
-- growing or old `pending`/`failed` webhook deliveries;
+1. Create a dedicated OAuth App for Phenogram.
+2. Set the homepage to `https://phenogram.io`.
+3. Register exactly `https://app.phenogram.io/api/auth/oauth/github/callback`.
+4. Leave the requested OAuth scope empty; do not request `user` or `user:email` and do not call the email endpoint.
+5. Store the client ID and secret in `phenogram-secrets`.
+
+Use separate OAuth clients for local development.
+
+## Direct production deployment
+
+Application deployment is owned by this repository. It does not use Flux, and project-specific releases must not be added to `infra-flux`.
+
+A push to `master` runs:
+
+1. Rust formatting, lint, tests, browser syntax checks, action lint, and strict Helm rendering;
+2. immutable Linux/amd64 builds for the application, pinned official server, and streaming gateway;
+3. direct `helm upgrade --install` against the Contabo `phenogram` namespace using the namespace-limited kubeconfig;
+4. Kubernetes rollout checks and origin-pinned checks for all three public hosts and OAuth redirects.
+
+The production workflow checks the Kubernetes API endpoint and namespace before deployment and rejects a credential that can create namespaces. Image references are digest-pinned. Normal control-plane releases do not implicitly move the independently pinned official, collector, file-sidecar, or gateway images.
+
+## Destructive first data-plane cutover
+
+There is no legacy bot migration in this release. Existing bot records, their captured update history, and the old Telegram sidecar state are disposable. User identities and current browser sessions are separate control-plane records and remain intact.
+
+Before the first release, delete every disposable legacy bot record and its
+cascaded bot data. Preserve user identities and browser sessions. Then use three
+releases so the new official pools are warm before the public ingress moves:
+
+1. **Build without traffic change.** Keep `dataPlane.enabled=false`, `dataPlane.publicCutover=false`, and `telegramBotApi.enabled=true`. Merge to `master`; the workflow publishes the new app, official-server, and gateway images. Record their immutable digests.
+2. **Start the shadow plane.** Pin the recorded gateway, official, collector, and file-sidecar digests in production values. Set `dataPlane.enabled=true`, keep `dataPlane.publicCutover=false`, and leave the legacy sidecar enabled. Verify both official pools, gateway snapshot readiness, collector isolation, files, and a disposable canary route. Do not attempt to copy a legacy Telegram data directory or preserve a legacy Bot API session.
+3. **Move the public paths.** Set `dataPlane.publicCutover=true` and `telegramBotApi.enabled=false` with the same pinned data-plane digests. Helm rejects a cutover that leaves the legacy sidecar enabled. Verify `/bot*` and `/file*` through the Contabo origin, then delete the obsolete legacy Telegram PVC. That PVC deletion is irreversible and intentionally discards the old test-bot session/state.
+
+No database backup, bot replay, compatibility shim, per-bot migration, or fallback route is a prerequisite for this empty-bot destructive cutover. The shadow phase exists only to prove that the already-built replacement is healthy before ingress moves; it is not a data-migration phase.
+
+## Release validation
+
+Render the chart before merging:
+
+```sh
+helm lint deploy/helm/phenogram-platform \
+  --values deploy/helm/phenogram-platform/values-production.yaml
+
+helm template phenogram deploy/helm/phenogram-platform \
+  --namespace phenogram \
+  --values deploy/helm/phenogram-platform/values-production.yaml \
+  --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+When `dataPlane.enabled=true`, also provide independent gateway, official, collector, and file-sidecar digests. The chart refuses missing pins and refuses `publicCutover=true` while the legacy Telegram sidecar is enabled.
+
+Minimum live checks after cutover:
+
+- `GET https://app.phenogram.io/api/health` is 200, reports PostgreSQL healthy, and exposes the deployed commit revision;
+- landing and privacy routes work only on `phenogram.io`;
+- management routes work only on `app.phenogram.io`;
+- an unknown `/bot.../getMe` route on `api.phenogram.io` returns Telegram-shaped 401 without revealing the marker token in ingress logs;
+- an active canary route reaches the official server for JSON, form, multipart, long-poll, large request target, and test-DC requests;
+- `/file` supports `GET`, `HEAD`, open-ended, suffix, single, and multipart byte ranges;
+- stopping the collector does not change the official server's readiness, restart count, or native API response;
+- Google redirects contain only `openid profile`; GitHub redirects contain no scope.
+
+`/api/health` proves the control application and PostgreSQL only. It does not prove gateway snapshot freshness, official-server Telegram connectivity, file-sidecar access, observer completeness, or public ingress behavior.
+
+## Compatibility path
+
+The gateway structurally parses only enough of the token-bearing path to authenticate and choose a pool. It then forwards the original raw path/query, method, end-to-end headers, and streaming body to the pinned official server. It does not interpret method arguments and it does not special-case `getUpdates`, `setWebhook`, `deleteWebhook`, or `getWebhookInfo`.
+
+Never add request-path database access, whole-body parsing, upload buffering, automatic retries, or observer acknowledgement to the gateway. A retry of a partially streamed multipart request is not safe. Token-free telemetry uses a bounded asynchronous queue and may be dropped rather than delay the Bot API response.
+
+The official binary is pinned by commit and patched only with the opt-in observer described in [`deploy/telegram-bot-api/UPDATE_TAP_PROTOCOL.md`](../deploy/telegram-bot-api/UPDATE_TAP_PROTOCOL.md). When upgrading it, re-run raw wire compatibility checks instead of assuming a green control-plane health check is sufficient.
+
+## Connecting a bot and preserving its webhook
+
+Connection starts against Telegram cloud so ownership can be verified before a route is published. The lifecycle operation moves that clean bot session into the selected official pool using Telegram's required `logOut`/`close` behavior.
+
+If `getWebhookInfo` reports an existing webhook, Phenogram does not offer a skip/takeover checkbox. It will transfer the webhook as part of connection, but it fences the operation before mutation until the user either enters the current `secret_token` or explicitly confirms that the webhook has no secret. If Telegram reports a current IPv4 address, the user must also choose whether to preserve it as a fixed `ip_address` or keep DNS resolution; Telegram does not reveal which mode created the reported address. Uploaded certificate bytes are likewise unavailable, so custom-certificate webhooks remain fenced.
+
+If Telegram rejects a token, return a readable invalid/revoked-token message and keep the token in the browser field so the user can correct it. Never include the token in error text, logs, audit metadata, or telemetry.
+
+## Managed-bot discovery and rotation
+
+The native patch appends a compact type-2 lifecycle record to a reserved persistent observer queue after the official `managed_bot` update path has run. This record is independent of `allowed_updates`, so Phenogram can discover a child even when the bot application's native subscription filters that update type. The official server replays the queue head until the collector commits an idempotent receipt and managed job in one PostgreSQL transaction and returns an exact ACK. The worker then calls `getManagedBotToken`, validates the returned token with `getMe`, encrypts the PostgreSQL copy, and connects the child to the manager's current pool.
+
+The job table contains identity and generation metadata, not the child token. A child belonging to another Phenogram account is an ownership conflict and is never moved automatically. Removing a manager leaves children visible as manager-missing; reconnecting the same Telegram manager repairs the relationship.
+
+Managed lifecycle replay is bounded to 10,000 pending records with seven-day expiry. A lost datagram, lost ACK, collector restart, or temporary PostgreSQL outage therefore delays discovery instead of losing it. Queue overflow, expiry, or native TQueue persistence failure still fails open so Telegram delivery remains unaffected; alert on the dedicated lifecycle durability counters. Ordinary type-1 update mirrors remain best-effort and are never ACKed.
+
+The lifecycle observer is an ordered global queue per official pool. Before enabling or cutting over, require `managed_lifecycle_pending` to drain and the overflow, persistence-error, expiry, and ACK-error counters to remain zero. An unresolvable head indicates manual database corruption or an unsupported out-of-band bot removal and can delay later lifecycle records until that head expires.
+
+For a managed token rotation:
+
+- polling mode can rotate through the serialized official-server lifecycle;
+- an active native webhook blocks the rotation before route withdrawal, `deleteWebhook`, `logOut`, or `close`;
+- the existing route and webhook remain active;
+- the bot is surfaced as requiring webhook-secret recovery because Telegram does not reveal the secret/certificate/original pinned IP.
+
+Do not silently recreate an authenticated webhook without its original authentication material.
+
+## Observer journal, SSE, and retention
+
+For each complete type-1 tap event that reaches the collector, Phenogram writes the canonical update and conversation projection in one PostgreSQL transaction. A post-commit trigger emits `NOTIFY`; every application process listens, reloads the committed row, and wakes local SSE subscribers.
+
+This yields live UI updates without manual refresh and database-backed reconnect replay. It does not make the observer lossless. The collector can drop malformed, oversized, incomplete, or unavailable-database copies while native Telegram delivery continues.
+
+SSE consumers must:
+
+1. persist an event ID only after committing the event locally;
+2. reconnect with `Last-Event-ID`;
+3. reconnect from the ID carried by `resync` after a replay cap or local consumer lag;
+4. treat 401 as a missing/revoked key and 429 as a connection-cap response.
+
+Each application process permits 256 public streams globally and four per stream key. Console streams have equivalent bounded local permits. Stream access is revalidated approximately every 15 seconds.
+
+Plan coverage is deterministic. Directly connected bots consume capacity first. Every managed bot on Free, every managed bot beyond paid capacity, and every child without a connected manager receives one-day Phenogram retention and a visible warning. Discovery is never rejected because of plan capacity. Retention deletes observer records only; it does not acknowledge or delete the official server's native updates.
+
+## Standard and `--local` file semantics
+
+The standard pool is the public Bot API compatibility target. Its `/file` request uses the relative `file_path` returned by native `getFile`, and the sidecar resolves it under the raw-token directory on the official PVC.
+
+The local pool keeps Telegram's documented `--local` contract. `getFile` may return an absolute path under `/var/lib/telegram-bot-api`; that path refers to the Contabo pool PVC. It never refers to the bot application's machine or a developer workstation. Ingress preserves the double slash before an absolute path, and the sidecar also accepts only the exact configured root form if an intermediary merges it.
+
+The sidecar performs descriptor-relative, no-follow, same-filesystem opens and streams regular files only. It accepts `GET`/`HEAD` and valid byte ranges. It reads the pool PVC but never writes it. The internal gateway-to-sidecar request is authenticated with `DATA_PLANE_SYNC_TOKEN`.
+
+## Credential storage boundary
+
+Application and official-server storage have different properties:
+
+- PostgreSQL bot tokens, ingress secrets, downstream/lifecycle webhook secrets, and lifecycle snapshots are encrypted by the application with XChaCha20-Poly1305 and per-record associated data.
+- Official Bot API PVC storage is exactly the pinned upstream format. It may contain the complete bot token in directory names and persisted runtime state. Production directories include `<raw-token>/`; test-DC directories include `<raw-token>:T/` (with the upstream filesystem fallback where applicable).
+- There is no `OFFICIAL_STORAGE_KEY`, official-storage KDF, token-directory HMAC, custom TDLib database key, or Phenogram encrypted envelope around this PVC.
+
+Treat node shell access, PVC mounts, CSI snapshots, storage-system copies, and official-volume backups as bot-token access. Restrict and audit them accordingly. Rotating `MASTER_KEY` has no effect on the official PVC, and losing `MASTER_KEY` does not make the official PVC unreadable.
+
+The currently enabled scheduled Restic job backs up PostgreSQL application state only. It is not part of the destructive first bot cutover and does not claim to protect or encrypt official Bot API PVC contents.
+
+## Monitoring
+
+Minimum alerts and dashboards should cover:
+
+- app health and PostgreSQL availability;
+- gateway readiness and last-good route snapshot age/generation;
+- official standard/local pod readiness and restart count;
+- native upstream status/latency from bounded, token-free gateway telemetry;
+- tap sent/dropped/error counters and collector malformed/incomplete/drop logs;
+- official PVC capacity/inodes;
 - growing or repeatedly retried `managed_bot_sync_jobs`;
-- bots with stale `last_update_at`, `degraded`, or `token_invalid` status;
-- expired-row backlog or unusual growth in `updates`, `outbound_messages`, `api_calls`, `conversations`, or `audit_log`;
-- SSE 429s: each process allows 256 total streams and four per stream key;
-- optional local Bot API process/volume failure.
+- bots in `degraded`, `token_invalid`, provisioning, or manual-recovery state;
+- SSE disconnect/429 rates and observer-journal retention backlog;
+- ingress 5xx/502 without logging the request target.
 
-Useful read-only checks:
-
-```sh
-docker compose ps
-docker compose logs --tail=200 app
-docker compose exec -T postgres psql -U phenogram -d phenogram -c \
-  "SELECT state, count(*), min(next_attempt_at) AS oldest FROM webhook_deliveries GROUP BY state ORDER BY state"
-docker compose exec -T postgres psql -U phenogram -d phenogram -c \
-  "SELECT state, count(*), min(next_attempt_at) AS oldest FROM managed_bot_sync_jobs GROUP BY state ORDER BY state"
-docker compose exec -T postgres psql -U phenogram -d phenogram -c \
-  "SELECT status, routing_mode, update_mode, count(*) FROM bots GROUP BY 1,2,3 ORDER BY 1,2,3"
-docker compose exec -T postgres psql -U phenogram -d phenogram -c \
-  "SELECT pg_size_pretty(pg_database_size(current_database())) AS database_size"
-```
-
-`api_calls` provides application-level method/status/latency history but no metrics endpoint is included. Export stdout logs and database/storage metrics through the hosting platform. Treat raw update contents as sensitive and avoid shipping them to general-purpose telemetry.
-
-## Backups and restore drills
-
-A usable backup set contains:
-
-1. a consistent PostgreSQL backup;
-2. the exact `MASTER_KEY`, `PUBLIC_ID_KEY`, and `LINK_SIGNING_KEY` versions active at backup time;
-3. deployment configuration, OAuth client configuration, and image/source revision metadata;
-4. if used, a consistent snapshot of the local Bot API volume and its Telegram API credentials.
-
-Without the original `MASTER_KEY`, encrypted bot and webhook credentials in PostgreSQL cannot be recovered. Without the original `PUBLIC_ID_KEY`, stored public IDs no longer match token-derived lookups. Restoring with a different `LINK_SIGNING_KEY` invalidates old public file links and changes CSRF values.
-
-Example logical database backup:
-
-```sh
-umask 077
-mkdir -p backups
-phenogram_backup="backups/phenogram-$(date +%Y%m%dT%H%M%S).dump"
-docker compose exec -T postgres pg_dump -U phenogram -d phenogram -Fc > "$phenogram_backup"
-pg_restore --list "$phenogram_backup" >/dev/null
-```
-
-Use encrypted, access-controlled off-host storage and enforce retention independently of the application. A volume snapshot is useful in addition to, not instead of, a logical dump.
-
-Test restores into an isolated PostgreSQL instance with no production traffic. Verify migrations, row counts, a provider sign-in using non-production OAuth clients, decryption through a non-production bot, update history, and signed-link behavior using the backed-up key versions. Never use `--clean` against the live database as a casual restore test.
-
-For the optional local Telegram service, stop or quiesce it while taking a filesystem snapshot of `telegram-bot-api-data`, or use a storage system that provides consistent volume snapshots. Regularly test both service recovery and Telegram re-login; PostgreSQL alone does not contain its local files or runtime state.
-
-The production Helm profile configures six-hourly encrypted Restic backups in
-Contabo MinIO with daily/weekly/monthly retention and repository sampling. It does not
-provide point-in-time recovery, replication, or cross-region failover. Define
-and test RPO/RTO, alert on missed jobs, and repeat isolated restore drills.
-
-## Secret rotation
-
-### Stream keys
-
-Create a replacement in the bot's **Delivery & API** view, move the consumer, verify it, then revoke the old key in the same view. Revocation is immediate for new connections; an open stream rechecks the key about every 15 seconds, emits `revoked`, and closes.
-
-### Downstream webhook secret
-
-Call virtual `setWebhook` through Phenogram with the new `secret_token`, update the receiver atomically, and watch delivery failures. The value is encrypted at rest and sent in `X-Telegram-Bot-Api-Secret-Token`.
-
-### Signed-file/CSRF key
-
-Rotating `LINK_SIGNING_KEY` immediately invalidates every outstanding signed file URL and changes the expected CSRF token for existing sessions. Schedule a maintenance window, rotate the secret, restart all app instances together, and have browser clients reload or fetch `/api/me` before their next mutation.
-
-### OAuth client credentials
-
-Existing Phenogram sessions do not contain or depend on provider access tokens, so rotating a provider client secret affects only new sign-ins and callbacks currently in flight.
-
-For GitHub, generate a new client secret on the dedicated OAuth App, update `GITHUB_OAUTH_CLIENT_SECRET` in the restricted Kubernetes Secret, restart the application, verify a fresh sign-in, and then delete the old secret. GitHub recommends exactly that order after a secret compromise. Do not change the app's no-scope policy during rotation.
-
-For Google, create a replacement Web application client with the same production callback, update both `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in the restricted Kubernetes Secret, restart the application, verify a fresh sign-in, and then delete the old client. This permits controlled rollback, unlike resetting the existing client's secret. An authorization flow started immediately before the deployment may need to be restarted. Keep `openid profile` as the complete scope set.
-
-In both cases, keep the values out of Helm parameters and release history. Review callback failure rates and remove superseded credentials after verification.
-
-### Master encryption key
-
-Do not simply change `MASTER_KEY`: the application has no online re-encryption command, and existing bot tokens, ingress/downstream secrets, and outstanding opaque local-file references would become unreadable. A safe rotation requires a purpose-built decrypt/re-encrypt migration while the old key is available, or controlled deletion and reconnection of every bot. Back up first and verify a restore.
-
-### Public-ID key
-
-Do not rotate `PUBLIC_ID_KEY` in place. Proxy authentication derives a public ID from the presented bot token and looks up the stored ID; a new key breaks every bot route and leaves Telegram pointing at old ingress URLs. Rotation requires a coordinated database/public-URL migration and upstream webhook reprovisioning, which this MVP does not automate.
-
-### Bot tokens
-
-For a directly connected bot, revoke a suspected token with @BotFather immediately. This MVP has no in-place replacement endpoint for that credential; deleting and reconnecting the bot removes its Phenogram history through cascading deletes, so preserve required evidence under the applicable policy before that destructive step.
-
-For a Telegram managed bot, do not copy or rotate its token through Phenogram. Telegram sends its manager a `managed_bot` update when the token changes; the synchronization worker fetches and encrypts the current token automatically while preserving the child record, history, public ID, and ingress URL.
-
-### Database and local-server credentials
-
-Rotate the PostgreSQL role secret together with `DATABASE_URL` and restart the app. For `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`, follow Telegram's credential process, update the companion service secret, and test bot login and update ingress before routing traffic.
-
-## Plan administration and retention
-
-A user's first provider sign-in assigns the `free` plan. There is no payment provider or admin endpoint in this MVP; the plan-selection UI is informational. Until billing exists, authorized operators assign plans directly in PostgreSQL and should record the approval externally and in the audit log.
-
-Inspect before changing a membership:
-
-```sql
-SELECT users.id, identities.provider, identities.provider_login,
-       memberships.plan_id, memberships.status,
-       plans.bot_limit, plans.retention_days, plans.local_bot_api
-FROM users
-JOIN oauth_identities identities ON identities.user_id = users.id
-JOIN memberships ON memberships.user_id = users.id
-JOIN plan_definitions plans ON plans.id = memberships.plan_id
-WHERE identities.provider = 'github'
-  AND identities.provider_login = 'owner-handle';
-```
-
-Apply a reviewed assignment in a transaction, using `free`, `pro`, or `scale`:
-
-```sql
-BEGIN;
-UPDATE memberships
-SET plan_id = 'pro', status = 'active', updated_at = now()
-WHERE user_id = '<user-uuid>';
-INSERT INTO audit_log (user_id, action, metadata)
-VALUES ('<user-uuid>', 'membership.admin_changed', '{"plan_id":"pro"}'::jsonb);
-COMMIT;
-```
-
-A downgrade does not remove excess bots. It continues to block additional directly connected bots, while managed bots beyond the new covered capacity remain active with one-day retention and a visible warning in the console.
-
-Plan coverage is deterministic. Directly connected bots consume the hard connection allowance first. On Free, every managed child uses one-day retention. On paid plans, managed children fill the remaining covered capacity in creation order; overflow children and children without a connected manager use one-day retention. Discovery itself is never rejected at the plan boundary.
-
-Effective retention is calculated when `updates`, `outbound_messages`, `api_calls`, bot-scoped `audit_log` rows, and conversation projections are created or refreshed. A plan or hierarchy change also recalculates retained bot-scoped rows, so a newly uncovered bot is reduced to its most recent day and an upgraded bot immediately reflects its longer window for data that has not already been swept. Account-scoped audit rows use a one-year expiry, sessions use `SESSION_TTL_HOURS`, and delivery rows cascade with their parent updates. Every retention run drains each expired table completely in repeated 5,000-row batches, yielding between full batches.
-
-Monitor expired backlog:
-
-```sql
-SELECT count(*) AS expired_updates FROM updates WHERE expires_at <= now();
-SELECT count(*) AS expired_outbound FROM outbound_messages WHERE expires_at <= now();
-SELECT count(*) AS expired_api_calls FROM api_calls WHERE expires_at <= now();
-SELECT count(*) AS expired_conversations FROM conversations WHERE expires_at <= now();
-SELECT count(*) AS expired_audit FROM audit_log WHERE expires_at <= now();
-```
-
-## Optional local Telegram Bot API service
-
-The companion image builds a pinned revision of Telegram's official `tdlib/telegram-bot-api` and starts it with `--local` on port 8081. The platform itself remains the gateway; it does not implement Telegram's server. The premium overlay gives the companion read/write access to `telegram-bot-api-data`, mounts the same volume read-only into the app, and configures both the API origin and local file root.
-
-Obtain `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` using Telegram's [official instructions](https://core.telegram.org/api/obtaining_api_id), store them as secrets, then start the overlay:
-
-```sh
-docker compose -f compose.yaml -f compose.premium.yaml up --build -d
-docker compose -f compose.yaml -f compose.premium.yaml ps
-docker compose -f compose.yaml -f compose.premium.yaml logs --tail=200 telegram-bot-api
-```
-
-Before migrating a bot:
-
-- confirm its membership has `local_bot_api = true`;
-- confirm the companion service and persistent volume are healthy and backed up;
-- review Telegram's [local Bot API server behavior](https://core.telegram.org/bots/api#using-a-local-bot-api-server);
-- schedule the migration, because moving to local calls cloud `logOut`, and returning to cloud can be subject to Telegram's login cooldown;
-- use the confirmed migration control in bot settings (or call the routing API with `mode: "local"` and `confirm_migration: true`);
-- call `getMe` through Phenogram and verify a real incoming update end to end;
-- query the actual local server's `getWebhookInfo` securely and confirm it points to Phenogram ingress.
-
-Routing changes are serialized per bot with a PostgreSQL advisory lock. Phenogram logs out of the old backend, records the new mode, and installs its managed ingress webhook on the target backend. Success sets the bot healthy; a target that is not ready leaves the selected mode in place with degraded status. Retry webhook installation through `POST /api/bots/{bot_id}/provision`, then repeat `getMe`, upstream `getWebhookInfo`, and real-update checks.
-
-In local mode, Phenogram virtualizes `getFile`: an absolute path returned by the companion is replaced with an authenticated-encrypted `__phenogram_local__/...` reference scoped to that bot. Token-bearing and signed public download routes decrypt it, canonicalize the path, require it to remain below `TELEGRAM_LOCAL_DATA_DIR`, and stream from the read-only mount. Single byte ranges return `206`; invalid or multiple ranges return `416`. Never make the app's mount writable.
-
-The companion service is still an external operational dependency. The Rust application does not monitor its internals, schedule its backups, rotate Telegram application credentials, or provide a general local-server control plane.
+Do not use a growing journal count as proof of native delivery, and do not use successful native delivery as proof that every observer copy was stored. They are intentionally separate paths.
 
 ## Incident runbooks
 
-### Health is degraded or PostgreSQL is unavailable
+### PostgreSQL or the collector is unavailable
 
-1. Stop rollouts and confirm whether `https://app.phenogram.io/api/health` is 503.
-2. Inspect container health, PostgreSQL logs, storage capacity/inodes, connection count, and host pressure.
-3. Preserve logs and take a snapshot before repairing suspected corruption.
-4. Restore connectivity or fail over PostgreSQL, then verify migrations and `https://app.phenogram.io/api/health`.
-5. Check delivery leases. Jobs left `delivering` are automatically returned to `failed` after five minutes by the retention task.
-6. Run a proxied test call and a real update ingress check; database health alone is insufficient.
+1. Verify an already routed bot still receives a native official-server response through `/bot*`.
+2. Confirm gateway readiness is using its last-good route snapshot.
+3. Confirm the official container remains ready and has not restarted because a sidecar failed.
+4. Repair PostgreSQL/collector independently.
+5. Expect possible gaps in history, SSE, and conversation projections for the outage interval. Managed lifecycle records replay after recovery while they remain inside the bounded seven-day queue; inspect its pending/overflow/expiry/error counters. Never block native traffic to manufacture observer copies.
 
-### Telegram updates stop arriving
+New connections, route changes, Bot View, and new route-snapshot publication require the control plane and may be unavailable while PostgreSQL is down. Existing last-good routes and official native delivery do not.
 
-1. Check bot `status` and `last_update_at` in the console/database.
-2. Distinguish the two webhooks: Phenogram's virtual `getWebhookInfo` reports the developer's downstream destination, not Telegram's upstream destination.
-3. Using secure operator tooling, call `getWebhookInfo` directly on the selected Telegram cloud/local backend and verify the URL is `${API_BASE_URL}/telegram/webhook/{public_id}`.
-4. Check reverse-proxy status codes for the ingress route, TLS/DNS reachability, and 401 responses caused by a secret mismatch.
-5. Send one controlled test update and verify it appears in `updates` before inspecting downstream delivery.
-6. Retry the managed upstream webhook with `POST /api/bots/{bot_id}/provision`; it decrypts the existing ingress secret and installs the webhook on the currently selected backend without deleting history. Confirm the bot returns to `healthy`.
+### Native polling or webhook delivery stops
 
-### A downstream webhook is failing
+1. Call the affected method through the public gateway and directly against the pool service from an authorized in-cluster shell; compare native responses.
+2. Check gateway route generation and pool selection, official process logs, Telegram connectivity, PVC capacity, and pod restart history.
+3. Inspect the official server's native `getWebhookInfo`; there is no Phenogram virtual webhook status.
+4. Test with a controlled update. The journal is supporting evidence only and may be incomplete.
+5. Do not redirect delivery through the collector or PostgreSQL as a workaround.
 
-1. Inspect virtual `getWebhookInfo`, `webhook_deliveries`, and the last error/status.
-2. Verify public DNS, TLS chain, allowed port, response latency below the 15-second client timeout, and that every resolved address is globally routable. For every attempt, Phenogram disables inherited proxies, resolves once, validates all addresses, and pins the request to that set; infrastructure egress policy should remain in place.
-3. Verify the receiver accepts JSON and the current secret header.
-4. Correct the receiver or call virtual `setWebhook` with the replacement URL/secret. Existing failed jobs use the current stored destination on their next attempt.
-5. Watch retries. Backoff grows exponentially to one hour; there is no manual retry endpoint or terminal retry count. The job is eventually removed when its parent update reaches retention expiry.
+### Journal or live SSE has a gap
 
-### SSE misses or duplicates events
+1. Check tap drop/error counters, collector restarts, datagram reassembly expiry, PostgreSQL availability, and retention expiry.
+2. Reconnect SSE with the last committed event ID and follow `resync` pagination.
+3. Reconcile against the bot application's native source of truth if completeness matters.
+4. Accept that a dropped best-effort copy cannot always be reconstructed after Telegram has natively delivered and acknowledged it.
 
-1. Treat 401 as a missing, revoked, or mismatched stream URL and issue a replacement if needed.
-2. Persist each SSE event ID only after the consumer commits the event.
-3. Reconnect with `Last-Event-ID`; replay is ordered by database row ID and capped at 5,000 rows, 8 MiB serialized total, and roughly 2 MiB for one event.
-4. On a `resync` event, persist its event ID and reconnect from that ID to continue the next replay page. Reconcile through the authenticated update-history API if necessary.
-5. Confirm the reverse proxy is not buffering and permits connections longer than the 15-second keepalive interval.
-6. Treat 429 as a connection-cap signal. Each process allows 256 total streams and four per stream key; permits are held for the connection lifetime.
-7. The live bus is process-local. A stream on replica A does not see an update ingested by replica B until reconnect/replay. Keep the MVP to one app instance, or add a shared notification layer such as PostgreSQL `LISTEN/NOTIFY`, Redis, or NATS before scaling live SSE horizontally.
+### A managed token rotation is blocked
 
-### Signed file download fails
+1. Confirm the child's current native webhook remains configured and its route was not withdrawn.
+2. Obtain the webhook authentication material from the bot operator; do not infer it from `getWebhookInfo`.
+3. Re-enter/reconfigure the webhook through a controlled lifecycle operation.
+4. Retry rotation only after the control plane can preserve the receiver's authentication semantics.
 
-1. Check that expiry is current and no more than seven days in the future.
-2. Use the exact `file_path` returned through Phenogram; path, public ID, and expiry are covered by the signature. Local absolute paths are returned as opaque `__phenogram_local__/...` references.
-3. Confirm the bot still exists, its token decrypts, and its selected Telegram backend is reachable.
-4. For an opaque local reference, confirm `TELEGRAM_LOCAL_DATA_DIR` is an absolute path, the companion volume is mounted there read-only, and the decrypted file still canonicalizes below that root.
-5. Do not extend a link by editing `expires`; create a new signed URL.
+### `/file` fails
 
-### Local routing migration fails
+1. Use the exact `file_path` returned by the selected pool's native `getFile`.
+2. Confirm route pool, file-sidecar process, read-only PVC mount, and `DATA_PLANE_SYNC_TOKEN` agreement.
+3. For `--local`, confirm the absolute path is under the configured Contabo data root; a developer-machine path is invalid by design.
+4. Test `HEAD` and a small range before attempting the complete download.
 
-1. Do not repeatedly toggle routing. Determine whether cloud `logOut` already succeeded.
-2. Check the local service logs, Telegram API credentials, volume ownership/capacity, and `getMe` directly on the local service.
-3. If the platform returned a provisioning warning, keep traffic stopped and retry `POST /api/bots/{bot_id}/provision` until the bot is healthy; then confirm `getMe` and the Phenogram ingress webhook on the target backend.
-4. When returning to cloud, expect Telegram's cooldown and validate both proxied methods and upstream update delivery after it expires.
-5. Preserve the local volume until recovery is complete.
+### Data-plane control token rotation
+
+Update the repository secret and reconcile the Kubernetes Secret, then restart the gateway, application, collectors, and file sidecars together so every internal participant uses the same value. The official Bot API containers do not consume this secret and must not be restarted merely to rotate it.
 
 ## Current production boundaries
 
-- `phenogram.io` is the public landing surface and exposes only `/`, `/privacy`, `/assets/app.css`, `/assets/app.js`, and `/assets/runtime.js`. `app.phenogram.io` owns the authenticated console, client routes, management API, and health. `api.phenogram.io` is restricted to Telegram-compatible bot/file paths, Telegram ingress, SSE, and signed public downloads; the landing and API hosts intentionally do not expose `/api/health` or management endpoints.
-- SSE is the only new subscription transport. Kafka, WebSockets, NATS, and similar brokers are not implemented.
-- Live SSE fan-out and its 256-global/four-per-key connection caps are process-local. Replay is durable but capped per connection at 5,000 rows, 8 MiB total, and roughly 2 MiB per event.
-- Downstream delivery uses four workers per app process. Stored `max_connections` is informational in this MVP.
-- Payment collection, provider reconciliation, tax/invoice handling, self-service plan changes, and an admin console are absent.
-- Plan retention covers updates, outbound messages, API calls, conversation projections, and bot-scoped audit rows, but changing a plan does not recalculate already stamped expiry times. Account-scoped audit rows use one year.
-- The optional official local Bot API server is a separate operational component. Routing, managed webhook reprovisioning, opaque local paths, and range delivery are integrated, but the platform is not a local-server monitoring or backup control plane.
-- Bot credential replacement is absent. Reconnecting after a BotFather token rotation requires deleting the existing bot record, which cascades its stored history.
-- Authentication depends on Google and GitHub availability and has no MFA policy of its own, organization model, or RBAC. Phenogram requests no email scope or field and receives or stores neither email addresses nor provider tokens. OAuth endpoints still need distributed edge limits before horizontal scaling.
-- Downstream destination pinning and global-address checks reduce SSRF risk, but operator-level egress controls remain required defense in depth.
-- The Helm deployment includes scheduled encrypted PostgreSQL backups to an operator-provisioned S3-compatible bucket, but no built-in metrics endpoint, point-in-time recovery, multi-region failover, or automated disaster recovery.
-- Compatibility has been exercised for the included contract tests, not certified against every Telegram method/content type. Managed update methods intentionally implement a subset of Telegram parameters.
-- Managed `setWebhook` does not accept multipart custom certificates or implement `ip_address`; `max_connections` is stored/reported but does not control the global four-worker pool.
-
-These boundaries make the safest initial shape a protected, single-instance deployment with managed PostgreSQL/backups, strict ingress redaction and rate controls, a small authorized user base, and explicit operator ownership of plans and premium routing.
+- The standard compatibility target is the pinned official server. Phenogram's added hop can still fail at ingress, route authentication, or transport; compatibility must be regression-tested at the raw HTTP boundary.
+- The gateway and each official pool are single replica in the MVP, so node/pod disruption can interrupt service even though observer failures are isolated.
+- Observer history, Bot View projections, and SSE use best-effort type-1 copies and can contain gaps. Managed discovery uses a bounded ACKed seven-day observer queue; overflow, expiry, or local persistence failure can still create a gap but never blocks native Telegram delivery.
+- `--local` absolute paths are Contabo server-local paths, not client-local paths.
+- Moving an already active bot between standard and local pools is not exposed as an ordinary routing change.
+- A managed token rotation with an active webhook requires explicit recovery of authentication settings.
+- Payment collection, self-service upgrades, MFA, organizations/RBAC, multi-region failover, and point-in-time recovery are not implemented.
+- Authentication depends on Google and GitHub availability; Phenogram still requests and stores no email addresses or provider tokens.

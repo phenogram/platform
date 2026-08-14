@@ -9,17 +9,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::FromRow;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     auth::{AuthUser, active_membership, membership},
     crypto::Crypto,
     error::{AppError, Result},
+    lifecycle::{
+        DataPlanePool, ExistingWebhookResolution, LifecycleOperation, LifecycleOutcome, SourcePool,
+        create_operation, has_operation, prepare_connect_webhook_transfer,
+        resolve_connect_webhook_secret, run_bot_operation,
+    },
     models::{ActivitySummary, BotRecord, BotSummary, ConversationSummary, UpdateSummary},
     state::AppState,
     telegram::{
-        ALL_UPDATE_TYPES, OutboundMessageRecord, StreamQuery, console_event_stream, decrypt_token,
-        existing_webhook, install_managed_webhook, raw_telegram_json, record_outbound_message,
-        search_pattern, telegram_json_for_bot,
+        ALL_UPDATE_TYPES, ExistingWebhookPolicy, OutboundMessageRecord, StreamQuery,
+        console_event_stream, decrypt_token, existing_webhook, install_managed_webhook,
+        prepare_file_link_path, raw_telegram_json_for_dc, record_outbound_message,
+        recover_managed_bot_rotation, search_pattern, telegram_json_for_bot,
     },
 };
 
@@ -71,15 +78,28 @@ struct PlanRow {
     monthly_price_cents: Option<i32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ConnectBotRequest {
     token: String,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    test_dc: bool,
+    #[serde(default)]
+    existing_webhook_secret: Option<String>,
+    #[serde(default)]
+    existing_webhook_has_no_secret: bool,
+    #[serde(default)]
+    existing_webhook_ip_address: Option<String>,
+    #[serde(default)]
+    existing_webhook_has_no_ip_address: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ConnectBotResponse {
     bot: BotSummary,
     warnings: Vec<String>,
+    webhook_ip_address_preserved: bool,
 }
 
 pub async fn connect_bot(
@@ -88,8 +108,20 @@ pub async fn connect_bot(
     Json(input): Json<ConnectBotRequest>,
 ) -> Result<(StatusCode, Json<ConnectBotResponse>)> {
     let token = input.token.trim().to_owned();
+    let telegram_test_dc = input.test_dc;
     validate_bot_token(&token)?;
     let membership = active_membership(&state, user.id).await?;
+    let target_pool = connect_target_pool(input.pool.as_deref())?;
+    if target_pool == DataPlanePool::Local && !membership.local_bot_api {
+        return Err(AppError::PlanLimit(
+            "Phenogram Local requires a plan with Local Bot API access".into(),
+        ));
+    }
+    if target_pool == DataPlanePool::Local && !state.config.data_plane_enabled {
+        return Err(AppError::Conflict(
+            "Phenogram Local is not enabled on this deployment".into(),
+        ));
+    }
     let bot_count = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM bots WHERE user_id = $1 AND bot_kind = 'connected'",
     )
@@ -105,10 +137,11 @@ pub async fn connect_bot(
         )));
     }
 
-    let (telegram_status, me) = raw_telegram_json(
+    let (telegram_status, me) = raw_telegram_json_for_dc(
         &state.telegram,
         &state.config.telegram_cloud_api_url,
         &token,
+        telegram_test_dc,
         "getMe",
         &json!({}),
     )
@@ -132,11 +165,13 @@ pub async fn connect_bot(
         .unwrap_or(&username)
         .to_owned();
 
-    if let Some(existing_owner) =
-        sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM bots WHERE telegram_bot_id = $1")
-            .bind(telegram_bot_id)
-            .fetch_optional(&state.db)
-            .await?
+    if let Some(existing_owner) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM bots WHERE telegram_bot_id = $1 AND telegram_test_dc = $2",
+    )
+    .bind(telegram_bot_id)
+    .bind(telegram_test_dc)
+    .fetch_optional(&state.db)
+    .await?
     {
         return Err(if existing_owner == user.id {
             AppError::Conflict("This bot is already connected to your account".into())
@@ -145,23 +180,58 @@ pub async fn connect_bot(
         });
     }
 
-    let (_, webhook_info) = raw_telegram_json(
-        &state.telegram,
-        &state.config.telegram_cloud_api_url,
-        &token,
-        "getWebhookInfo",
-        &json!({}),
-    )
-    .await?;
-    let previous_webhook = existing_webhook(
-        &webhook_info,
-        &state.config.api_base_url,
-        state.config.app_env != "production",
-    )?;
-
     let bot_id = Uuid::new_v4();
-    let public_id = state.crypto.bot_public_id(&token);
-    let token_fingerprint = Crypto::token_fingerprint(&token);
+    let prepared_webhook = if state.config.data_plane_enabled {
+        Some(
+            prepare_connect_webhook_transfer(
+                &state,
+                bot_id,
+                SourcePool::Cloud,
+                &token,
+                telegram_test_dc,
+                ExistingWebhookResolution {
+                    secret: input.existing_webhook_secret.as_deref(),
+                    confirmed_no_secret: input.existing_webhook_has_no_secret,
+                    ip_address: input.existing_webhook_ip_address.as_deref(),
+                    confirmed_no_ip_address: input.existing_webhook_has_no_ip_address,
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let previous_webhook = if state.config.data_plane_enabled {
+        None
+    } else {
+        let (_, webhook_info) = raw_telegram_json_for_dc(
+            &state.telegram,
+            &state.config.telegram_cloud_api_url,
+            &token,
+            telegram_test_dc,
+            "getWebhookInfo",
+            &json!({}),
+        )
+        .await?;
+        existing_webhook(
+            &webhook_info,
+            &state.config.api_base_url,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: state.config.app_env != "production",
+            },
+        )?
+    };
+    let previous_webhook_secret = if state.config.data_plane_enabled {
+        None
+    } else {
+        resolve_connect_webhook_secret(
+            previous_webhook.as_ref(),
+            input.existing_webhook_secret.as_deref(),
+            input.existing_webhook_has_no_secret,
+        )?
+    };
+    let public_id = state.crypto.bot_public_id(&token, telegram_test_dc);
+    let token_fingerprint = Crypto::token_fingerprint(&token, telegram_test_dc);
     let token_encrypted = state
         .crypto
         .encrypt(token.as_bytes(), format!("bot:{bot_id}:token").as_bytes())?;
@@ -170,18 +240,177 @@ pub async fn connect_bot(
         ingress_secret.as_bytes(),
         format!("bot:{bot_id}:ingress-secret").as_bytes(),
     )?;
+    let downstream_secret_encrypted = previous_webhook_secret
+        .as_ref()
+        .map(|secret| {
+            state.crypto.encrypt(
+                secret.as_bytes(),
+                format!("bot:{bot_id}:downstream-secret").as_bytes(),
+            )
+        })
+        .transpose()?;
+
+    if state.config.data_plane_enabled {
+        let webhook_ip_address_preserved = prepared_webhook
+            .as_ref()
+            .is_some_and(|webhook| webhook.reported_ip_address_preserved());
+        let mut tx = state.db.begin().await?;
+        let insert = sqlx::query(
+            r#"INSERT INTO bots
+                   (id, user_id, telegram_bot_id, telegram_test_dc, username, display_name,
+                    token_ciphertext, token_nonce, token_fingerprint, public_id,
+                    token_lookup_hash, ingress_secret_ciphertext,
+                    ingress_secret_nonce, data_plane_target_pool)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12,$13)"#,
+        )
+        .bind(bot_id)
+        .bind(user.id)
+        .bind(telegram_bot_id)
+        .bind(telegram_test_dc)
+        .bind(&username)
+        .bind(&display_name)
+        .bind(&token_encrypted.data)
+        .bind(&token_encrypted.nonce)
+        .bind(&token_fingerprint)
+        .bind(&public_id)
+        .bind(&ingress_encrypted.data)
+        .bind(&ingress_encrypted.nonce)
+        .bind(target_pool.as_str())
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = insert {
+            if error.to_string().contains("bot plan limit reached") {
+                return Err(AppError::PlanLimit("Your bot limit was reached".into()));
+            }
+            return Err(error.into());
+        }
+        sqlx::query("INSERT INTO bot_update_state (bot_id) VALUES ($1)")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+        create_operation(
+            &mut tx,
+            bot_id,
+            LifecycleOperation::Connect,
+            SourcePool::Cloud,
+            target_pool,
+            prepared_webhook.as_ref().ok_or(AppError::Internal)?,
+        )
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
+               SELECT $1, bots.id, 'bot.connected', $3,
+                      now() + make_interval(days => bot_effective_retention_days(bots.id))
+                 FROM bots WHERE bots.id = $2"#,
+        )
+        .bind(user.id)
+        .bind(bot_id)
+        .bind(json!({
+            "telegram_bot_id": telegram_bot_id,
+            "telegram_test_dc": telegram_test_dc,
+            "username": username,
+            "data_plane_target": target_pool.as_str()
+        }))
+        .execute(&mut *tx)
+        .await?;
+        let reattached = sqlx::query(
+            r#"UPDATE bots
+                  SET manager_bot_id = $1, updated_at = now()
+                WHERE user_id = $2
+                  AND bot_kind = 'managed'
+                  AND manager_bot_id IS NULL
+                  AND manager_telegram_bot_id = $3
+                  AND telegram_test_dc = $4"#,
+        )
+        .bind(bot_id)
+        .bind(user.id)
+        .bind(telegram_bot_id)
+        .bind(telegram_test_dc)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        if reattached == 0 {
+            sqlx::query("SELECT refresh_user_bot_retention($1)")
+                .bind(user.id)
+                .execute(&state.db)
+                .await?;
+        }
+
+        let mut warnings = Vec::new();
+        if webhook_ip_address_preserved {
+            warnings.push(
+                "You chose fixed-IP continuity for the existing webhook. Phenogram preserved that exact IPv4 address on the official server."
+                    .into(),
+            );
+        }
+        match run_bot_operation(&state, bot_id).await {
+            Ok(LifecycleOutcome::Active {
+                webhook_transferred,
+                secret_reentry_required,
+            }) => {
+                if webhook_transferred && secret_reentry_required {
+                    warnings.push(
+                        "Webhook transferred automatically. Telegram does not expose an existing secret_token, so configure that secret again with setWebhook through Phenogram if the receiver validates it."
+                            .into(),
+                    );
+                }
+            }
+            Ok(LifecycleOutcome::Busy) => warnings.push(
+                "The bot is saved and its Bot API migration is still running. Phenogram will finish it automatically."
+                    .into(),
+            ),
+            Ok(LifecycleOutcome::RolledBack) => return Err(AppError::Internal),
+            Err(error) => {
+                let provisional_bot_still_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM bots WHERE id = $1)",
+                )
+                .bind(bot_id)
+                .fetch_one(&state.db)
+                .await?;
+                if !provisional_bot_still_exists {
+                    return Err(error);
+                }
+                tracing::warn!(%bot_id, error = ?error, "initial data-plane provisioning will retry");
+                let manual_recovery = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM bot_data_plane_operations WHERE bot_id = $1 AND phase = 'manual_recovery')",
+                )
+                .bind(bot_id)
+                .fetch_one(&state.db)
+                .await?;
+                warnings.push(if manual_recovery {
+                    "Telegram did not confirm whether logOut completed. Phenogram stopped routing and automatic retries; this bot requires operator recovery before it can be used."
+                        .into()
+                } else {
+                    "The bot is saved, but its Bot API migration is not complete yet. Phenogram will retry automatically."
+                        .into()
+                });
+            }
+        }
+        let bot = get_bot_summary(&state, user.id, bot_id).await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(ConnectBotResponse {
+                bot,
+                warnings,
+                webhook_ip_address_preserved,
+            }),
+        ));
+    }
 
     let mut tx = state.db.begin().await?;
     let insert = sqlx::query(
         r#"INSERT INTO bots
-               (id, user_id, telegram_bot_id, username, display_name, token_ciphertext, token_nonce,
+               (id, user_id, telegram_bot_id, telegram_test_dc, username, display_name,
+                token_ciphertext, token_nonce,
                 token_fingerprint, public_id, token_lookup_hash,
                 ingress_secret_ciphertext, ingress_secret_nonce)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11)"#,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12)"#,
     )
     .bind(bot_id)
     .bind(user.id)
     .bind(telegram_bot_id)
+    .bind(telegram_test_dc)
     .bind(&username)
     .bind(&display_name)
     .bind(&token_encrypted.data)
@@ -200,19 +429,31 @@ pub async fn connect_bot(
     }
     sqlx::query(
         r#"INSERT INTO bot_update_state
-               (bot_id, allowed_updates, downstream_webhook_url, max_connections)
-           VALUES ($1, $2, $3, $4)"#,
+               (bot_id, allowed_updates, downstream_webhook_url,
+                downstream_secret_ciphertext, downstream_secret_nonce,
+                max_connections)
+           VALUES ($1, $2, $3, $4, $5, $6)"#,
     )
     .bind(bot_id)
     .bind(
         previous_webhook
             .as_ref()
-            .map(|webhook| &webhook.allowed_updates),
+            .and_then(|webhook| webhook.allowed_updates.as_ref()),
     )
     .bind(
         previous_webhook
             .as_ref()
             .map(|webhook| webhook.url.as_str()),
+    )
+    .bind(
+        downstream_secret_encrypted
+            .as_ref()
+            .map(|secret| secret.data.as_slice()),
+    )
+    .bind(
+        downstream_secret_encrypted
+            .as_ref()
+            .map(|secret| secret.nonce.as_slice()),
     )
     .bind(
         previous_webhook
@@ -236,7 +477,7 @@ pub async fn connect_bot(
     )
     .bind(user.id)
     .bind(bot_id)
-    .bind(json!({"telegram_bot_id": telegram_bot_id, "username": username, "migrated_webhook": previous_webhook.is_some()}))
+    .bind(json!({"telegram_bot_id": telegram_bot_id, "telegram_test_dc": telegram_test_dc, "username": username, "migrated_webhook": previous_webhook.is_some()}))
     .execute(&mut *tx)
     .await?;
 
@@ -248,11 +489,13 @@ pub async fn connect_bot(
             WHERE user_id = $2
               AND bot_kind = 'managed'
               AND manager_bot_id IS NULL
-              AND manager_telegram_bot_id = $3"#,
+              AND manager_telegram_bot_id = $3
+              AND telegram_test_dc = $4"#,
     )
     .bind(bot_id)
     .bind(user.id)
     .bind(telegram_bot_id)
+    .bind(telegram_test_dc)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -271,10 +514,11 @@ pub async fn connect_bot(
         "{}/telegram/webhook/{}",
         state.config.api_base_url, public_id
     );
-    let webhook_result = raw_telegram_json(
+    let webhook_result = raw_telegram_json_for_dc(
         &state.telegram,
         &state.config.telegram_cloud_api_url,
         &token,
+        telegram_test_dc,
         "setWebhook",
         &json!({
             "url": webhook_url,
@@ -294,21 +538,17 @@ pub async fn connect_bot(
         .execute(&state.db)
         .await?;
     let mut warnings: Vec<String> = Vec::new();
-    if previous_webhook.is_some() && provisioned {
-        // Telegram's getWebhookInfo response deliberately omits secret_token,
-        // so the previous downstream authentication header cannot be recovered.
-        warnings.push(
-            "Webhook transferred automatically. If the existing receiver validates Telegram's secret-token header, configure that secret again with setWebhook through Phenogram."
-                .into(),
-        );
-    }
     if !provisioned {
         warnings.push("The bot was saved, but Telegram did not accept the Phenogram webhook. Retry setup from bot settings.".into());
     }
     let bot = get_bot_summary(&state, user.id, bot_id).await?;
     Ok((
         StatusCode::CREATED,
-        Json(ConnectBotResponse { bot, warnings }),
+        Json(ConnectBotResponse {
+            bot,
+            warnings,
+            webhook_ip_address_preserved: false,
+        }),
     ))
 }
 
@@ -319,6 +559,43 @@ pub async fn provision_bot(
 ) -> Result<Json<Value>> {
     active_membership(&state, user.id).await?;
     let bot = get_bot_record(&state, user.id, bot_id).await?;
+    if state.config.data_plane_enabled {
+        if !has_operation(&state, bot_id).await? {
+            if managed_rotation_waits_for_webhook_secret(&state, bot_id).await? {
+                return Err(AppError::Conflict(
+                    "Managed bot setup is waiting for webhook recovery. The native webhook remains active and unchanged; use the dedicated recovery action before retrying setup."
+                        .into(),
+                ));
+            }
+            if bot.data_plane_pool.is_some() {
+                telegram_json_for_bot(&state, &bot, "getMe", &json!({}), "system").await?;
+                sqlx::query("UPDATE bots SET status = 'healthy', updated_at = now() WHERE id = $1")
+                    .bind(bot_id)
+                    .execute(&state.db)
+                    .await?;
+                return Ok(Json(json!({
+                    "bot": get_bot_summary(&state, user.id, bot_id).await?,
+                    "warnings": []
+                })));
+            }
+            return Err(AppError::Conflict(
+                "This clean-state release cannot migrate a legacy bot record. Reconnect the bot after the production reset."
+                    .into(),
+            ));
+        }
+        return match run_bot_operation(&state, bot_id).await? {
+            LifecycleOutcome::Active { .. } => Ok(Json(json!({
+                "bot": get_bot_summary(&state, user.id, bot_id).await?,
+                "warnings": Vec::<&str>::new()
+            }))),
+            LifecycleOutcome::RolledBack => Err(AppError::Conflict(
+                "The Bot API operation was safely rolled back".into(),
+            )),
+            LifecycleOutcome::Busy => Err(AppError::Conflict(
+                "Bot API migration is already running".into(),
+            )),
+        };
+    }
     let provisioned = install_managed_webhook(&state, &bot).await.unwrap_or(false);
     let status = if provisioned { "healthy" } else { "degraded" };
     sqlx::query("UPDATE bots SET status = $2, updated_at = now() WHERE id = $1")
@@ -349,10 +626,71 @@ pub async fn provision_bot(
     })))
 }
 
+async fn managed_rotation_waits_for_webhook_secret(state: &AppState, bot_id: Uuid) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+               SELECT 1
+                 FROM bots child
+                 JOIN managed_bot_sync_jobs jobs
+                   ON jobs.manager_bot_id = child.manager_bot_id
+                  AND jobs.managed_telegram_bot_id = child.telegram_bot_id
+                WHERE child.id = $1
+                  AND child.bot_kind = 'managed'
+                  AND jobs.state = 'conflict'
+                  AND jobs.error_summary = 'webhook_secret_required'
+           )"#,
+    )
+    .bind(bot_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+pub struct ManagedWebhookRecoveryRequest {
+    #[serde(default)]
+    existing_webhook_secret: Option<String>,
+    #[serde(default)]
+    existing_webhook_has_no_secret: bool,
+    #[serde(default)]
+    existing_webhook_ip_address: Option<String>,
+    #[serde(default)]
+    existing_webhook_has_no_ip_address: bool,
+}
+
+pub async fn recover_managed_webhook(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(bot_id): Path<Uuid>,
+    Json(input): Json<ManagedWebhookRecoveryRequest>,
+) -> Result<Json<Value>> {
+    active_membership(&state, user.id).await?;
+    // Resolve ownership before consuming any operator-supplied secret. The
+    // worker performs the stricter managed-job, route, and token checks.
+    get_bot_record(&state, user.id, bot_id).await?;
+    let existing_webhook_secret = input.existing_webhook_secret.map(Zeroizing::new);
+    recover_managed_bot_rotation(
+        &state,
+        user.id,
+        bot_id,
+        existing_webhook_secret.as_deref().map(String::as_str),
+        input.existing_webhook_has_no_secret,
+        input.existing_webhook_ip_address.as_deref(),
+        input.existing_webhook_has_no_ip_address,
+    )
+    .await?;
+    Ok(Json(json!({
+        "bot": get_bot_summary(&state, user.id, bot_id).await?,
+        "warnings": Vec::<String>::new(),
+    })))
+}
+
 pub async fn list_bots(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>> {
     let bots = sqlx::query_as::<_, BotSummary>(
-        r#"SELECT bots.id, bots.telegram_bot_id, bots.username, bots.display_name,
-                  bots.public_id, bots.status, bots.routing_mode, bots.update_mode,
+        r#"SELECT bots.id, bots.telegram_bot_id, bots.telegram_test_dc,
+                  bots.username, bots.display_name,
+                  bots.public_id, bots.status, bots.routing_mode, bots.data_plane_pool,
+                  bots.update_mode,
                   bots.last_update_at, bots.last_api_call_at, bots.created_at,
                   bots.bot_kind, bots.bot_kind = 'managed' AS is_managed,
                   bots.manager_bot_id, bots.manager_telegram_bot_id,
@@ -361,7 +699,14 @@ pub async fn list_bots(State(state): State<AppState>, user: AuthUser) -> Result<
                   bots.managed_owner_telegram_user_id,
                   bot_plan_covered(bots.id) AS plan_covered,
                   bot_effective_retention_days(bots.id) AS effective_retention_days,
-                  bot_retention_warning(bots.id) AS retention_warning
+                  bot_retention_warning(bots.id) AS retention_warning,
+                  EXISTS (
+                      SELECT 1 FROM managed_bot_sync_jobs jobs
+                       WHERE jobs.manager_bot_id = bots.manager_bot_id
+                         AND jobs.managed_telegram_bot_id = bots.telegram_bot_id
+                         AND jobs.state = 'conflict'
+                         AND jobs.error_summary = 'webhook_secret_required'
+                  ) AS webhook_secret_required
              FROM bots
              LEFT JOIN bots manager
                ON manager.id = bots.manager_bot_id AND manager.user_id = bots.user_id
@@ -422,7 +767,11 @@ pub async fn get_bot(
         "membership": membership,
         "stats": {"updates_24h": stats.0, "api_calls_24h": stats.1, "failed_deliveries": stats.2, "average_api_latency_ms": stats.3},
         "integration": {
-            "api_base": format!("{}/bot${{BOT_TOKEN}}", state.config.api_base_url),
+            "api_base": format!(
+                "{}/bot${{BOT_TOKEN}}{}",
+                state.config.api_base_url,
+                if bot.telegram_test_dc { "/test" } else { "" }
+            ),
             "public_id": bot.public_id,
             "retention_days": bot.effective_retention_days
         }
@@ -790,19 +1139,13 @@ pub async fn create_file_link(
     Json(input): Json<FileLinkRequest>,
 ) -> Result<Json<Value>> {
     active_membership(&state, user.id).await?;
-    let bot = get_bot_summary(&state, user.id, bot_id).await?;
-    if input.file_path.is_empty()
-        || input.file_path.starts_with('/')
-        || input.file_path.contains("..")
-        || input.file_path.contains(['?', '#', '\\'])
-    {
-        return Err(AppError::Validation("Invalid Telegram file path".into()));
-    }
+    let bot = get_bot_record(&state, user.id, bot_id).await?;
+    let file_path = prepare_file_link_path(&state, &bot, &input.file_path)?;
     let ttl = input.expires_in_seconds.unwrap_or(3600).clamp(60, 604_800);
     let expires = Utc::now().timestamp() + ttl;
     let sig = state
         .crypto
-        .sign_file_link(&bot.public_id, &input.file_path, expires);
+        .sign_file_link(&bot.public_id, &file_path, expires);
     let mut url = url::Url::parse(&state.config.api_base_url).map_err(|_| AppError::Internal)?;
     {
         let mut segments = url.path_segments_mut().map_err(|_| AppError::Internal)?;
@@ -811,7 +1154,7 @@ pub async fn create_file_link(
             .push("public")
             .push(&bot.public_id)
             .push("files");
-        for segment in input.file_path.split('/') {
+        for segment in file_path.split('/') {
             segments.push(segment);
         }
     }
@@ -824,7 +1167,7 @@ pub async fn create_file_link(
     })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct RoutingRequest {
     mode: String,
     confirm_migration: bool,
@@ -844,6 +1187,24 @@ pub async fn change_routing(
     if !matches!(input.mode.as_str(), "cloud" | "local") {
         return Err(AppError::Validation(
             "Routing mode must be cloud or local".into(),
+        ));
+    }
+    if state.config.data_plane_enabled {
+        let bot = get_bot_record(&state, user.id, bot_id).await?;
+        let target = DataPlanePool::from_routing_mode(&input.mode)?;
+        if has_operation(&state, bot_id).await? {
+            return Err(AppError::Conflict(
+                "The bot is still being connected to its official Bot API pool".into(),
+            ));
+        }
+        if bot.data_plane_pool.as_deref() == Some(target.as_str()) {
+            return Ok(Json(
+                json!({"bot": get_bot_summary(&state, user.id, bot_id).await?, "warnings": []}),
+            ));
+        }
+        return Err(AppError::Conflict(
+            "Moving a bot between official Bot API pools is not available yet. Phenogram left the current route unchanged."
+                .into(),
         ));
     }
     // Serialize the externally visible logOut/login saga per bot. Transaction-
@@ -884,10 +1245,11 @@ pub async fn change_routing(
     let token = std::str::from_utf8(&token).map_err(|_| AppError::Internal)?;
     let mut warnings: Vec<String> = Vec::new();
     if input.mode == "local" {
-        let (_, logout) = raw_telegram_json(
+        let (_, logout) = raw_telegram_json_for_dc(
             &state.telegram,
             &state.config.telegram_cloud_api_url,
             token,
+            bot.telegram_test_dc,
             "logOut",
             &json!({}),
         )
@@ -899,8 +1261,15 @@ pub async fn change_routing(
         }
         bot.routing_mode = "local".into();
     } else {
-        let (_, logout) =
-            raw_telegram_json(&state.telegram, local_base, token, "logOut", &json!({})).await?;
+        let (_, logout) = raw_telegram_json_for_dc(
+            &state.telegram,
+            local_base,
+            token,
+            bot.telegram_test_dc,
+            "logOut",
+            &json!({}),
+        )
+        .await?;
         if logout.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(AppError::Upstream(
                 "Telegram local logout failed; routing was not changed".into(),
@@ -961,6 +1330,17 @@ pub async fn delete_bot(
             "This bot is managed automatically. Disconnect its manager before deleting it.".into(),
         ));
     }
+    if state.config.data_plane_enabled && has_operation(&state, bot_id).await? {
+        return Err(AppError::Conflict(
+            "Finish the current Bot API migration before disconnecting this bot".into(),
+        ));
+    }
+    if state.config.data_plane_enabled && bot.data_plane_pool.is_some() {
+        return Err(AppError::Conflict(
+            "Disconnecting a bot from the official Phenogram data plane is temporarily unavailable because Telegram requires logOut before cloud ownership can resume and may enforce a ten-minute login delay. Phenogram left the route and webhook unchanged."
+                .into(),
+        ));
+    }
     let token = decrypt_token(&state, &bot)?;
     let base = if bot.routing_mode == "local" {
         state
@@ -971,10 +1351,11 @@ pub async fn delete_bot(
     } else {
         &state.config.telegram_cloud_api_url
     };
-    let cleanup = raw_telegram_json(
+    let cleanup = raw_telegram_json_for_dc(
         &state.telegram,
         base,
         std::str::from_utf8(&token).unwrap_or(""),
+        bot.telegram_test_dc,
         "deleteWebhook",
         &json!({"drop_pending_updates": false}),
     )
@@ -1002,8 +1383,10 @@ pub async fn delete_bot(
 
 async fn get_bot_summary(state: &AppState, user_id: Uuid, bot_id: Uuid) -> Result<BotSummary> {
     sqlx::query_as::<_, BotSummary>(
-        r#"SELECT bots.id, bots.telegram_bot_id, bots.username, bots.display_name,
-                  bots.public_id, bots.status, bots.routing_mode, bots.update_mode,
+        r#"SELECT bots.id, bots.telegram_bot_id, bots.telegram_test_dc,
+                  bots.username, bots.display_name,
+                  bots.public_id, bots.status, bots.routing_mode, bots.data_plane_pool,
+                  bots.update_mode,
                   bots.last_update_at, bots.last_api_call_at, bots.created_at,
                   bots.bot_kind, bots.bot_kind = 'managed' AS is_managed,
                   bots.manager_bot_id, bots.manager_telegram_bot_id,
@@ -1012,7 +1395,14 @@ async fn get_bot_summary(state: &AppState, user_id: Uuid, bot_id: Uuid) -> Resul
                   bots.managed_owner_telegram_user_id,
                   bot_plan_covered(bots.id) AS plan_covered,
                   bot_effective_retention_days(bots.id) AS effective_retention_days,
-                  bot_retention_warning(bots.id) AS retention_warning
+                  bot_retention_warning(bots.id) AS retention_warning,
+                  EXISTS (
+                      SELECT 1 FROM managed_bot_sync_jobs jobs
+                       WHERE jobs.manager_bot_id = bots.manager_bot_id
+                         AND jobs.managed_telegram_bot_id = bots.telegram_bot_id
+                         AND jobs.state = 'conflict'
+                         AND jobs.error_summary = 'webhook_secret_required'
+                  ) AS webhook_secret_required
              FROM bots
              LEFT JOIN bots manager
                ON manager.id = bots.manager_bot_id AND manager.user_id = bots.user_id
@@ -1027,10 +1417,11 @@ async fn get_bot_summary(state: &AppState, user_id: Uuid, bot_id: Uuid) -> Resul
 
 async fn get_bot_record(state: &AppState, user_id: Uuid, bot_id: Uuid) -> Result<BotRecord> {
     sqlx::query_as::<_, BotRecord>(
-        r#"SELECT id, user_id, telegram_bot_id, username, display_name,
+        r#"SELECT id, user_id, telegram_bot_id, telegram_test_dc, username, display_name,
                   token_ciphertext, token_nonce, token_fingerprint, public_id,
                   ingress_secret_ciphertext, ingress_secret_nonce, status,
-                  routing_mode, update_mode, last_update_at, last_api_call_at, created_at
+                  routing_mode, data_plane_pool, update_mode, last_update_at,
+                  last_api_call_at, created_at
              FROM bots WHERE id = $1 AND user_id = $2"#,
     )
     .bind(bot_id)
@@ -1052,6 +1443,16 @@ async fn assert_bot_owner(state: &AppState, user_id: Uuid, bot_id: Uuid) -> Resu
         Ok(())
     } else {
         Err(AppError::NotFound)
+    }
+}
+
+fn connect_target_pool(requested: Option<&str>) -> Result<DataPlanePool> {
+    match requested.unwrap_or("standard") {
+        "standard" => Ok(DataPlanePool::Standard),
+        "local" => Ok(DataPlanePool::Local),
+        _ => Err(AppError::Validation(
+            "Bot API pool must be standard or local".into(),
+        )),
     }
 }
 
@@ -1097,8 +1498,13 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::{ConnectBotRequest, existing_webhook, health_payload, validate_get_me_response};
+    use super::{
+        ConnectBotRequest, ManagedWebhookRecoveryRequest, connect_target_pool, existing_webhook,
+        health_payload, validate_get_me_response,
+    };
     use crate::error::AppError;
+    use crate::lifecycle::DataPlanePool;
+    use crate::telegram::ExistingWebhookPolicy;
 
     const API_BASE_URL: &str = "https://api.phenogram.io";
 
@@ -1119,6 +1525,76 @@ mod tests {
         }))
         .expect("token-only connect request should deserialize");
         assert_eq!(request.token, "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef");
+        assert!(request.pool.is_none());
+        assert!(!request.test_dc);
+        assert!(request.existing_webhook_secret.is_none());
+        assert!(!request.existing_webhook_has_no_secret);
+        assert!(request.existing_webhook_ip_address.is_none());
+        assert!(!request.existing_webhook_has_no_ip_address);
+        assert_eq!(
+            connect_target_pool(request.pool.as_deref()).unwrap(),
+            DataPlanePool::Standard
+        );
+    }
+
+    #[test]
+    fn connect_request_accepts_the_telegram_test_environment() {
+        let request: ConnectBotRequest = serde_json::from_value(json!({
+            "token": "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef",
+            "test_dc": true
+        }))
+        .expect("test-environment connect request should deserialize");
+
+        assert!(request.test_dc);
+    }
+
+    #[test]
+    fn managed_webhook_recovery_keeps_secret_input_explicit() {
+        let with_secret: ManagedWebhookRecoveryRequest = serde_json::from_value(json!({
+            "existing_webhook_secret": "Current_secret-1"
+        }))
+        .expect("secret recovery request should deserialize");
+        assert_eq!(
+            with_secret.existing_webhook_secret.as_deref(),
+            Some("Current_secret-1")
+        );
+        assert!(!with_secret.existing_webhook_has_no_secret);
+        assert!(with_secret.existing_webhook_ip_address.is_none());
+        assert!(!with_secret.existing_webhook_has_no_ip_address);
+
+        let without_secret: ManagedWebhookRecoveryRequest = serde_json::from_value(json!({
+            "existing_webhook_has_no_secret": true
+        }))
+        .expect("no-secret recovery request should deserialize");
+        assert!(without_secret.existing_webhook_secret.is_none());
+        assert!(without_secret.existing_webhook_has_no_secret);
+
+        let fixed_ip: ManagedWebhookRecoveryRequest = serde_json::from_value(json!({
+            "existing_webhook_secret": "Current_secret-1",
+            "existing_webhook_ip_address": "203.0.113.9"
+        }))
+        .expect("fixed-IP recovery request should deserialize");
+        assert_eq!(
+            fixed_ip.existing_webhook_ip_address.as_deref(),
+            Some("203.0.113.9")
+        );
+        assert!(!fixed_ip.existing_webhook_has_no_ip_address);
+        assert!(without_secret.existing_webhook_has_no_secret);
+    }
+
+    #[test]
+    fn connect_pool_supports_initial_premium_local_placement() {
+        let request: ConnectBotRequest = serde_json::from_value(json!({
+            "token": "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef",
+            "pool": "local"
+        }))
+        .expect("local connect request should deserialize");
+
+        assert_eq!(
+            connect_target_pool(request.pool.as_deref()).unwrap(),
+            DataPlanePool::Local
+        );
+        assert!(connect_target_pool(Some("legacy")).is_err());
     }
 
     #[test]
@@ -1167,11 +1643,14 @@ mod tests {
                     "url": "https://receiver.example/telegram",
                     "has_custom_certificate": false,
                     "allowed_updates": ["message", "callback_query"],
-                    "max_connections": 73
+                    "max_connections": 73,
+                    "ip_address": "203.0.113.7"
                 }
             }),
             API_BASE_URL,
-            false,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: false,
+            },
         )
         .expect("valid webhook information should be accepted")
         .expect("non-empty webhook should be imported");
@@ -1179,9 +1658,10 @@ mod tests {
         assert_eq!(webhook.url, "https://receiver.example/telegram");
         assert_eq!(
             webhook.allowed_updates,
-            json!(["message", "callback_query"])
+            Some(json!(["message", "callback_query"]))
         );
         assert_eq!(webhook.max_connections, 73);
+        assert_eq!(webhook.reported_ip_address.as_deref(), Some("203.0.113.7"));
     }
 
     #[test]
@@ -1196,7 +1676,9 @@ mod tests {
                 }
             }),
             API_BASE_URL,
-            false,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: false,
+            },
         )
         .expect_err("private webhook targets must not be imported");
 
@@ -1214,12 +1696,14 @@ mod tests {
                 }
             }),
             API_BASE_URL,
-            false,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: false,
+            },
         )
         .expect("valid webhook information should be accepted")
         .expect("non-empty webhook should be imported");
 
-        assert_eq!(webhook.allowed_updates, json!([]));
+        assert_eq!(webhook.allowed_updates, None);
     }
 
     #[test]
@@ -1233,11 +1717,34 @@ mod tests {
                 }
             }),
             API_BASE_URL,
-            false,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: false,
+            },
         )
         .expect_err("custom certificate cannot be recovered from Telegram");
 
         assert!(error.to_string().contains("custom certificate"));
+    }
+
+    #[test]
+    fn refuses_an_invalid_reported_webhook_ipv4_before_transfer() {
+        let error = existing_webhook(
+            &json!({
+                "ok": true,
+                "result": {
+                    "url": "https://receiver.example/telegram",
+                    "has_custom_certificate": false,
+                    "ip_address": "2001:db8::1"
+                }
+            }),
+            API_BASE_URL,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: false,
+            },
+        )
+        .expect_err("Telegram webhook transfer accepts only a canonical IPv4 address");
+
+        assert!(error.to_string().contains("invalid IPv4 address"));
     }
 
     #[test]
@@ -1253,7 +1760,9 @@ mod tests {
                 }
             }),
             API_BASE_URL,
-            false,
+            ExistingWebhookPolicy::Cloud {
+                allow_insecure_development: false,
+            },
         )
         .expect("stale managed ingress should be handled");
 

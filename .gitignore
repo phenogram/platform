@@ -1,4 +1,7 @@
 /target/
+/deploy/gateway/target/
+/deploy/gateway/vendor/http/target/
+/deploy/gateway/vendor/hyper/target/
 /.env
 .DS_Store
 *.log

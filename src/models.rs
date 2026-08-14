@@ -8,6 +8,7 @@ pub struct BotRecord {
     pub id: Uuid,
     pub user_id: Uuid,
     pub telegram_bot_id: i64,
+    pub telegram_test_dc: bool,
     pub username: String,
     pub display_name: String,
     pub token_ciphertext: Vec<u8>,
@@ -18,6 +19,7 @@ pub struct BotRecord {
     pub ingress_secret_nonce: Vec<u8>,
     pub status: String,
     pub routing_mode: String,
+    pub data_plane_pool: Option<String>,
     pub update_mode: String,
     pub last_update_at: Option<DateTime<Utc>>,
     pub last_api_call_at: Option<DateTime<Utc>>,
@@ -28,11 +30,13 @@ pub struct BotRecord {
 pub struct BotSummary {
     pub id: Uuid,
     pub telegram_bot_id: i64,
+    pub telegram_test_dc: bool,
     pub username: String,
     pub display_name: String,
     pub public_id: String,
     pub status: String,
     pub routing_mode: String,
+    pub data_plane_pool: Option<String>,
     pub update_mode: String,
     pub last_update_at: Option<DateTime<Utc>>,
     pub last_api_call_at: Option<DateTime<Utc>>,
@@ -47,6 +51,7 @@ pub struct BotSummary {
     pub plan_covered: bool,
     pub effective_retention_days: i32,
     pub retention_warning: Option<String>,
+    pub webhook_secret_required: bool,
 }
 
 #[derive(Debug, Serialize, FromRow)]

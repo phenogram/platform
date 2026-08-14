@@ -2,10 +2,14 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod crypto;
+pub mod data_plane;
 pub mod error;
+pub mod ingestion;
+pub mod lifecycle;
 pub mod models;
 pub mod retention;
 pub mod state;
+pub mod tap;
 pub mod telegram;
 pub mod web;
 
@@ -34,6 +38,10 @@ pub fn app(state: AppState) -> Router {
         .route("/bots", get(api::list_bots).post(api::connect_bot))
         .route("/bots/{bot_id}", get(api::get_bot).delete(api::delete_bot))
         .route("/bots/{bot_id}/provision", post(api::provision_bot))
+        .route(
+            "/bots/{bot_id}/managed-webhook-recovery",
+            post(api::recover_managed_webhook),
+        )
         .route("/bots/{bot_id}/updates", get(api::updates))
         .route("/bots/{bot_id}/updates/stream", get(api::updates_stream))
         .route("/bots/{bot_id}/activity", get(api::activity))
@@ -53,6 +61,11 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/bots/{bot_id}/file-links", post(api::create_file_link))
         .route("/bots/{bot_id}/routing", post(api::change_routing))
+        .route("/internal/data-plane/routes", get(data_plane::routes))
+        .route(
+            "/internal/data-plane/telemetry",
+            post(data_plane::telemetry),
+        )
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -62,7 +75,15 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .nest("/api", api)
         .route("/bot{token}/{method}", any(telegram::proxy_method))
+        .route(
+            "/bot{token}/test/{method}",
+            any(telegram::proxy_test_method),
+        )
         .route("/file/bot{token}/{*file_path}", get(telegram::proxy_file))
+        .route(
+            "/file/bot{token}/test/{*file_path}",
+            get(telegram::proxy_test_file),
+        )
         .route(
             "/telegram/webhook/{public_id}",
             post(telegram::webhook_ingress),

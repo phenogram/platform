@@ -24,6 +24,17 @@ pub struct Config {
     pub telegram_cloud_api_url: String,
     pub telegram_local_api_url: Option<String>,
     pub telegram_local_data_dir: Option<PathBuf>,
+    pub data_plane_enabled: bool,
+    pub data_plane_sync_token: Option<String>,
+    /// Private raw Bot API gateway used by control-plane calls after a route is active.
+    pub data_plane_gateway_url: Option<String>,
+    /// Private gateway admin origin used to fence route withdrawal before logOut.
+    pub data_plane_gateway_admin_url: Option<String>,
+    /// Private direct origins used only by the serialized login/logOut saga.
+    pub data_plane_standard_api_url: Option<String>,
+    pub data_plane_local_api_url: Option<String>,
+    /// Native official Bot API data root shared with the local-pool file sidecar.
+    pub data_plane_official_data_dir: Option<PathBuf>,
     pub session_ttl: Duration,
     pub retention_sweep: Duration,
 }
@@ -86,6 +97,14 @@ impl Config {
             telegram_local_api_url: optional("TELEGRAM_LOCAL_API_URL")
                 .map(|value| value.trim_end_matches('/').to_owned()),
             telegram_local_data_dir: optional("TELEGRAM_LOCAL_DATA_DIR").map(PathBuf::from),
+            data_plane_enabled: parse_bool("DATA_PLANE_ENABLED", false)?,
+            data_plane_sync_token: optional("DATA_PLANE_SYNC_TOKEN"),
+            data_plane_gateway_url: optional_origin("DATA_PLANE_GATEWAY_URL"),
+            data_plane_gateway_admin_url: optional_origin("DATA_PLANE_GATEWAY_ADMIN_URL"),
+            data_plane_standard_api_url: optional_origin("DATA_PLANE_STANDARD_API_URL"),
+            data_plane_local_api_url: optional_origin("DATA_PLANE_LOCAL_API_URL"),
+            data_plane_official_data_dir: optional("DATA_PLANE_OFFICIAL_DATA_DIR")
+                .map(PathBuf::from),
             session_ttl: Duration::from_secs(parse_u64("SESSION_TTL_HOURS", 720)? * 3600),
             retention_sweep: Duration::from_secs(parse_u64("RETENTION_SWEEP_SECONDS", 3600)?),
         };
@@ -175,6 +194,55 @@ impl Config {
         if let Some(origin) = &self.telegram_local_api_url {
             validate_api_origin("TELEGRAM_LOCAL_API_URL", origin, false)?;
         }
+        if self
+            .data_plane_sync_token
+            .as_ref()
+            .is_some_and(|token| token.len() < 32)
+        {
+            return Err(AppError::Config(
+                "DATA_PLANE_SYNC_TOKEN must contain at least 32 bytes".into(),
+            ));
+        }
+        if self.data_plane_enabled && self.data_plane_sync_token.is_none() {
+            return Err(AppError::Config(
+                "DATA_PLANE_SYNC_TOKEN is required when DATA_PLANE_ENABLED is true".into(),
+            ));
+        }
+        for (name, origin) in [
+            ("DATA_PLANE_GATEWAY_URL", &self.data_plane_gateway_url),
+            (
+                "DATA_PLANE_GATEWAY_ADMIN_URL",
+                &self.data_plane_gateway_admin_url,
+            ),
+            (
+                "DATA_PLANE_STANDARD_API_URL",
+                &self.data_plane_standard_api_url,
+            ),
+            ("DATA_PLANE_LOCAL_API_URL", &self.data_plane_local_api_url),
+        ] {
+            if self.data_plane_enabled && origin.is_none() {
+                return Err(AppError::Config(format!(
+                    "{name} is required when DATA_PLANE_ENABLED is true"
+                )));
+            }
+            if let Some(origin) = origin {
+                validate_api_origin(name, origin, false)?;
+            }
+        }
+        if self.data_plane_enabled && self.data_plane_official_data_dir.is_none() {
+            return Err(AppError::Config(
+                "DATA_PLANE_OFFICIAL_DATA_DIR is required when DATA_PLANE_ENABLED is true".into(),
+            ));
+        }
+        if self
+            .data_plane_official_data_dir
+            .as_deref()
+            .is_some_and(|path| !is_normalized_absolute_directory(path))
+        {
+            return Err(AppError::Config(
+                "DATA_PLANE_OFFICIAL_DATA_DIR must be a normalized absolute path below /".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -239,6 +307,27 @@ impl Config {
     }
 }
 
+fn optional_origin(name: &str) -> Option<String> {
+    optional(name).map(|value| value.trim_end_matches('/').to_owned())
+}
+
+fn is_normalized_absolute_directory(path: &std::path::Path) -> bool {
+    use std::path::Component;
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+    let mut normal_components = 0_usize;
+    for component in components {
+        match component {
+            Component::Normal(value) if !value.is_empty() => normal_components += 1,
+            _ => return false,
+        }
+    }
+    normal_components > 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicSurface {
     Landing,
@@ -280,6 +369,18 @@ fn parse_u64(name: &str, fallback: u64) -> Result<u64> {
             value
                 .parse()
                 .map_err(|e| AppError::Config(format!("invalid {name}: {e}")))
+        })
+        .unwrap_or(Ok(fallback))
+}
+
+fn parse_bool(name: &str, fallback: bool) -> Result<bool> {
+    optional(name)
+        .map(|value| match value.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(AppError::Config(format!(
+                "{name} must be true, false, 1, or 0"
+            ))),
         })
         .unwrap_or(Ok(fallback))
 }
@@ -414,6 +515,13 @@ mod tests {
             telegram_cloud_api_url: "https://api.telegram.org".into(),
             telegram_local_api_url: None,
             telegram_local_data_dir: None::<PathBuf>,
+            data_plane_enabled: false,
+            data_plane_sync_token: None,
+            data_plane_gateway_url: None,
+            data_plane_gateway_admin_url: None,
+            data_plane_standard_api_url: None,
+            data_plane_local_api_url: None,
+            data_plane_official_data_dir: None,
             session_ttl: Duration::from_secs(3600),
             retention_sweep: Duration::from_secs(3600),
         }
@@ -424,6 +532,44 @@ mod tests {
         assert_eq!(deployment_revision(None), "local");
         assert_eq!(deployment_revision(Some("  ".into())), "local");
         assert_eq!(deployment_revision(Some("  abc123  ".into())), "abc123");
+    }
+
+    #[test]
+    fn data_plane_secret_is_optional_until_the_data_plane_is_enabled() {
+        let mut value = config(
+            "development",
+            "http://localhost:8080",
+            "http://localhost:8080",
+            "http://localhost:8080",
+        );
+        assert!(value.validate().is_ok());
+        value.data_plane_enabled = true;
+        assert!(value.validate().is_err());
+        value.data_plane_sync_token = Some("short".into());
+        assert!(value.validate().is_err());
+        value.data_plane_sync_token = Some("s".repeat(32));
+        value.data_plane_gateway_url = Some("http://gateway:8080".into());
+        value.data_plane_gateway_admin_url = Some("http://gateway:9090".into());
+        value.data_plane_standard_api_url = Some("http://telegram-standard:8081".into());
+        value.data_plane_local_api_url = Some("http://telegram-local:8081".into());
+        value.data_plane_official_data_dir = Some("/var/lib/telegram-bot-api".into());
+        assert!(value.validate().is_ok());
+    }
+
+    #[test]
+    fn data_plane_official_data_dir_must_be_normalized_and_absolute() {
+        let mut value = config(
+            "development",
+            "http://localhost:8080",
+            "http://localhost:8080",
+            "http://localhost:8080",
+        );
+        value.data_plane_official_data_dir = Some("relative/data".into());
+        assert!(value.validate().is_err());
+        value.data_plane_official_data_dir = Some("/var/lib/../telegram-bot-api".into());
+        assert!(value.validate().is_err());
+        value.data_plane_official_data_dir = Some("/var/lib/telegram-bot-api".into());
+        assert!(value.validate().is_ok());
     }
 
     #[test]

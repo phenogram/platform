@@ -680,6 +680,18 @@ pub async fn csrf_guard(
     request: Request,
     next: Next,
 ) -> Result<Response> {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if crate::data_plane::is_internal_path(request.uri().path())
+        && matches!(
+            state.config.public_surface(host),
+            crate::config::PublicSurface::Unknown
+        )
+    {
+        return Ok(next.run(request).await);
+    }
     if matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS

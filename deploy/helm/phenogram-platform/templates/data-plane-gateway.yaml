@@ -1,0 +1,212 @@
+{{- if and .Values.dataPlane.publicCutover (not .Values.dataPlane.enabled) }}
+{{- fail "dataPlane.publicCutover requires dataPlane.enabled=true" }}
+{{- end }}
+{{- if and .Values.dataPlane.enabled (not .Values.dataPlane.gateway.image.digest) }}
+{{- fail "dataPlane.enabled requires an immutable dataPlane.gateway.image.digest" }}
+{{- end }}
+{{- if and .Values.dataPlane.enabled (not .Values.dataPlane.official.image.digest) }}
+{{- fail "dataPlane.enabled requires an immutable dataPlane.official.image.digest" }}
+{{- end }}
+{{- if and .Values.dataPlane.enabled (not .Values.dataPlane.official.collector.image.digest) }}
+{{- fail "dataPlane.enabled requires an independently pinned dataPlane.official.collector.image.digest" }}
+{{- end }}
+{{- if and .Values.dataPlane.enabled (not .Values.dataPlane.official.fileServer.image.digest) }}
+{{- fail "dataPlane.enabled requires an independently pinned dataPlane.official.fileServer.image.digest" }}
+{{- end }}
+{{- if and .Values.dataPlane.enabled (not .Values.dataPlane.official.collector.enabled) }}
+{{- fail "dataPlane.enabled requires the official observer/control sidecar" }}
+{{- end }}
+{{- if and .Values.dataPlane.publicCutover .Values.telegramBotApi.enabled }}
+{{- fail "dataPlane.publicCutover requires telegramBotApi.enabled=false to prevent two local servers owning the same bot" }}
+{{- end }}
+{{- if .Values.dataPlane.enabled }}
+{{- $fullname := include "phenogram.fullname" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-data-plane-gateway-headless
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane-gateway
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: public-http
+      port: {{ .Values.dataPlane.gateway.publicPort }}
+      targetPort: public-http
+      protocol: TCP
+    - name: admin-http
+      port: {{ .Values.dataPlane.gateway.adminPort }}
+      targetPort: admin-http
+      protocol: TCP
+  selector:
+    {{- include "phenogram.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane-gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-data-plane-gateway
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane-gateway
+spec:
+  type: ClusterIP
+  ports:
+    - name: public-http
+      port: {{ .Values.dataPlane.gateway.publicPort }}
+      targetPort: public-http
+      protocol: TCP
+    - name: admin-http
+      port: {{ .Values.dataPlane.gateway.adminPort }}
+      targetPort: admin-http
+      protocol: TCP
+  selector:
+    {{- include "phenogram.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane-gateway
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-data-plane-gateway
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane-gateway
+spec:
+  replicas: 1
+  serviceName: {{ $fullname }}-data-plane-gateway-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: data-plane-gateway
+  template:
+    metadata:
+      labels:
+        {{- include "phenogram.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: data-plane-gateway
+    spec:
+      serviceAccountName: {{ include "phenogram.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.dataPlane.gateway.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10003
+        runAsGroup: 10003
+        fsGroup: 10003
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: {{ include "phenogram.dataPlaneGatewayImage" . | quote }}
+          imagePullPolicy: {{ .Values.dataPlane.gateway.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          ports:
+            - name: public-http
+              containerPort: {{ .Values.dataPlane.gateway.publicPort }}
+              protocol: TCP
+            - name: admin-http
+              containerPort: {{ .Values.dataPlane.gateway.adminPort }}
+              protocol: TCP
+          env:
+            - name: PUBLIC_LISTEN_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.dataPlane.gateway.publicPort | quote }}
+            - name: ADMIN_LISTEN_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.dataPlane.gateway.adminPort | quote }}
+            - name: STANDARD_UPSTREAM_URL
+              value: {{ printf "http://%s-telegram-standard:%v" $fullname .Values.dataPlane.official.port | quote }}
+            - name: LOCAL_UPSTREAM_URL
+              value: {{ printf "http://%s-telegram-local:%v" $fullname .Values.dataPlane.official.port | quote }}
+            - name: STANDARD_FILE_UPSTREAM_URL
+              value: {{ printf "http://%s-telegram-standard:%v" $fullname .Values.dataPlane.official.fileServer.port | quote }}
+            - name: LOCAL_FILE_UPSTREAM_URL
+              value: {{ printf "http://%s-telegram-local:%v" $fullname .Values.dataPlane.official.fileServer.port | quote }}
+            - name: STANDARD_OFFICIAL_CONTROL_URL
+              value: {{ printf "http://%s-telegram-standard:%v/internal/official/drain" $fullname .Values.dataPlane.official.collector.controlPort | quote }}
+            - name: LOCAL_OFFICIAL_CONTROL_URL
+              value: {{ printf "http://%s-telegram-local:%v/internal/official/drain" $fullname .Values.dataPlane.official.collector.controlPort | quote }}
+            - name: ROUTE_SNAPSHOT_URL
+              value: {{ .Values.dataPlane.gateway.routeSnapshot.url | quote }}
+            - name: ROUTE_SNAPSHOT_PATH
+              value: {{ .Values.dataPlane.gateway.routeSnapshot.path | quote }}
+            - name: ROUTE_REFRESH_SECONDS
+              value: {{ .Values.dataPlane.gateway.routeSnapshot.refreshSeconds | quote }}
+            - name: TELEMETRY_URL
+              value: {{ .Values.dataPlane.gateway.telemetry.url | quote }}
+            - name: TELEMETRY_QUEUE_CAPACITY
+              value: {{ .Values.dataPlane.gateway.telemetry.queueCapacity | quote }}
+            - name: PUBLIC_ID_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.publicIdKeyKey }}
+            - name: DATA_PLANE_SYNC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.dataPlaneSyncTokenKey }}
+            - name: RUST_LOG
+              value: phenogram_data_plane_gateway=info
+          volumeMounts:
+            - name: snapshot
+              mountPath: /var/lib/phenogram-gateway
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: admin-http
+            failureThreshold: {{ .Values.dataPlane.gateway.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.dataPlane.gateway.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.dataPlane.gateway.probes.startup.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: admin-http
+            failureThreshold: {{ .Values.dataPlane.gateway.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.dataPlane.gateway.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.dataPlane.gateway.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: admin-http
+            failureThreshold: {{ .Values.dataPlane.gateway.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.dataPlane.gateway.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.dataPlane.gateway.probes.liveness.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.dataPlane.gateway.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: snapshot
+        labels:
+          {{- include "phenogram.labels" . | nindent 10 }}
+          app.kubernetes.io/component: data-plane-gateway
+        {{- if .Values.dataPlane.gateway.persistence.retain }}
+        annotations:
+          helm.sh/resource-policy: keep
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.dataPlane.gateway.persistence.accessModes | nindent 10 }}
+        {{- with .Values.dataPlane.gateway.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.dataPlane.gateway.persistence.size }}
+{{- end }}

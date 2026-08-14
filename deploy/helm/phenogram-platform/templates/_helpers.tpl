@@ -55,6 +55,40 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end }}
 
+{{- define "phenogram.dataPlaneGatewayImage" -}}
+{{- if .Values.dataPlane.gateway.image.digest -}}
+{{ printf "%s@%s" .Values.dataPlane.gateway.image.repository .Values.dataPlane.gateway.image.digest }}
+{{- else -}}
+{{ printf "%s:%s" .Values.dataPlane.gateway.image.repository (default .Chart.AppVersion .Values.dataPlane.gateway.image.tag) }}
+{{- end -}}
+{{- end }}
+
+{{- define "phenogram.dataPlaneTelegramImage" -}}
+{{- if .Values.dataPlane.official.image.digest -}}
+{{ printf "%s@%s" .Values.dataPlane.official.image.repository .Values.dataPlane.official.image.digest }}
+{{- else -}}
+{{ printf "%s:%s" .Values.dataPlane.official.image.repository (default .Chart.AppVersion .Values.dataPlane.official.image.tag) }}
+{{- end -}}
+{{- end }}
+
+{{- define "phenogram.dataPlaneFileServerImage" -}}
+{{- if .Values.dataPlane.official.fileServer.image.digest -}}
+{{ printf "%s@%s" .Values.dataPlane.official.fileServer.image.repository .Values.dataPlane.official.fileServer.image.digest }}
+{{- else -}}
+{{ printf "%s:%s" .Values.dataPlane.official.fileServer.image.repository (default .Chart.AppVersion .Values.dataPlane.official.fileServer.image.tag) }}
+{{- end -}}
+{{- end }}
+
+{{- define "phenogram.dataPlaneCollectorImage" -}}
+{{- if .Values.dataPlane.official.collector.image.digest -}}
+{{ printf "%s@%s" .Values.dataPlane.official.collector.image.repository .Values.dataPlane.official.collector.image.digest }}
+{{- else if .Values.image.digest -}}
+{{ printf "%s@%s" .Values.dataPlane.official.collector.image.repository .Values.image.digest }}
+{{- else -}}
+{{ printf "%s:%s" .Values.dataPlane.official.collector.image.repository (default .Chart.AppVersion .Values.dataPlane.official.collector.image.tag) }}
+{{- end -}}
+{{- end }}
+
 {{- define "phenogram.postgresImage" -}}
 {{- if .Values.postgresql.image.digest -}}
 {{ printf "%s@%s" .Values.postgresql.image.repository .Values.postgresql.image.digest }}

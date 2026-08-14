@@ -17,6 +17,8 @@ pub enum AppError {
     Database(#[from] sqlx::Error),
     #[error("upstream service error: {0}")]
     Upstream(String),
+    #[error("the data-plane gateway is still draining admitted requests")]
+    GatewayDrainPending,
     #[error("invalid request: {0}")]
     Validation(String),
     #[error("authentication required")]
@@ -27,6 +29,13 @@ pub enum AppError {
     NotFound,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("existing webhook secret required for {destination_host}")]
+    WebhookSecretRequired { destination_host: String },
+    #[error("existing webhook IP-address intent required for {destination_host}")]
+    WebhookIpAddressResolutionRequired {
+        destination_host: String,
+        reported_ip_address: String,
+    },
     #[error("plan limit reached: {0}")]
     PlanLimit(String),
     #[error("rate limit exceeded")]
@@ -44,6 +53,14 @@ struct ErrorBody {
 struct ErrorDetail {
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires_webhook_secret: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires_webhook_ip_address_resolution: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reported_ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination_host: Option<String>,
 }
 
 impl IntoResponse for AppError {
@@ -59,6 +76,12 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_GATEWAY,
                 "telegram_unavailable",
                 "Telegram is temporarily unavailable".to_owned(),
+            ),
+            Self::GatewayDrainPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "data_plane_draining",
+                "Phenogram is waiting for admitted Bot API requests to finish before continuing safely."
+                    .to_owned(),
             ),
             Self::Validation(message) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -81,6 +104,18 @@ impl IntoResponse for AppError {
                 "The requested resource was not found".to_owned(),
             ),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.clone()),
+            Self::WebhookSecretRequired { .. } => (
+                StatusCode::CONFLICT,
+                "webhook_secret_required",
+                "This bot already has a webhook. Enter its current secret token, or declare that it does not use one, so Phenogram can transfer it without breaking delivery."
+                    .to_owned(),
+            ),
+            Self::WebhookIpAddressResolutionRequired { .. } => (
+                StatusCode::CONFLICT,
+                "webhook_ip_address_resolution_required",
+                "Telegram reports a current webhook IPv4 address but does not reveal whether it was explicitly pinned. Choose whether to preserve that exact address or continue with DNS resolution before Phenogram transfers the webhook."
+                    .to_owned(),
+            ),
             Self::PlanLimit(message) => {
                 (StatusCode::PAYMENT_REQUIRED, "plan_limit", message.clone())
             }
@@ -93,12 +128,36 @@ impl IntoResponse for AppError {
         if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");
         }
+        let (
+            requires_webhook_secret,
+            requires_webhook_ip_address_resolution,
+            destination_host,
+            reported_ip_address,
+        ) = match &self {
+            Self::WebhookSecretRequired { destination_host } => {
+                (Some(true), None, Some(destination_host.clone()), None)
+            }
+            Self::WebhookIpAddressResolutionRequired {
+                destination_host,
+                reported_ip_address,
+            } => (
+                None,
+                Some(true),
+                Some(destination_host.clone()),
+                Some(reported_ip_address.clone()),
+            ),
+            _ => (None, None, None, None),
+        };
         let mut response = (
             status,
             Json(ErrorBody {
                 error: ErrorDetail {
                     code,
                     message: public_message,
+                    requires_webhook_secret,
+                    requires_webhook_ip_address_resolution,
+                    reported_ip_address,
+                    destination_host,
                 },
             }),
         )

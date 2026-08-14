@@ -105,6 +105,17 @@ pub async fn public_host_guard(
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok());
+    if crate::data_plane::is_internal_path(request.uri().path()) {
+        return if matches!(state.config.public_surface(host), PublicSurface::Unknown) {
+            next.run(request).await
+        } else {
+            json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "The requested resource was not found",
+            )
+        };
+    }
     match state
         .config
         .public_request_access(host, request.uri().path())
@@ -208,6 +219,13 @@ mod tests {
             telegram_cloud_api_url: "https://api.telegram.org".into(),
             telegram_local_api_url: None,
             telegram_local_data_dir: None,
+            data_plane_enabled: true,
+            data_plane_sync_token: Some("d".repeat(32)),
+            data_plane_gateway_url: Some("http://gateway:8080".into()),
+            data_plane_gateway_admin_url: Some("http://gateway:9090".into()),
+            data_plane_standard_api_url: Some("http://telegram-standard:8081".into()),
+            data_plane_local_api_url: Some("http://telegram-local:8081".into()),
+            data_plane_official_data_dir: Some("/var/lib/telegram-bot-api".into()),
             session_ttl: Duration::from_secs(3600),
             retention_sweep: Duration::from_secs(3600),
         };
@@ -270,6 +288,77 @@ mod tests {
             response(&app, "attacker.example", "/").await.status(),
             axum::http::StatusCode::MISDIRECTED_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn internal_route_snapshot_is_hidden_publicly_and_bearer_protected_internally() {
+        let app = test_app();
+        let public = response(&app, "app.phenogram.io", crate::data_plane::ROUTES_PATH).await;
+        assert_eq!(public.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let missing = response(&app, "phenogram", crate::data_plane::ROUTES_PATH).await;
+        assert_eq!(missing.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+
+        let authenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(crate::data_plane::ROUTES_PATH)
+                    .header(axum::http::header::HOST, "phenogram")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", "d".repeat(32)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The test pool has no server. A valid caller must receive an explicit
+        // unavailable response, never a partial or fabricated empty snapshot.
+        assert_eq!(
+            authenticated.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let telemetry_without_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(crate::data_plane::TELEMETRY_PATH)
+                    .header(axum::http::header::HOST, "phenogram")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            telemetry_without_auth.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+
+        let public_telemetry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(crate::data_plane::TELEMETRY_PATH)
+                    .header(axum::http::header::HOST, "api.phenogram.io")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", "d".repeat(32)),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_telemetry.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -24,6 +24,16 @@ spec:
       ports:
         - port: 8080
           protocol: TCP
+    {{- if .Values.dataPlane.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: data-plane-gateway
+      ports:
+        - port: 8080
+          protocol: TCP
+    {{- end }}
   egress:
     - ports:
         - port: 53
@@ -38,6 +48,26 @@ spec:
       ports:
         - port: {{ .Values.postgresql.port }}
           protocol: TCP
+    {{- if .Values.dataPlane.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: data-plane-gateway
+      ports:
+        - port: {{ .Values.dataPlane.gateway.publicPort }}
+          protocol: TCP
+        - port: {{ .Values.dataPlane.gateway.adminPort }}
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: telegram-bot-api
+      ports:
+        - port: {{ .Values.dataPlane.official.port }}
+          protocol: TCP
+    {{- end }}
     - ports:
         - port: 80
           protocol: TCP
@@ -68,6 +98,12 @@ spec:
             matchLabels:
               {{- include "phenogram.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: app
+        {{- if .Values.dataPlane.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: telegram-bot-api
+        {{- end }}
         {{- if .Values.postgresql.backup.enabled }}
         - podSelector:
             matchLabels:

@@ -232,6 +232,11 @@
   const botNeedsRetentionWarning = (bot) => isManagedBot(bot)
     && (botRetentionWarning(bot) != null || bot?.plan_covered === false || botRetentionDays(bot) <= 1);
   const telegramBotId = (bot) => String(bot?.telegram_bot_id || bot?.telegram_id || "");
+  const botUsesTestEnvironment = (bot) => bot?.telegram_test_dc === true;
+  const botEnvironmentLabel = (bot) => botUsesTestEnvironment(bot) ? "Telegram Test" : "Telegram Production";
+  const renderBotEnvironmentBadge = (bot) => botUsesTestEnvironment(bot)
+    ? '<span class="badge badge--info">Test</span>'
+    : "";
   const findManagerBot = (bot) => {
     const managerId = botManagerId(bot);
     if (managerId) {
@@ -1177,7 +1182,7 @@
           </div>
         </section>
 
-        <div class="trust-strip"><div class="trust-item"><strong>Drop-in compatible</strong> with the Telegram Bot API</div><div class="trust-item"><strong>Encrypted credentials</strong> never shown after setup</div><div class="trust-item"><strong>Built in Rust</strong> for predictable performance</div></div>
+        <div class="trust-strip"><div class="trust-item"><strong>Drop-in compatible</strong> with the Telegram Bot API</div><div class="trust-item"><strong>Private credentials</strong> never shown after setup</div><div class="trust-item"><strong>Built in Rust</strong> for predictable performance</div></div>
 
         <section class="landing-section landing-section--light" id="platform"><div class="landing-section__inner">
           <div class="section-heading"><p class="eyebrow">One control plane</p><h2>See every update. Understand every failure.</h2><p>Phenogram sits between your bot and Telegram, preserving the API contract while making the invisible parts of production visible.</p></div>
@@ -1185,13 +1190,13 @@
             <article class="feature-card feature-card--wide"><div class="feature-card__icon">${icon("pulse")}</div><h3>Durable update history</h3><p>Search the exact payload your bot received, inspect delivery attempts, and trace failures without reconstructing production from scattered logs.</p><div class="feature-card__visual"><div class="mini-event"><span class="mini-event__dot"></span><strong>message</strong><code>update_914022</code><time>12 ms</time></div><div class="mini-event"><span class="mini-event__dot mini-event__dot--violet"></span><strong>callback_query</strong><code>update_914021</code><time>18 ms</time></div></div></article>
             <article class="feature-card"><div class="feature-card__icon feature-card__icon--mint">${icon("message")}</div><h3>Bot View</h3><p>Experience conversations as your bot does. Inspect context and safely reply as the bot from one operator console.</p></article>
             <article class="feature-card"><div class="feature-card__icon feature-card__icon--violet">${icon("link")}</div><h3>Flexible delivery</h3><p>Start with a reliable live stream and add new delivery models as your architecture grows.</p></article>
-            <article class="feature-card feature-card--wide"><div class="feature-card__icon">${icon("shield")}</div><h3>Share without leaking tokens</h3><p>Use scoped, expiring public references for downloads and event access. Bot credentials stay encrypted and out of URLs, logs, and browser history.</p><div class="feature-card__visual feature-card__visual--code mono">/public/<span class="text-primary">phg_a8c2…</span>/files/report.pdf?expires=…&amp;sig=…</div></article>
+            <article class="feature-card feature-card--wide"><div class="feature-card__icon">${icon("shield")}</div><h3>Share without leaking tokens</h3><p>Public share links use scoped, expiring references instead of bot tokens.</p><div class="feature-card__visual feature-card__visual--code mono">/public/<span class="text-primary">phg_a8c2…</span>/files/report.pdf?expires=…&amp;sig=…</div></article>
           </div>
         </div></section>
 
         <section class="landing-section landing-section--dark" id="workflow"><div class="landing-section__inner">
           <div class="section-heading"><p class="eyebrow">Two-minute migration</p><h2>Your bot code stays yours.</h2><p>Prove ownership with the BotFather token, point your client at Phenogram, and watch the first update arrive.</p></div>
-          <div class="steps"><article class="step"><h3>Connect securely</h3><p>We verify the token with Telegram, show you the bot identity, then encrypt the credential. It cannot be viewed again.</p></article><article class="step"><h3>Change one host</h3><p>Replace api.telegram.org with api.phenogram.io. Methods, payloads, and responses remain familiar.</p></article><article class="step"><h3>Ship with context</h3><p>Use the dashboard to follow API calls, updates, conversations, and delivery health in real time.</p></article></div>
+          <div class="steps"><article class="step"><h3>Connect securely</h3><p>We verify the token with Telegram, store the application credential securely, and never display it again.</p></article><article class="step"><h3>Change one host</h3><p>Replace api.telegram.org with api.phenogram.io. Methods, payloads, and responses remain familiar.</p></article><article class="step"><h3>Ship with context</h3><p>Use the dashboard to follow API calls, updates, conversations, and delivery health in real time.</p></article></div>
           <div class="code-slab"><span class="prompt">$</span> export TELEGRAM_API_BASE=<span class="host">https://api.phenogram.io</span><br><span class="code-slab__comment"># Keep your bot token in the server environment—never in frontend code.</span></div>
         </div></section>
 
@@ -1206,7 +1211,7 @@
 
         <section class="landing-section landing-section--dark" id="security"><div class="landing-section__inner security-band">
           <div class="security-orbit">${icon("lock")}</div>
-          <div class="security-copy"><p class="eyebrow">Designed for sensitive credentials</p><h2>Your bot token stays private.</h2><p>Phenogram verifies a bot server-side, encrypts the token at rest, and redacts credentials from request history. Public bot keys identify; they never authorize API calls.</p><div class="security-list"><div>${icon("check")}Encrypted token storage</div><div>${icon("check")}Expiring, scoped file links</div><div>${icon("check")}Audited operator actions</div><div>${icon("check")}Explicit bot deletion controls</div></div></div>
+          <div class="security-copy"><p class="eyebrow">Designed for sensitive credentials</p><h2>Your token is never shown again.</h2><p>Phenogram encrypts the credential in its application database and never displays it again. The official Bot API server uses its native storage format. Request history is credential-redacted, and public bot keys identify rather than authorize.</p><div class="security-list"><div>${icon("check")}Encrypted application credentials</div><div>${icon("check")}Expiring, scoped file links</div><div>${icon("check")}Audited operator actions</div><div>${icon("check")}Explicit bot deletion controls</div></div></div>
         </div></section>
 
         <section class="final-cta"><h2>Make your next bot easier to operate.</h2><p>Connect one bot for free and see what it sees—without rewriting the integration you already trust.</p><a class="btn btn--primary btn--lg" href="${esc(appHref("/login"))}">Start with one free bot ${icon("arrow")}</a></section>
@@ -1221,7 +1226,7 @@
         <p class="eyebrow">Privacy</p><h1>Minimal identity, by design.</h1><p class="privacy-lead">Phenogram uses Google or GitHub only to recognize your account. We do not request, receive, or store your email address.</p>
         <section><h2>Identity data we use</h2><p>When you choose social sign-in, we store the provider name, its stable account identifier, and the public profile fields needed to show your identity in the console: display name, username, and avatar URL. Your provider password is never shared with Phenogram.</p></section>
         <section><h2>Why we use it</h2><p>The stable provider identifier lets us return you to the same Phenogram workspace. Public profile fields make that account recognizable to you. We do not use this data for advertising or sell it.</p></section>
-        <section><h2>Operational data</h2><p>Phenogram stores the bot configuration, updates, API activity, and operator actions needed to provide the platform. Bot tokens are encrypted at rest. Retention depends on the selected membership plan.</p></section>
+        <section><h2>Operational data</h2><p>Phenogram stores the bot configuration, updates, API activity, and operator actions needed to provide the platform. Credentials are encrypted in Phenogram's application database and never displayed again. The official Bot API server uses its native storage format. Retention depends on the selected membership plan.</p></section>
         <section><h2>Deletion</h2><p>You can delete individual bots and their Phenogram data from the console. Account deletion requests are handled through the public project.</p></section>
         <section><h2>Open development</h2><p>Phenogram is developed publicly. Privacy questions and account-deletion requests can be submitted through the <a href="https://github.com/phenogram/platform/issues" target="_blank" rel="noreferrer">Phenogram platform issue tracker</a>. Do not include bot tokens or other secrets in a public issue.</p></section>
         <p class="privacy-updated">Effective August 13, 2026</p>
@@ -1286,7 +1291,7 @@
     const meta = managed
       ? `Managed by ${managerLabel(bot)} · ${retentionLabel(bot)}`
       : `${botUsername(bot)}${descendants ? ` · ${descendants} managed bot${descendants === 1 ? "" : "s"}` : ""}`;
-    return `<li><button class="bot-picker-item ${managed ? "is-managed" : ""} ${selected ? "active" : ""} ${warning ? "has-warning" : ""}" type="button" data-action="pick-bot" data-bot-id="${esc(id)}" aria-pressed="${selected ? "true" : "false"}"><span class="bot-avatar">${initials(botName(bot))}</span><span class="bot-picker-item__copy"><span><strong>${esc(botName(bot))}</strong>${managed ? '<em>Managed</em>' : ""}</span><small>${esc(meta)}</small></span>${warning ? '<span class="badge badge--warning">24-hour history</span>' : selected ? icon("check") : icon("chevron")}</button>${node.children.length ? `<ul>${node.children.map(renderPickerBotNode).join("")}</ul>` : ""}</li>`;
+    return `<li><button class="bot-picker-item ${managed ? "is-managed" : ""} ${selected ? "active" : ""} ${warning ? "has-warning" : ""}" type="button" data-action="pick-bot" data-bot-id="${esc(id)}" aria-pressed="${selected ? "true" : "false"}"><span class="bot-avatar">${initials(botName(bot))}</span><span class="bot-picker-item__copy"><span><strong>${esc(botName(bot))}</strong>${managed ? '<em>Managed</em>' : ""}${renderBotEnvironmentBadge(bot)}</span><small>${esc(meta)}</small></span>${warning ? '<span class="badge badge--warning">24-hour history</span>' : selected ? icon("check") : icon("chevron")}</button>${node.children.length ? `<ul>${node.children.map(renderPickerBotNode).join("")}</ul>` : ""}</li>`;
   }
 
   function renderBotPickerTree() {
@@ -1468,17 +1473,18 @@
   }
 
   function renderHealthHero(bot) {
+    const webhookRecoveryRequired = bot?.webhook_secret_required === true;
     const status = botStatus(bot);
     const bad = ["invalid", "token_invalid", "error", "disabled", "failed"].includes(status);
     const provisioning = ["provisioning", "setup", "pending"].includes(status);
     const degraded = ["degraded", "warning"].includes(status);
     const unknown = !bad && !provisioning && !degraded && !["active", "healthy", "ready", "ok"].includes(status);
     const warning = provisioning || degraded || unknown;
-    const title = bad ? "This bot needs attention" : degraded ? "This bot is degraded" : provisioning ? "Webhook provisioning is in progress" : unknown ? "Bot status is unavailable" : "Bot is healthy";
-    const copy = bad ? "Verify the bot token and review recent API activity." : degraded ? "The bot is connected, but an upstream setup step failed. Review its recent activity." : provisioning ? "Phenogram is registering its upstream webhook. Activity will appear when Telegram starts delivering updates." : unknown ? "Refresh this workspace before assuming the bot is ready." : "Phenogram is receiving and processing activity normally.";
+    const title = webhookRecoveryRequired ? "Webhook details are needed to continue this managed bot" : bad ? "This bot needs attention" : degraded ? "This bot is degraded" : provisioning ? "Webhook provisioning is in progress" : unknown ? "Bot status is unavailable" : "Bot is healthy";
+    const copy = webhookRecoveryRequired ? "The native webhook remains active and unchanged. Phenogram API routing is paused until you confirm its authentication and IP behavior." : bad ? "Verify the bot token and review recent API activity." : degraded ? "The bot is connected, but an upstream setup step failed. Review its recent activity." : provisioning ? "Phenogram is registering its upstream webhook. Activity will appear when Telegram starts delivering updates." : unknown ? "Refresh this workspace before assuming the bot is ready." : "Phenogram is receiving and processing activity normally.";
     const lastUpdate = bot.last_update_at || bot.last_update || bot.latest_update_at;
     const lastApi = bot.last_api_call_at || bot.last_api_request_at || bot.last_request_at || bot.latest_activity_at;
-    return `<section class="health-hero ${bad ? "is-error" : warning ? "is-warning" : ""}"><span class="health-hero__icon">${icon(bad ? "alert" : warning ? "clock" : "check")}</span><div class="health-hero__copy"><h2>${title}</h2><p>${copy}</p></div><div class="health-hero__meta"><div><span>Last update</span><strong>${esc(relativeTime(lastUpdate))}</strong></div><div><span>Last API call</span><strong>${esc(relativeTime(lastApi))}</strong></div><div><span>Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div></section>`;
+    return `<section class="health-hero ${bad ? "is-error" : warning || webhookRecoveryRequired ? "is-warning" : ""}"><span class="health-hero__icon">${icon(bad || webhookRecoveryRequired ? "alert" : warning ? "clock" : "check")}</span><div class="health-hero__copy"><h2>${title}</h2><p>${copy}</p>${webhookRecoveryRequired ? `<button class="btn btn--secondary btn--sm btn--top-gap" type="button" data-action="open-managed-webhook-recovery">Resolve webhook transfer</button>` : ""}</div><div class="health-hero__meta"><div><span>Last update</span><strong>${esc(relativeTime(lastUpdate))}</strong></div><div><span>Last API call</span><strong>${esc(relativeTime(lastApi))}</strong></div><div><span>Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div></section>`;
   }
 
   function renderMetrics(bot) {
@@ -1540,7 +1546,7 @@
 
   function renderBotCard(bot, managedCount = 0) {
     const id = botId(bot);
-    return `<a class="bot-card bot-family__root" href="${botPath(id, "overview")}"><div class="bot-card__top"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><span class="bot-card__copy"><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></span>${renderBotStatusBadge(bot)}</div><div class="bot-card__meta"><div><span class="stat-label">Last update</span><strong>${esc(relativeTime(bot.last_update_at || bot.last_update))}</strong></div><div><span class="stat-label">Managed bots</span><strong>${managedCount}</strong></div><div><span class="stat-label">Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div><div class="bot-card__foot"><span>Connected bot</span><span>Open workspace ${icon("arrow")}</span></div></a>`;
+    return `<a class="bot-card bot-family__root" href="${botPath(id, "overview")}"><div class="bot-card__top"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><span class="bot-card__copy"><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></span>${renderBotEnvironmentBadge(bot)}${renderBotStatusBadge(bot)}</div><div class="bot-card__meta"><div><span class="stat-label">Last update</span><strong>${esc(relativeTime(bot.last_update_at || bot.last_update))}</strong></div><div><span class="stat-label">Managed bots</span><strong>${managedCount}</strong></div><div><span class="stat-label">Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div><div class="bot-card__foot"><span>Connected bot</span><span>Open workspace ${icon("arrow")}</span></div></a>`;
   }
 
   function renderBotOverview() {
@@ -1674,7 +1680,7 @@
   function renderIntegration() {
     const bot = currentBot();
     if (!bot) return `<div class="page">${renderNoBots()}</div>`;
-    const apiBase = bot.integration?.api_base || `${window.location.origin}/bot${"${BOT_TOKEN}"}`;
+    const apiBase = bot.integration?.api_base || `${window.location.origin}/bot${"${BOT_TOKEN}"}${botUsesTestEnvironment(bot) ? "/test" : ""}`;
     const endpoint = `${String(apiBase).replace(/\/$/, "")}/${"${METHOD}"}`;
     return `<div class="page">
       ${pageHeader("Delivery & API", `Connect ${botName(bot)} to the compatible API gateway and create scoped stream credentials.`)}
@@ -1719,7 +1725,17 @@
 
   function renderRoutingSettings(bot) {
     const currentMode = String(bot.routing_mode || "cloud").toLowerCase();
+    const currentPool = ["standard", "local"].includes(String(bot.data_plane_pool || "").toLowerCase())
+      ? String(bot.data_plane_pool).toLowerCase()
+      : "";
     const localEligible = Boolean(state.membership?.local_bot_api);
+    if (currentPool) {
+      const poolLabel = currentPool === "local" ? "Phenogram Local" : "Phenogram Standard";
+      const poolDescription = currentPool === "local"
+        ? "Uses Phenogram's official local Bot API pool with extended file support."
+        : "Uses Phenogram's official Bot API pool with Telegram-compatible request and delivery behavior.";
+      return `<section class="panel panel--spaced"><div class="panel__head"><div><h2>Telegram API routing</h2><p>Bot API calls, polling, webhooks, and files use the official Telegram server operated by Phenogram.</p></div><span class="badge badge--info">${esc(poolLabel)}</span></div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Current backend</h3><p>All Bot API calls and file requests use this route.</p></div><div class="routing-choice"><strong>${esc(poolLabel)}</strong><span>${esc(poolDescription)}</span></div></div></div></section>`;
+    }
     const modeLabel = currentMode === "local" ? "Local Bot API" : "Telegram cloud";
     const targetMode = currentMode === "local" ? "cloud" : "local";
     const targetLabel = targetMode === "local" ? "Local Bot API" : "Telegram cloud";
@@ -1736,14 +1752,18 @@
     const connectedManager = managed && Boolean(botManagerId(bot));
     const descendants = managedDescendantCount(bot);
     const credentialRow = managed
-      ? `<div class="settings-row"><div class="settings-row__intro"><h3>Bot credential</h3><p>Kept current through ${esc(managerLabel(bot))}.</p></div><div class="form-note">${icon("lock")}The credential stays encrypted. Phenogram refreshes it automatically from the manager after Telegram reports a token change.</div></div>`
-      : `<div class="settings-row"><div class="settings-row__intro"><h3>Bot token</h3><p>Phenogram does not reveal stored credentials.</p></div><div class="form-note">${icon("lock")}The bot token is encrypted and cannot be viewed after connection. If it may be exposed, revoke it through BotFather and reconnect the bot.</div></div>`;
+      ? `<div class="settings-row"><div class="settings-row__intro"><h3>Bot credential</h3><p>Kept current through ${esc(managerLabel(bot))}.</p></div><div class="form-note">${icon("lock")}Phenogram encrypts the credential in its application database and refreshes it automatically after Telegram reports a token change. The official Bot API server uses its native storage format.</div></div>`
+      : `<div class="settings-row"><div class="settings-row__intro"><h3>Bot token</h3><p>Phenogram does not reveal stored credentials.</p></div><div class="form-note">${icon("lock")}Phenogram encrypts the bot token in its application database and never displays it again. The official Bot API server uses its native storage format. If the token may be exposed, revoke it through BotFather.</div></div>`;
+    const webhookRecoveryPanel = bot.webhook_secret_required === true
+      ? `<section class="panel panel--spaced"><div class="panel__head"><div><h2>Managed bot setup paused</h2><p>The existing Telegram webhook is still active and unchanged; Phenogram API routing is paused.</p></div><span class="badge badge--warning">Action needed</span></div><div class="settings-row"><div class="settings-row__intro"><h3>Preserve webhook authentication</h3><p>Telegram does not reveal the receiver’s current secret header. If the webhook uses a custom certificate, replace it with a publicly trusted certificate before continuing.</p></div><div><button class="btn btn--primary" type="button" data-action="open-managed-webhook-recovery">${icon("refresh")}Continue setup</button></div></div></section>`
+      : "";
     const removalPanel = connectedManager
       ? `<section class="panel panel--spaced"><div class="panel__head"><div><h2>Managed relationship</h2><p>This bot is maintained through ${esc(managerLabel(bot))}</p></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Automatic availability</h3><p>Managed bots stay in the workspace while their manager relationship is active.</p></div><div class="form-note">${icon("info")}This bot cannot be removed separately while ${esc(managerLabel(bot))} manages it.</div></div></section>`
       : `<section class="panel panel--spaced danger-zone"><div class="panel__head"><div><h2>Danger zone</h2><p>Permanent workspace actions</p></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Delete this bot</h3><p>${managed ? "Remove this managerless managed bot and its stored Phenogram data." : `Disconnect the token and remove its stored data.${descendants ? ` ${descendants} managed bot${descendants === 1 ? "" : "s"} beneath it will remain in Phenogram; direct children become managerless.` : ""}`}</p></div><div><button class="btn btn--danger" type="button" data-action="confirm-delete-bot">${icon("trash")}Delete ${esc(botName(bot))}</button></div></div></section>`;
     return `<div class="page page--narrow">
       ${pageHeader("Bot settings", `Ownership, credentials, and stored data for ${botName(bot)}.`)}
-      <section class="panel"><div class="panel__head"><div><h2>Telegram identity</h2><p>Verified server-side using Telegram getMe</p></div>${verified ? renderBotStatusBadge(bot) : '<span class="badge badge--danger">Token invalid</span>'}</div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Bot</h3><p>The Telegram identity associated with this workspace bot.</p></div><div class="identity-card"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><div><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}${managed ? ` · Managed by ${esc(managerLabel(bot))}` : ""}</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Platform status</h3><p>Current provisioning and delivery state reported by Phenogram.</p></div><div>${renderBotStatusBadge(bot)}</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Public identifier</h3><p>Identifies this bot without authorizing Telegram API calls.</p></div><div><div class="fingerprint">${esc(fingerprint)}</div><p class="field__hint field__hint--spaced">This value is safe to reference publicly. Signed file links still expire separately.</p></div></div>${credentialRow}<div class="settings-row"><div class="settings-row__intro"><h3>Data retention</h3><p>Updates outside this window are removed automatically.</p></div><div><strong class="settings-value">${esc(retentionValue(bot))}</strong><p class="field__hint field__hint--compact-spaced">${botNeedsRetentionWarning(bot) ? "This managed bot is outside full-history coverage." : `Covered by your ${esc(membershipPlan())} plan.`}</p></div></div></div></section>
+      <section class="panel"><div class="panel__head"><div><h2>Telegram identity</h2><p>Verified server-side using Telegram getMe</p></div>${verified ? renderBotStatusBadge(bot) : '<span class="badge badge--danger">Token invalid</span>'}</div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Bot</h3><p>The Telegram identity associated with this workspace bot.</p></div><div class="identity-card"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><div><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}${managed ? ` · Managed by ${esc(managerLabel(bot))}` : ""}</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Telegram environment</h3><p>Production and Test are separate Telegram Bot API environments.</p></div><div><strong class="settings-value">${esc(botEnvironmentLabel(bot))}</strong>${renderBotEnvironmentBadge(bot)}</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Platform status</h3><p>Current provisioning and delivery state reported by Phenogram.</p></div><div>${renderBotStatusBadge(bot)}</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Public identifier</h3><p>Identifies this bot without authorizing Telegram API calls.</p></div><div><div class="fingerprint">${esc(fingerprint)}</div><p class="field__hint field__hint--spaced">This value is safe to reference publicly. Signed file links still expire separately.</p></div></div>${credentialRow}<div class="settings-row"><div class="settings-row__intro"><h3>Data retention</h3><p>Updates outside this window are removed automatically.</p></div><div><strong class="settings-value">${esc(retentionValue(bot))}</strong><p class="field__hint field__hint--compact-spaced">${botNeedsRetentionWarning(bot) ? "This managed bot is outside full-history coverage." : `Covered by your ${esc(membershipPlan())} plan.`}</p></div></div></div></section>
+      ${webhookRecoveryPanel}
       ${renderRoutingSettings(bot)}
       ${removalPanel}
     </div>`;
@@ -1766,7 +1786,16 @@
     modalRoot.dataset.modalName = name;
     if (name === "connect") {
       const atLimit = connectedBots().length >= membershipLimit();
-      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-modal-panel><header class="modal__head"><div><h2 id="connect-title">${atLimit ? "Your bot limit is full" : "Connect a Telegram bot"}</h2><p>${atLimit ? `The ${membershipPlan()} plan includes ${membershipLimit()} bot${membershipLimit() === 1 ? "" : "s"}.` : "Paste the token from @BotFather."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header>${atLimit ? `<div class="modal__body"><div class="form-note">${icon("info")}Your existing bots stay active. Upgrade the workspace before connecting another bot.</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Not now</button><button class="btn btn--primary" type="button" data-action="go-billing">See plans</button></footer>` : `<form id="connect-bot-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="field"><div class="field__row"><label for="bot-token">Telegram bot token</label><span class="field__hint">From @BotFather</span></div><div class="input-wrap">${icon("lock")}<input id="bot-token" name="token" type="password" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="123456789:AA…" required></div><p class="field__hint">Your token is encrypted and will not be shown again.</p></div><div class="form-note">${icon("info")}Connecting transfers this bot’s webhook to Phenogram. If a webhook is already set, Phenogram will keep delivering updates to the same destination.</div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Verify and connect ${icon("arrow")}</button></footer></form>`}</section></div>`;
+      const poolField = state.membership?.local_bot_api === true
+        ? `<div class="field"><label for="bot-pool">Telegram API backend</label><select id="bot-pool" name="pool"><option value="standard" selected>Phenogram Standard</option><option value="local">Phenogram Local — extended file support</option></select><p class="field__hint">This is the bot’s initial placement. Moving between pools is not available yet.</p></div>`
+        : "";
+      const environmentField = `<div class="field"><label for="bot-environment">Telegram environment</label><select id="bot-environment" name="test_dc"><option value="false" selected>Production</option><option value="true">Test environment</option></select><p class="field__hint">Choose Test only for a bot created in Telegram’s separate test environment.</p></div>`;
+      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-modal-panel><header class="modal__head"><div><h2 id="connect-title">${atLimit ? "Your bot limit is full" : "Connect a Telegram bot"}</h2><p>${atLimit ? `The ${membershipPlan()} plan includes ${membershipLimit()} bot${membershipLimit() === 1 ? "" : "s"}.` : "Paste the token from @BotFather."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header>${atLimit ? `<div class="modal__body"><div class="form-note">${icon("info")}Your existing bots stay active. Upgrade the workspace before connecting another bot.</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Not now</button><button class="btn btn--primary" type="button" data-action="go-billing">See plans</button></footer>` : `<form id="connect-bot-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="field"><div class="field__row"><label for="bot-token">Telegram bot token</label><span class="field__hint">From @BotFather</span></div><div class="input-wrap">${icon("lock")}<input id="bot-token" name="token" type="password" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="123456789:AA…" required></div><p class="field__hint">Phenogram encrypts this credential in its application database and will not display it again.</p></div>${environmentField}${poolField}<div class="form-note">${icon("info")}Connecting transfers this bot’s webhook to Phenogram. If a webhook is already set, Phenogram will keep delivering updates to the same destination.</div><div data-webhook-secret-resolution></div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Verify and connect ${icon("arrow")}</button></footer></form>`}</section></div>`;
+      return;
+    }
+    if (name === "managed-webhook-recovery") {
+      const bot = currentBot();
+      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="managed-webhook-recovery-title" data-modal-panel><header class="modal__head"><div><h2 id="managed-webhook-recovery-title">Continue ${esc(botName(bot))} setup</h2><p>Preserve the existing receiver before onboarding or changing the managed credential.</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><form id="managed-webhook-recovery-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="status-banner status-banner--warning">${icon("alert")}<div class="status-banner__copy"><strong>The existing webhook is active; Phenogram API routing is paused</strong>Telegram does not reveal the webhook secret or custom certificate. If a custom certificate is configured, replace it with a publicly trusted certificate before retrying.</div></div><div class="field"><label for="managed-webhook-secret-mode">Existing webhook authentication</label><select id="managed-webhook-secret-mode" name="existing_webhook_secret_mode" required><option value="" selected disabled>Choose one</option><option value="secret">It uses a secret token</option><option value="none">It does not use a secret token</option></select></div><div class="field"><label for="managed-existing-webhook-secret">Current secret token</label><input id="managed-existing-webhook-secret" name="existing_webhook_secret" type="password" autocomplete="off" spellcheck="false" placeholder="Required only when the receiver uses one"><p class="field__hint">This value is used only to create the encrypted, crash-resumable lifecycle operation and is never written to logs or job status.</p></div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Preserve webhook and continue ${icon("arrow")}</button></footer></form></section></div>`;
       return;
     }
     if (name === "bot-picker") {
@@ -1787,13 +1816,34 @@
       const bot = currentBot();
       const mode = state.modal.data.mode === "local" ? "local" : "cloud";
       const label = mode === "local" ? "Local Bot API" : "Telegram cloud";
-      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="alertdialog" aria-modal="true" aria-labelledby="routing-title" data-modal-panel><header class="modal__head"><div><h2 id="routing-title">Migrate ${esc(botName(bot))} to ${esc(label)}?</h2><p>This changes the upstream Telegram API server for this bot.</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><form id="routing-form" data-mode="${mode}"><div class="modal__body"><div class="status-banner status-banner--danger">${icon("alert")}<div class="status-banner__copy"><strong>Expect a short interruption</strong>Telegram logout and login rules can delay the new route. Confirm webhook delivery after the migration.</div></div><label class="webhook-consent"><input name="confirm_migration" type="checkbox" required><span><strong>I understand this changes live bot traffic</strong>Proceed with the routing migration and record it in the audit log.</span></label><div data-form-error aria-live="polite"></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Migrate to ${esc(label)}</button></footer></form></section></div>`;
+      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="alertdialog" aria-modal="true" aria-labelledby="routing-title" data-modal-panel><header class="modal__head"><div><h2 id="routing-title">Migrate ${esc(botName(bot))} to ${esc(label)}?</h2><p>This changes the upstream Telegram API server for this bot.</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><form id="routing-form" data-mode="${mode}"><div class="modal__body"><div class="status-banner status-banner--danger">${icon("alert")}<div class="status-banner__copy"><strong>Pool changes are not available yet</strong>Phenogram keeps the bot on its current official Bot API pool to avoid an unsafe cross-server move.</div></div><div data-form-error aria-live="polite"></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Keep current pool</button></footer></form></section></div>`;
     }
   }
 
   function formError(form, message) {
     const target = form.querySelector("[data-form-error]");
     if (target) target.innerHTML = message ? `<p class="form-error">${esc(message)}</p>` : "";
+  }
+
+  function requestExistingWebhookSecret(form, detail) {
+    const target = form.querySelector("[data-webhook-secret-resolution]");
+    if (!target) return false;
+    const destination = detail?.destination_host || "the current receiver";
+    target.innerHTML = `<div class="status-banner status-banner--warning" role="status">${icon("alert")}<div class="status-banner__copy"><strong>Existing webhook detected at ${esc(destination)}</strong>Telegram does not reveal its current secret header. Tell Phenogram how this receiver is authenticated before the transfer continues.</div></div><div class="field"><label for="webhook-secret-mode">Existing webhook authentication</label><select id="webhook-secret-mode" name="existing_webhook_secret_mode" required><option value="" selected disabled>Choose one</option><option value="secret">It uses a secret token</option><option value="none">It does not use a secret token</option></select></div><div class="field"><label for="existing-webhook-secret">Current secret token</label><input id="existing-webhook-secret" name="existing_webhook_secret" type="password" autocomplete="off" spellcheck="false" placeholder="Required only when the receiver uses one"><p class="field__hint">Phenogram uses this value to preserve the receiver’s Telegram secret header.</p></div>`;
+    target.querySelector("select")?.focus();
+    return true;
+  }
+
+  function requestExistingWebhookIpAddress(form, detail) {
+    if (form.querySelector('[name="existing_webhook_ip_address_mode"]')) return true;
+    const reported = String(detail?.reported_ip_address || "");
+    if (!reported) return false;
+    const fields = `<div data-webhook-ip-resolution><div class="status-banner status-banner--warning" role="status">${icon("alert")}<div class="status-banner__copy"><strong>Choose fixed IP or DNS resolution</strong>Telegram currently reports ${esc(reported)}, but does not reveal whether that address was explicitly pinned. Phenogram will not guess.</div></div><div class="field"><label for="webhook-ip-address-mode">Existing webhook network routing</label><select id="webhook-ip-address-mode" name="existing_webhook_ip_address_mode" required><option value="" selected disabled>Choose one</option><option value="fixed">Keep ${esc(reported)} as a fixed IPv4 address</option><option value="dns">Resolve the webhook hostname through DNS</option></select><input type="hidden" name="existing_webhook_reported_ip_address" value="${esc(reported)}"><p class="field__hint">Fixed IP preserves this exact address. DNS follows future address changes for the hostname.</p></div></div>`;
+    const secretTarget = form.querySelector("[data-webhook-secret-resolution]");
+    if (secretTarget) secretTarget.insertAdjacentHTML("beforeend", fields);
+    else form.querySelector("[data-form-error]")?.insertAdjacentHTML("beforebegin", fields);
+    form.querySelector('[name="existing_webhook_ip_address_mode"]')?.focus();
+    return true;
   }
 
   function setSubmitting(form, submitting, label) {
@@ -1814,10 +1864,31 @@
     const data = new FormData(form);
     const sessionVersion = state.sessionVersion;
     let token = String(data.get("token") || "").trim();
+    const pool = String(data.get("pool") || "standard");
+    const testDc = String(data.get("test_dc") || "false") === "true";
+    const webhookSecretMode = String(data.get("existing_webhook_secret_mode") || "");
+    const existingWebhookSecret = String(data.get("existing_webhook_secret") || "").trim();
+    const webhookIpMode = String(data.get("existing_webhook_ip_address_mode") || "");
+    const reportedWebhookIp = String(data.get("existing_webhook_reported_ip_address") || "");
     if (!token) { formError(form, "Paste the token provided by BotFather."); return; }
+    if (webhookSecretMode === "secret" && !existingWebhookSecret) {
+      formError(form, "Enter the current secret token used by the existing webhook.");
+      form.elements.existing_webhook_secret?.focus();
+      return;
+    }
+    if (form.elements.existing_webhook_ip_address_mode && !webhookIpMode) {
+      formError(form, "Choose whether to keep the reported IPv4 address fixed or use DNS resolution.");
+      form.elements.existing_webhook_ip_address_mode.focus();
+      return;
+    }
     setSubmitting(form, true, "Verifying with Telegram…");
     try {
-      const payload = await api("/bots", { method: "POST", body: { token } });
+      const body = { token, pool, test_dc: testDc };
+      if (webhookSecretMode === "secret") body.existing_webhook_secret = existingWebhookSecret;
+      if (webhookSecretMode === "none") body.existing_webhook_has_no_secret = true;
+      if (webhookIpMode === "fixed") body.existing_webhook_ip_address = reportedWebhookIp;
+      if (webhookIpMode === "dns") body.existing_webhook_has_no_ip_address = true;
+      const payload = await api("/bots", { method: "POST", body });
       if (state.sessionVersion !== sessionVersion || !state.user) return;
       token = "";
       form.reset();
@@ -1831,9 +1902,72 @@
       navigate(state.selectedBotId ? `/bots/${encodeURIComponent(state.selectedBotId)}/overview` : "/bots");
     } catch (error) {
       if (state.sessionVersion !== sessionVersion || !state.user || !form.isConnected) return;
+      const detail = error?.payload?.error;
+      if (detail?.code === "webhook_secret_required" && requestExistingWebhookSecret(form, detail)) {
+        formError(form, "");
+        setSubmitting(form, false);
+        return;
+      }
+      if (detail?.code === "webhook_ip_address_resolution_required" && requestExistingWebhookIpAddress(form, detail)) {
+        formError(form, "");
+        setSubmitting(form, false);
+        return;
+      }
       formError(form, errorMessage(error));
       setSubmitting(form, false);
       form.elements.token.focus();
+    }
+  }
+
+  async function submitManagedWebhookRecovery(form) {
+    formError(form, "");
+    const id = state.selectedBotId;
+    const contextVersion = state.botContextVersion;
+    const data = new FormData(form);
+    const mode = String(data.get("existing_webhook_secret_mode") || "");
+    let secret = String(data.get("existing_webhook_secret") || "").trim();
+    const webhookIpMode = String(data.get("existing_webhook_ip_address_mode") || "");
+    const reportedWebhookIp = String(data.get("existing_webhook_reported_ip_address") || "");
+    if (!id || !mode) { formError(form, "Choose how the existing webhook is authenticated."); return; }
+    if (mode === "secret" && !secret) {
+      formError(form, "Enter the current secret token used by the existing webhook.");
+      form.elements.existing_webhook_secret?.focus();
+      return;
+    }
+    if (form.elements.existing_webhook_ip_address_mode && !webhookIpMode) {
+      formError(form, "Choose whether to keep the reported IPv4 address fixed or use DNS resolution.");
+      form.elements.existing_webhook_ip_address_mode.focus();
+      return;
+    }
+    setSubmitting(form, true, "Continuing safely…");
+    try {
+      const body = {};
+      if (mode === "secret") body.existing_webhook_secret = secret;
+      if (mode === "none") body.existing_webhook_has_no_secret = true;
+      if (webhookIpMode === "fixed") body.existing_webhook_ip_address = reportedWebhookIp;
+      if (webhookIpMode === "dns") body.existing_webhook_has_no_ip_address = true;
+      const payload = await api(`/bots/${encodeURIComponent(id)}/managed-webhook-recovery`, { method: "POST", body });
+      secret = "";
+      form.reset();
+      if (state.botContextVersion !== contextVersion || String(state.selectedBotId) !== String(id)) return;
+      await loadBots({ silent: true });
+      closeModal();
+      render();
+      toast("Managed bot setup continued and the existing webhook was preserved.");
+      surfaceWarnings(payload);
+    } catch (error) {
+      const detail = error?.payload?.error;
+      if (detail?.code === "webhook_ip_address_resolution_required" && requestExistingWebhookIpAddress(form, detail)) {
+        formError(form, "");
+        setSubmitting(form, false);
+        return;
+      }
+      secret = "";
+      if (state.botContextVersion === contextVersion && String(state.selectedBotId) === String(id)) {
+        form.elements.existing_webhook_secret.value = "";
+        formError(form, errorMessage(error));
+        setSubmitting(form, false);
+      }
     }
   }
 
@@ -1985,10 +2119,6 @@
 
   async function submitRouting(form) {
     formError(form, "");
-    if (!form.elements.confirm_migration.checked) {
-      formError(form, "Confirm that you understand this changes live bot traffic.");
-      return;
-    }
     const id = state.selectedBotId;
     const contextVersion = state.botContextVersion;
     const mode = form.dataset.mode === "local" ? "local" : "cloud";
@@ -2036,6 +2166,7 @@
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     if (form.id === "connect-bot-form") { event.preventDefault(); submitConnectBot(form); }
+    if (form.id === "managed-webhook-recovery-form") { event.preventDefault(); submitManagedWebhookRecovery(form); }
     if (form.id === "message-form") { event.preventDefault(); submitMessage(form); }
     if (form.id === "delete-bot-form") { event.preventDefault(); submitDeleteBot(form); }
     if (form.id === "stream-key-form") { event.preventDefault(); submitStreamKey(form); }
@@ -2060,6 +2191,7 @@
     event.preventDefault();
 
     if (action === "open-connect") setModal("connect");
+    else if (action === "open-managed-webhook-recovery") setModal("managed-webhook-recovery");
     else if (action === "close-modal") closeModal();
     else if (action === "open-bot-picker") state.bots.length ? setModal("bot-picker") : setModal("connect");
     else if (action === "pick-bot") { const id = trigger.dataset.botId; selectBot(id); closeModal(); navigate(`/bots/${encodeURIComponent(id)}/overview`); }

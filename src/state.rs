@@ -156,7 +156,7 @@ impl AuthLimiter {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
 pub struct StoredUpdate {
     pub row_id: i64,
     pub update_id: i64,

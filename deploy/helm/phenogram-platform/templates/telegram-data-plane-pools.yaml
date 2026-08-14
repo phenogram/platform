@@ -1,0 +1,353 @@
+{{- if .Values.dataPlane.enabled }}
+{{- $root := . -}}
+{{- $fullname := include "phenogram.fullname" . -}}
+{{- if ne (len .Values.dataPlane.official.pools) 2 }}
+{{- fail "dataPlane.official.pools must contain exactly standard and local" }}
+{{- end }}
+{{- $tapSocketPrefix := printf "%s/" (trimSuffix "/" .Values.dataPlane.official.collector.socketDirectory) -}}
+{{- if or (eq .Values.dataPlane.official.collector.socketPath .Values.dataPlane.official.collector.ackSocketPath) (not (hasPrefix $tapSocketPrefix .Values.dataPlane.official.collector.socketPath)) (not (hasPrefix $tapSocketPrefix .Values.dataPlane.official.collector.ackSocketPath)) }}
+{{- fail "collector tap and ACK sockets must be distinct paths inside collector.socketDirectory" }}
+{{- end }}
+{{- if and .Values.dataPlane.official.collector.enabled (or (ne .Values.dataPlane.official.stats.listenAddress "127.0.0.1") (ne (int .Values.dataPlane.official.stats.port) 8083)) }}
+{{- fail "official lifecycle statistics must listen only on 127.0.0.1:8083" }}
+{{- end }}
+{{- $seenPools := dict -}}
+{{- range $pool := .Values.dataPlane.official.pools }}
+{{- if not (has $pool.name (list "standard" "local")) }}
+{{- fail (printf "unsupported dataPlane official pool %q" $pool.name) }}
+{{- end }}
+{{- if hasKey $seenPools $pool.name }}
+{{- fail (printf "duplicate dataPlane official pool %q" $pool.name) }}
+{{- end }}
+{{- $_ := set $seenPools $pool.name true -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-telegram-{{ $pool.name }}-headless
+  labels:
+    {{- include "phenogram.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+spec:
+  clusterIP: None
+  # A collector outage must not remove a healthy official server from DNS.
+  publishNotReadyAddresses: true
+  ports:
+    - name: telegram-http
+      port: {{ $root.Values.dataPlane.official.port }}
+      targetPort: telegram-http
+      protocol: TCP
+    - name: file-http
+      port: {{ $root.Values.dataPlane.official.fileServer.port }}
+      targetPort: file-http
+      protocol: TCP
+    {{- if $root.Values.dataPlane.official.collector.enabled }}
+    - name: drain-control
+      port: {{ $root.Values.dataPlane.official.collector.controlPort }}
+      targetPort: drain-control
+      protocol: TCP
+    {{- end }}
+  selector:
+    {{- include "phenogram.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-telegram-{{ $pool.name }}
+  labels:
+    {{- include "phenogram.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+spec:
+  type: ClusterIP
+  # Keep the single official endpoint routable while only the observer
+  # sidecar is restarting. Official TCP readiness remains independently probed.
+  publishNotReadyAddresses: true
+  ports:
+    - name: telegram-http
+      port: {{ $root.Values.dataPlane.official.port }}
+      targetPort: telegram-http
+      protocol: TCP
+    - name: file-http
+      port: {{ $root.Values.dataPlane.official.fileServer.port }}
+      targetPort: file-http
+      protocol: TCP
+    {{- if $root.Values.dataPlane.official.collector.enabled }}
+    - name: drain-control
+      port: {{ $root.Values.dataPlane.official.collector.controlPort }}
+      targetPort: drain-control
+      protocol: TCP
+    {{- end }}
+  selector:
+    {{- include "phenogram.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-telegram-{{ $pool.name }}
+  labels:
+    {{- include "phenogram.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+spec:
+  replicas: 1
+  serviceName: {{ $fullname }}-telegram-{{ $pool.name }}-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: telegram-bot-api
+      phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "phenogram.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: telegram-bot-api
+        phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+    spec:
+      serviceAccountName: {{ include "phenogram.serviceAccountName" $root }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $root.Values.dataPlane.official.terminationGracePeriodSeconds }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # All pool containers share group 10001 without sharing a UID. This lets
+      # the official process write data/tap.sock and the file sidecar read data.
+      securityContext:
+        runAsNonRoot: true
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: telegram-bot-api
+          image: {{ include "phenogram.dataPlaneTelegramImage" $root | quote }}
+          imagePullPolicy: {{ $root.Values.dataPlane.official.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10002
+            runAsGroup: 10001
+          args:
+            {{- if $pool.localMode }}
+            - --local
+            {{- end }}
+            - {{ printf "--http-port=%v" $root.Values.dataPlane.official.port | quote }}
+            - {{ printf "--dir=%s" $root.Values.dataPlane.official.dataDir | quote }}
+            - {{ printf "--temp-dir=%s/temp" ($root.Values.dataPlane.official.dataDir | trimSuffix "/") | quote }}
+            - --verbosity=0
+            - --memory-verbosity=0
+            {{- if $root.Values.dataPlane.official.collector.enabled }}
+            - {{ printf "--update-tap-socket=%s" $root.Values.dataPlane.official.collector.socketPath | quote }}
+            - {{ printf "--update-tap-ack-socket=%s" $root.Values.dataPlane.official.collector.ackSocketPath | quote }}
+            - {{ printf "--http-stat-ip-address=%s" $root.Values.dataPlane.official.stats.listenAddress | quote }}
+            - {{ printf "--http-stat-port=%v" $root.Values.dataPlane.official.stats.port | quote }}
+            {{- end }}
+          env:
+            - name: TELEGRAM_API_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" $root.Values.secrets.existingSecret }}
+                  key: {{ $root.Values.secrets.telegramApiIdKey }}
+            - name: TELEGRAM_API_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.secrets.existingSecret }}
+                  key: {{ $root.Values.secrets.telegramApiHashKey }}
+          ports:
+            - name: telegram-http
+              containerPort: {{ $root.Values.dataPlane.official.port }}
+              protocol: TCP
+          volumeMounts:
+            - name: telegram-data
+              mountPath: {{ $root.Values.dataPlane.official.dataDir }}
+            - name: telegram-tmp
+              mountPath: /tmp
+            {{- if $root.Values.dataPlane.official.collector.enabled }}
+            - name: tap-socket
+              mountPath: {{ $root.Values.dataPlane.official.collector.socketDirectory }}
+            {{- end }}
+          startupProbe:
+            tcpSocket:
+              port: telegram-http
+            failureThreshold: 120
+            periodSeconds: 5
+            timeoutSeconds: 2
+          readinessProbe:
+            tcpSocket:
+              port: telegram-http
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: telegram-http
+            failureThreshold: 3
+            periodSeconds: 30
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml $root.Values.dataPlane.official.resources | nindent 12 }}
+        - name: file-server
+          image: {{ include "phenogram.dataPlaneFileServerImage" $root | quote }}
+          imagePullPolicy: {{ $root.Values.dataPlane.official.fileServer.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10003
+            runAsGroup: 10001
+          env:
+            - name: FILE_SERVER_MODE
+              value: {{ $pool.name | quote }}
+            - name: FILE_SERVER_LISTEN_ADDR
+              value: {{ printf "0.0.0.0:%v" $root.Values.dataPlane.official.fileServer.port | quote }}
+            - name: FILE_SERVER_ROOT
+              value: {{ $root.Values.dataPlane.official.dataDir | quote }}
+            - name: DATA_PLANE_SYNC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.secrets.existingSecret }}
+                  key: {{ $root.Values.secrets.dataPlaneSyncTokenKey }}
+            - name: RUST_LOG
+              value: phenogram_data_plane_gateway=info
+          ports:
+            - name: file-http
+              containerPort: {{ $root.Values.dataPlane.official.fileServer.port }}
+              protocol: TCP
+          volumeMounts:
+            - name: telegram-data
+              mountPath: {{ $root.Values.dataPlane.official.dataDir }}
+              readOnly: true
+          # No readiness or liveness probe: a file-sidecar failure must not
+          # restart or remove the healthy official Telegram endpoint.
+          resources:
+            {{- toYaml $root.Values.dataPlane.official.fileServer.resources | nindent 12 }}
+        {{- if $root.Values.dataPlane.official.collector.enabled }}
+        - name: update-tap-collector
+          image: {{ include "phenogram.dataPlaneCollectorImage" $root | quote }}
+          imagePullPolicy: {{ $root.Values.dataPlane.official.collector.image.pullPolicy }}
+          command:
+            - {{ $root.Values.dataPlane.official.collector.command | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.secrets.existingSecret }}
+                  key: {{ $root.Values.secrets.databaseUrlKey }}
+            - name: PHENOGRAM_TAP_SOCKET_PATH
+              value: {{ $root.Values.dataPlane.official.collector.socketPath | quote }}
+            - name: PHENOGRAM_TAP_ACK_SOCKET_PATH
+              value: {{ $root.Values.dataPlane.official.collector.ackSocketPath | quote }}
+            - name: PHENOGRAM_TAP_OFFICIAL_STATS_URL
+              value: {{ printf "http://%s:%v/" $root.Values.dataPlane.official.stats.listenAddress $root.Values.dataPlane.official.stats.port | quote }}
+            - name: PHENOGRAM_TAP_OFFICIAL_STATS_INTERVAL_SECONDS
+              value: {{ $root.Values.dataPlane.official.stats.pollIntervalSeconds | quote }}
+            - name: PHENOGRAM_TAP_CONTROL_LISTEN_ADDR
+              value: {{ printf "0.0.0.0:%v" $root.Values.dataPlane.official.collector.controlPort | quote }}
+            - name: DATA_PLANE_SYNC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.secrets.existingSecret }}
+                  key: {{ $root.Values.secrets.dataPlaneSyncTokenKey }}
+            - name: PHENOGRAM_TAP_POOL
+              value: {{ $pool.name | quote }}
+            - name: PHENOGRAM_TAP_MAX_EVENT_BYTES
+              value: {{ $root.Values.dataPlane.official.collector.maxEventBytes | quote }}
+            - name: PHENOGRAM_TAP_MAX_INFLIGHT_EVENTS
+              value: {{ $root.Values.dataPlane.official.collector.maxInflightEvents | quote }}
+            - name: PHENOGRAM_TAP_MAX_INFLIGHT_BYTES
+              value: {{ $root.Values.dataPlane.official.collector.maxInflightBytes | quote }}
+            - name: PHENOGRAM_TAP_REASSEMBLY_TIMEOUT_MS
+              value: {{ $root.Values.dataPlane.official.collector.reassemblyTimeoutMs | quote }}
+            - name: RUST_LOG
+              value: phenogram_platform=info
+          volumeMounts:
+            - name: tap-socket
+              mountPath: {{ $root.Values.dataPlane.official.collector.socketDirectory }}
+            - name: collector-tmp
+              mountPath: /tmp
+          ports:
+            - name: drain-control
+              containerPort: {{ $root.Values.dataPlane.official.collector.controlPort }}
+              protocol: TCP
+          # Deliberately no readiness or liveness dependency: DB and observer
+          # failures must never gate the official Telegram endpoint.
+          resources:
+            {{- toYaml $root.Values.dataPlane.official.collector.resources | nindent 12 }}
+        {{- end }}
+      volumes:
+        - name: telegram-tmp
+          emptyDir: {}
+        {{- if $root.Values.dataPlane.official.collector.enabled }}
+        - name: tap-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
+        - name: collector-tmp
+          emptyDir: {}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: telegram-data
+        labels:
+          {{- include "phenogram.labels" $root | nindent 10 }}
+          app.kubernetes.io/component: telegram-bot-api
+          phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+        {{- if $pool.persistence.retain }}
+        annotations:
+          helm.sh/resource-policy: keep
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml $pool.persistence.accessModes | nindent 10 }}
+        {{- with $pool.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pool.persistence.size }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-telegram-{{ $pool.name }}
+  labels:
+    {{- include "phenogram.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: telegram-bot-api
+      phenogram.io/data-plane-pool: {{ $pool.name | quote }}
+{{ if not (eq $pool.name (last $root.Values.dataPlane.official.pools).name) }}
+---
+{{ end }}
+{{ end }}
+{{ end }}

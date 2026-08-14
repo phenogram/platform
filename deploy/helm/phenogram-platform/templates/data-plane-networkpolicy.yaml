@@ -1,0 +1,177 @@
+{{- if and .Values.networkPolicy.enabled .Values.dataPlane.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phenogram.fullname" . }}-data-plane-gateway
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane-gateway
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: data-plane-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressController.namespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressController.podLabels | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: app
+      ports:
+        - port: {{ .Values.dataPlane.gateway.publicPort }}
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: app
+      ports:
+        - port: {{ .Values.dataPlane.gateway.adminPort }}
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: app
+      ports:
+        - port: 8080
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: telegram-bot-api
+      ports:
+        - port: {{ .Values.dataPlane.official.port }}
+          protocol: TCP
+        - port: {{ .Values.dataPlane.official.fileServer.port }}
+          protocol: TCP
+        - port: {{ .Values.dataPlane.official.collector.controlPort }}
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phenogram.fullname" . }}-telegram-data-plane-standard
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: telegram-bot-api
+      phenogram.io/data-plane-pool: "standard"
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: data-plane-gateway
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: app
+      ports:
+        - port: {{ .Values.dataPlane.official.port }}
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: data-plane-gateway
+      ports:
+        - port: {{ .Values.dataPlane.official.fileServer.port }}
+          protocol: TCP
+        - port: {{ .Values.dataPlane.official.collector.controlPort }}
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+      ports:
+        - port: {{ .Values.postgresql.port }}
+          protocol: TCP
+    # The official server owns Telegram transport selection. Restricting it to
+    # the webhook ports also blocks valid MTProto transports such as TCP 5222.
+    # Keep TCP unrestricted here so the policy cannot reduce Bot API behavior.
+    - ports:
+        - protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phenogram.fullname" . }}-telegram-data-plane-local
+  labels:
+    {{- include "phenogram.labels" . | nindent 4 }}
+    app.kubernetes.io/component: telegram-bot-api
+    phenogram.io/data-plane-pool: "local"
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phenogram.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: telegram-bot-api
+      phenogram.io/data-plane-pool: "local"
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: data-plane-gateway
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: app
+      ports:
+        - port: {{ .Values.dataPlane.official.port }}
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phenogram.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: data-plane-gateway
+      ports:
+        - port: {{ .Values.dataPlane.official.fileServer.port }}
+          protocol: TCP
+        - port: {{ .Values.dataPlane.official.collector.controlPort }}
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Local Bot API mode permits webhook destinations on any TCP port. The
+    # observer shares this pod, so TCP remains unrestricted rather than
+    # silently breaking Telegram compatibility.
+    - ports:
+        - protocol: TCP
+{{- end }}

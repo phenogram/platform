@@ -1,0 +1,1464 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6cd450d..4afa30c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,6 +68,7 @@ set(TELEGRAM_BOT_API_SOURCE
+   telegram-bot-api/HttpStatConnection.cpp
+   telegram-bot-api/Query.cpp
+   telegram-bot-api/Stats.cpp
++  telegram-bot-api/UpdateTap.cpp
+   telegram-bot-api/Watchdog.cpp
+   telegram-bot-api/WebhookActor.cpp
+
+@@ -79,6 +80,7 @@ set(TELEGRAM_BOT_API_SOURCE
+   telegram-bot-api/HttpStatConnection.h
+   telegram-bot-api/Query.h
+   telegram-bot-api/Stats.h
++  telegram-bot-api/UpdateTap.h
+   telegram-bot-api/Watchdog.h
+   telegram-bot-api/WebhookActor.h
+ )
+@@ -87,6 +89,18 @@ add_executable(telegram-bot-api ${TELEGRAM_BOT_API_SOURCE})
+ target_include_directories(telegram-bot-api PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+ target_link_libraries(telegram-bot-api PRIVATE memprof tdactor tdcore tddb tdnet tdutils)
+
++option(PHENOGRAM_UPDATE_TAP_TESTS "Build the Phenogram non-blocking update tap tests" OFF)
++if (PHENOGRAM_UPDATE_TAP_TESTS)
++  enable_testing()
++  add_executable(update-tap-test
++    telegram-bot-api/UpdateTap.cpp
++    telegram-bot-api/UpdateTapTest.cpp
++  )
++  target_include_directories(update-tap-test PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
++  target_link_libraries(update-tap-test PRIVATE tdactor tddb tdnet tdutils)
++  add_test(NAME update-tap-test COMMAND update-tap-test)
++endif()
++
+ install(TARGETS telegram-bot-api RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+ if (MSVC AND VCPKG_TOOLCHAIN)
+   install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/" DESTINATION "${CMAKE_INSTALL_BINDIR}" FILES_MATCHING PATTERN "*.dll" PATTERN "*.pdb")
+diff --git a/telegram-bot-api/Client.cpp b/telegram-bot-api/Client.cpp
+index 0d16d48..43d2034 100644
+--- a/telegram-bot-api/Client.cpp
++++ b/telegram-bot-api/Client.cpp
+@@ -7,6 +7,7 @@
+ #include "telegram-bot-api/Client.h"
+
+ #include "telegram-bot-api/ClientParameters.h"
++#include "telegram-bot-api/UpdateTap.h"
+
+ #include "td/db/TQueue.h"
+
+@@ -18131,8 +18132,9 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
+   }
+
+   auto update_slice = jb.string_builder().as_cslice();
+-  auto r_id = parameters_->shared_data_->tqueue_->push(tqueue_id_, update_slice.str(), get_unix_time() + timeout,
+-                                                       webhook_queue_id, td::TQueue::EventId());
++  auto expires_at = get_unix_time() + timeout;
++  auto r_id = parameters_->shared_data_->tqueue_->push(tqueue_id_, update_slice.str(), expires_at, webhook_queue_id,
++                                                       td::TQueue::EventId());
+   if (r_id.is_ok()) {
+     auto id = r_id.move_as_ok();
+     LOG(DEBUG) << "Update " << id << " was added for " << timeout << " seconds: " << update_slice;
+@@ -18141,6 +18143,11 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
+     } else {
+       send_closure(webhook_id_, &WebhookActor::update);
+     }
++    if (parameters_->update_tap_ != nullptr) {
++      parameters_->update_tap_->send_update(static_cast<td::uint64>(my_id_), is_test_dc_,
++                                            static_cast<td::uint32>(id.value()),
++                                            static_cast<td::uint32>(expires_at), update_slice);
++    }
+   } else {
+     LOG(DEBUG) << "Update failed to be added with error " << r_id.error() << " for " << timeout
+                << " seconds: " << update_slice;
+@@ -18394,8 +18401,17 @@ void Client::add_update_purchased_paid_media(object_ptr<td_api::updatePaidMediaP
+
+ void Client::add_update_managed_bot(object_ptr<td_api::updateManagedBot> &&query) {
+   CHECK(query != nullptr);
++  auto owner_user_id = query->user_id_;
++  auto child_bot_id = query->bot_user_id_;
+   add_update(UpdateType::ManagedBot, JsonManagedBotUpdated(query.get(), this), 86400,
+              query->user_id_ + (static_cast<int64>(13) << 33));
++  if (parameters_->update_tap_ != nullptr) {
++    auto now = td::Time::now();
++    parameters_->update_tap_->queue_managed_bot_lifecycle(
++        *parameters_->shared_data_->tqueue_, parameters_->shared_data_->get_unix_time(now), now,
++        static_cast<td::uint64>(my_id_), is_test_dc_, static_cast<td::uint64>(owner_user_id),
++        static_cast<td::uint64>(child_bot_id));
++  }
+ }
+
+ void Client::add_update_subscription(object_ptr<td_api::updateUserSubscription> &&query) {
+diff --git a/telegram-bot-api/ClientManager.cpp b/telegram-bot-api/ClientManager.cpp
+index 3df07e5..21a1008 100644
+--- a/telegram-bot-api/ClientManager.cpp
++++ b/telegram-bot-api/ClientManager.cpp
+@@ -7,6 +7,7 @@
+ #include "telegram-bot-api/ClientManager.h"
+
+ #include "telegram-bot-api/ClientParameters.h"
++#include "telegram-bot-api/UpdateTap.h"
+ #include "telegram-bot-api/WebhookActor.h"
+
+ #include "td/telegram/ClientActor.h"
+@@ -88,6 +89,18 @@ void ClientManager::send(PromisedQueryPtr query) {
+     token += "/test";
+   }
+
++  auto gateway_route_generation = query->get_header("x-phenogram-route-generation");
++  if (!gateway_route_generation.empty()) {
++    auto r_route_generation = td::to_integer_safe<td::uint64>(gateway_route_generation);
++    if (r_route_generation.is_error() || r_route_generation.ok() == 0) {
++      return fail_query(400, "Bad Request: invalid gateway route generation", std::move(query));
++    }
++    if (parameters_->shared_data_->is_gateway_query_fenced(query->token(), query->is_test_dc(),
++                                                           r_route_generation.ok())) {
++      return fail_query(503, "Service Unavailable: gateway route was withdrawn", std::move(query));
++    }
++  }
++
+   auto id_it = token_to_id_.find(token);
+   if (id_it == token_to_id_.end()) {
+     auto method = query->method();
+@@ -201,12 +214,28 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
+   td::StringBuilder sb(buf.as_slice());
+
+   td::Slice id_filter;
++  td::Slice phenogram_action;
++  td::Slice phenogram_bot_token;
++  td::Slice phenogram_test_dc;
++  td::Slice phenogram_route_generation;
+   int new_verbosity_level = -1;
+   td::string tag;
+   for (auto &arg : args) {
+     if (arg.first == "id") {
+       id_filter = arg.second;
+     }
++    if (arg.first == "phenogram_action") {
++      phenogram_action = arg.second;
++    }
++    if (arg.first == "phenogram_bot_token") {
++      phenogram_bot_token = arg.second;
++    }
++    if (arg.first == "phenogram_test_dc") {
++      phenogram_test_dc = arg.second;
++    }
++    if (arg.first == "phenogram_route_generation") {
++      phenogram_route_generation = arg.second;
++    }
+     if (arg.first == "v") {
+       auto r_new_verbosity_level = td::to_integer_safe<int>(arg.second);
+       if (r_new_verbosity_level.is_ok()) {
+@@ -225,6 +254,29 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
+     }
+   }
+
++  if (phenogram_action == "drain") {
++    auto r_route_generation = td::to_integer_safe<td::uint64>(phenogram_route_generation);
++    auto is_test_dc = phenogram_test_dc == "1";
++    auto is_valid_test_dc = is_test_dc || phenogram_test_dc == "0";
++    td::int64 bot_id = 0;
++    if (is_valid_test_dc && r_route_generation.is_ok()) {
++      bot_id = parameters_->shared_data_->install_gateway_drain_fence(
++          phenogram_bot_token, is_test_dc, r_route_generation.ok());
++    }
++    if (bot_id == 0) {
++      sb << "phenogram_drain_fenced\t0\n";
++    } else {
++      sb << "phenogram_drain_fenced\t1\n";
++      sb << "telegram_bot_id\t" << bot_id << '\n';
++      sb << "telegram_test_dc\t" << (is_test_dc ? 1 : 0) << '\n';
++      sb << "route_generation\t" << r_route_generation.ok() << '\n';
++      sb << "active_requests\t"
++         << parameters_->shared_data_->get_active_bot_query_count(bot_id, is_test_dc) << '\n';
++    }
++    promise.set_value(td::BufferSlice(sb.as_cslice()));
++    return;
++  }
++
+   auto now = td::Time::now();
+   auto top_clients = get_top_clients(50, id_filter);
+   sb << BotStatActor::get_description() << '\n';
+@@ -252,6 +304,22 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
+     sb << "active_webhook_connections\t" << WebhookActor::get_total_connection_count() << '\n';
+     sb << "active_requests\t" << parameters_->shared_data_->query_count_.load(std::memory_order_relaxed) << '\n';
+     sb << "active_network_queries\t" << td::get_pending_network_query_count(*parameters_->net_query_stats_) << '\n';
++    if (parameters_->update_tap_ != nullptr) {
++      sb << "update_tap_sent_events\t" << parameters_->update_tap_->sent_event_count() << '\n';
++      sb << "update_tap_sent_datagrams\t" << parameters_->update_tap_->sent_datagram_count() << '\n';
++      sb << "update_tap_dropped_events\t" << parameters_->update_tap_->dropped_event_count() << '\n';
++      sb << "update_tap_errors\t" << parameters_->update_tap_->error_count() << '\n';
++      sb << "managed_lifecycle_pending\t"
++         << parameters_->update_tap_->managed_lifecycle_pending_count(*parameters_->shared_data_->tqueue_) << '\n';
++      sb << "managed_lifecycle_persisted\t" << parameters_->update_tap_->managed_lifecycle_persisted_count() << '\n';
++      sb << "managed_lifecycle_replayed\t" << parameters_->update_tap_->managed_lifecycle_replayed_count() << '\n';
++      sb << "managed_lifecycle_acked\t" << parameters_->update_tap_->managed_lifecycle_acked_count() << '\n';
++      sb << "managed_lifecycle_overflow\t" << parameters_->update_tap_->managed_lifecycle_overflow_count() << '\n';
++      sb << "managed_lifecycle_persistence_errors\t"
++         << parameters_->update_tap_->managed_lifecycle_persistence_error_count() << '\n';
++      sb << "managed_lifecycle_expired\t" << parameters_->update_tap_->managed_lifecycle_expired_count() << '\n';
++      sb << "managed_lifecycle_ack_errors\t" << parameters_->update_tap_->managed_lifecycle_ack_error_count() << '\n';
++    }
+     auto stats = stat_.as_vector(now);
+     for (auto &stat : stats) {
+       sb << stat.key_ << "\t" << stat.value_ << '\n';
+@@ -350,6 +418,12 @@ void ClientManager::start_up() {
+
+     parameters_->shared_data_->tqueue_ = std::move(tqueue);
+
++    if (parameters_->update_tap_ != nullptr) {
++      auto now = td::Time::now();
++      parameters_->update_tap_->replay_managed_bot_lifecycle(
++          *parameters_->shared_data_->tqueue_, parameters_->shared_data_->get_unix_time(now), now);
++    }
++
+     LOG(WARNING) << "Loaded " << loaded_event_count << " TQueue events in " << (td::Time::now() - load_start_time)
+                  << " seconds";
+     next_tqueue_gc_time_ = td::Time::now() + 600;
+@@ -377,7 +451,7 @@ void ClientManager::start_up() {
+   // launch watchdog
+   watchdog_id_ = td::create_actor_on_scheduler<Watchdog>("ManagerWatchdog", SharedData::get_watchdog_scheduler_id(),
+                                                          td::this_thread::get_id(), WATCHDOG_TIMEOUT);
+-  set_timeout_in(600.0);
++  set_timeout_in(parameters_->update_tap_ == nullptr ? 600.0 : 1.0);
+ }
+
+ PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::Slice webhook_info,
+@@ -546,6 +620,10 @@ void ClientManager::timeout_expired() {
+   set_timeout_in(WATCHDOG_TIMEOUT / 10);
+
+   double now = td::Time::now();
++  if (parameters_->update_tap_ != nullptr) {
++    parameters_->update_tap_->replay_managed_bot_lifecycle(
++        *parameters_->shared_data_->tqueue_, parameters_->shared_data_->get_unix_time(now), now);
++  }
+   if (now > next_tqueue_gc_time_) {
+     auto unix_time = parameters_->shared_data_->get_unix_time(now);
+     LOG(INFO) << "Run TQueue GC at " << unix_time;
+diff --git a/telegram-bot-api/ClientParameters.h b/telegram-bot-api/ClientParameters.h
+index f6d252a..13b21cc 100644
+--- a/telegram-bot-api/ClientParameters.h
++++ b/telegram-bot-api/ClientParameters.h
+@@ -16,10 +16,14 @@
+ #include "td/utils/common.h"
+ #include "td/utils/List.h"
+ #include "td/utils/port/IPAddress.h"
++#include "td/utils/Slice.h"
+
+ #include <atomic>
+ #include <limits>
++#include <map>
+ #include <memory>
++#include <mutex>
++#include <utility>
+
+ namespace td {
+ class NetQueryStats;
+@@ -27,6 +31,8 @@ class NetQueryStats;
+
+ namespace telegram_bot_api {
+
++class UpdateTap;
++
+ struct SharedData {
+   std::atomic<td::uint64> query_count_{0};
+   std::atomic<size_t> query_list_size_{0};
+@@ -42,6 +48,63 @@ struct SharedData {
+   static constexpr size_t TQUEUE_EVENT_BUFFER_SIZE = 1000;
+   td::TQueue::Event event_buffer_[TQUEUE_EVENT_BUFFER_SIZE];
+
++  td::int64 register_active_bot_query(td::Slice token, bool is_test_dc) {
++    auto bot_id = get_bot_id(token);
++    if (bot_id == 0) {
++      return 0;
++    }
++    std::lock_guard<std::mutex> lock(gateway_drain_mutex_);
++    active_bot_queries_[{bot_id, is_test_dc}]++;
++    return bot_id;
++  }
++
++  void unregister_active_bot_query(td::int64 bot_id, bool is_test_dc) {
++    if (bot_id == 0) {
++      return;
++    }
++    std::lock_guard<std::mutex> lock(gateway_drain_mutex_);
++    auto it = active_bot_queries_.find({bot_id, is_test_dc});
++    if (it == active_bot_queries_.end()) {
++      return;
++    }
++    if (it->second <= 1) {
++      active_bot_queries_.erase(it);
++    } else {
++      it->second--;
++    }
++  }
++
++  td::uint64 get_active_bot_query_count(td::int64 bot_id, bool is_test_dc) const {
++    std::lock_guard<std::mutex> lock(gateway_drain_mutex_);
++    auto it = active_bot_queries_.find({bot_id, is_test_dc});
++    return it == active_bot_queries_.end() ? 0 : it->second;
++  }
++
++  td::int64 install_gateway_drain_fence(td::Slice token, bool is_test_dc, td::uint64 route_generation) {
++    auto bot_id = get_bot_id(token);
++    if (bot_id == 0 || route_generation == 0) {
++      return 0;
++    }
++    auto key = token.str();
++    if (is_test_dc) {
++      key += "/test";
++    }
++    std::lock_guard<std::mutex> lock(gateway_drain_mutex_);
++    auto &current = gateway_drain_fences_[std::move(key)];
++    current = td::max(current, route_generation);
++    return bot_id;
++  }
++
++  bool is_gateway_query_fenced(td::Slice token, bool is_test_dc, td::uint64 route_generation) const {
++    auto key = token.str();
++    if (is_test_dc) {
++      key += "/test";
++    }
++    std::lock_guard<std::mutex> lock(gateway_drain_mutex_);
++    auto it = gateway_drain_fences_.find(key);
++    return it != gateway_drain_fences_.end() && route_generation <= it->second;
++  }
++
+   td::int32 get_unix_time(double now) const {
+     auto result = unix_time_difference_ + now;
+     if (result <= 0) {
+@@ -101,6 +164,32 @@ struct SharedData {
+   static td::int32 get_thread_count() {
+     return 12;
+   }
++
++ private:
++  static td::int64 get_bot_id(td::Slice token) {
++    if (token.empty() || token[0] == '0' || token.size() > 80 || token.find('/') != td::Slice::npos) {
++      return 0;
++    }
++    auto colon = token.find(':');
++    if (colon == td::Slice::npos || colon == 0 || colon + 1 >= token.size()) {
++      return 0;
++    }
++    td::uint64 bot_id = 0;
++    for (size_t i = 0; i < colon; i++) {
++      if (token[i] < '0' || token[i] > '9') {
++        return 0;
++      }
++      bot_id = bot_id * 10 + static_cast<td::uint64>(token[i] - '0');
++      if (bot_id >= (static_cast<td::uint64>(1) << 54)) {
++        return 0;
++      }
++    }
++    return static_cast<td::int64>(bot_id);
++  }
++
++  mutable std::mutex gateway_drain_mutex_;
++  std::map<std::pair<td::int64, bool>, td::uint64> active_bot_queries_;
++  std::map<td::string, td::uint64> gateway_drain_fences_;
+ };
+
+ struct ClientParameters {
+@@ -124,6 +213,8 @@ struct ClientParameters {
+   std::shared_ptr<SharedData> shared_data_;
+
+   std::shared_ptr<td::NetQueryStats> net_query_stats_;
++
++  std::shared_ptr<UpdateTap> update_tap_;
+ };
+
+ }  // namespace telegram_bot_api
+diff --git a/telegram-bot-api/Query.cpp b/telegram-bot-api/Query.cpp
+index 2558a60..de4d876 100644
+--- a/telegram-bot-api/Query.cpp
++++ b/telegram-bot-api/Query.cpp
+@@ -45,6 +45,7 @@ Query::Query(td::vector<td::BufferSlice> &&container, td::Slice token, bool is_t
+   start_timestamp_ = td::Time::now();
+   LOG(INFO) << "Query " << this << ": " << *this;
+   if (shared_data_) {
++    active_bot_id_ = shared_data_->register_active_bot_query(token_, is_test_dc_);
+     shared_data_->query_count_.fetch_add(1, std::memory_order_relaxed);
+     if (method_ != "getupdates") {
+       shared_data_->query_list_size_.fetch_add(1, std::memory_order_relaxed);
+diff --git a/telegram-bot-api/Query.h b/telegram-bot-api/Query.h
+index 5fdfb7f..efb6ed2 100644
+--- a/telegram-bot-api/Query.h
++++ b/telegram-bot-api/Query.h
+@@ -118,6 +118,7 @@ class Query final : public td::ListNode {
+   Query &operator=(Query &&) = delete;
+   ~Query() {
+     if (shared_data_) {
++      shared_data_->unregister_active_bot_query(active_bot_id_, is_test_dc_);
+       shared_data_->query_count_.fetch_sub(1, std::memory_order_relaxed);
+       if (!empty()) {
+         shared_data_->query_list_size_.fetch_sub(1, std::memory_order_relaxed);
+@@ -144,6 +145,7 @@ class Query final : public td::ListNode {
+   td::vector<td::BufferSlice> container_;
+   td::Slice token_;
+   bool is_test_dc_;
++  td::int64 active_bot_id_ = 0;
+   td::MutableSlice method_;
+   td::vector<std::pair<td::MutableSlice, td::MutableSlice>> args_;
+   td::vector<std::pair<td::MutableSlice, td::MutableSlice>> headers_;
+diff --git a/telegram-bot-api/UpdateTap.cpp b/telegram-bot-api/UpdateTap.cpp
+new file mode 100644
+index 0000000..ddb4f26
+--- /dev/null
++++ b/telegram-bot-api/UpdateTap.cpp
+@@ -0,0 +1,520 @@
++//
++// Copyright (c) 2026 Phenogram contributors
++//
++// Distributed under the Boost Software License, Version 1.0. (See accompanying
++// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
++//
++#include "telegram-bot-api/UpdateTap.h"
++
++#include "td/db/TQueue.h"
++
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++#include <limits>
++
++#if !TD_WINDOWS
++#include <cstddef>
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <sys/un.h>
++#include <unistd.h>
++#endif
++
++namespace telegram_bot_api {
++namespace {
++
++constexpr td::uint8 FRAME_VERSION = 1;
++constexpr td::uint8 FRAME_TYPE_UPDATE = 1;
++constexpr td::uint8 FRAME_TYPE_MANAGED_BOT_LIFECYCLE = 2;
++constexpr td::uint8 FLAG_TEST_DC = 1;
++constexpr std::size_t MANAGED_LIFECYCLE_RECORD_SIZE = 33;
++constexpr std::size_t MANAGED_LIFECYCLE_PAYLOAD_SIZE = 16;
++constexpr std::size_t ACK_FRAME_SIZE = UpdateTap::HEADER_SIZE + MANAGED_LIFECYCLE_PAYLOAD_SIZE;
++constexpr double MANAGED_LIFECYCLE_REPLAY_INTERVAL = 1.0;
++constexpr std::size_t MAX_ACKS_PER_TICK = 64;
++
++void store_u16(td::uint8 *destination, td::uint16 value) noexcept {
++  destination[0] = static_cast<td::uint8>(value >> 8);
++  destination[1] = static_cast<td::uint8>(value);
++}
++
++void store_u32(td::uint8 *destination, td::uint32 value) noexcept {
++  destination[0] = static_cast<td::uint8>(value >> 24);
++  destination[1] = static_cast<td::uint8>(value >> 16);
++  destination[2] = static_cast<td::uint8>(value >> 8);
++  destination[3] = static_cast<td::uint8>(value);
++}
++
++void store_u64(td::uint8 *destination, td::uint64 value) noexcept {
++  store_u32(destination, static_cast<td::uint32>(value >> 32));
++  store_u32(destination + 4, static_cast<td::uint32>(value));
++}
++
++td::uint32 load_u32(const td::uint8 *source) noexcept {
++  return (static_cast<td::uint32>(source[0]) << 24) | (static_cast<td::uint32>(source[1]) << 16) |
++         (static_cast<td::uint32>(source[2]) << 8) | source[3];
++}
++
++td::uint64 load_u64(const td::uint8 *source) noexcept {
++  return (static_cast<td::uint64>(load_u32(source)) << 32) | load_u32(source + 4);
++}
++
++td::uint64 mix_u64(td::uint64 value) noexcept {
++  value += 0x9e3779b97f4a7c15ULL;
++  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
++  return value ^ (value >> 31);
++}
++
++td::uint64 make_producer_instance_id() noexcept {
++  auto ticks = static_cast<td::uint64>(
++      std::chrono::high_resolution_clock::now().time_since_epoch().count());
++#if !TD_WINDOWS
++  ticks ^= static_cast<td::uint64>(getpid()) << 32;
++#endif
++  auto result = mix_u64(ticks);
++  return result == 0 ? 1 : result;
++}
++
++struct ManagedLifecycleRecord {
++  bool is_test_dc{false};
++  td::uint64 parent_bot_id{0};
++  td::uint64 owner_user_id{0};
++  td::uint64 child_bot_id{0};
++  td::uint64 delivery_nonce{0};
++};
++
++td::string encode_managed_lifecycle_record(const ManagedLifecycleRecord &record) {
++  std::array<td::uint8, MANAGED_LIFECYCLE_RECORD_SIZE> bytes{};
++  bytes[0] = record.is_test_dc ? FLAG_TEST_DC : 0;
++  store_u64(bytes.data() + 1, record.parent_bot_id);
++  store_u64(bytes.data() + 9, record.owner_user_id);
++  store_u64(bytes.data() + 17, record.child_bot_id);
++  store_u64(bytes.data() + 25, record.delivery_nonce);
++  return td::string(reinterpret_cast<const char *>(bytes.data()), bytes.size());
++}
++
++bool decode_managed_lifecycle_record(td::Slice data, ManagedLifecycleRecord &record) noexcept {
++  if (data.size() != MANAGED_LIFECYCLE_RECORD_SIZE) {
++    return false;
++  }
++  const auto *bytes = reinterpret_cast<const td::uint8 *>(data.data());
++  if ((bytes[0] & ~FLAG_TEST_DC) != 0) {
++    return false;
++  }
++  record.is_test_dc = (bytes[0] & FLAG_TEST_DC) != 0;
++  record.parent_bot_id = load_u64(bytes + 1);
++  record.owner_user_id = load_u64(bytes + 9);
++  record.child_bot_id = load_u64(bytes + 17);
++  record.delivery_nonce = load_u64(bytes + 25);
++  return record.parent_bot_id != 0 && record.owner_user_id != 0 && record.child_bot_id != 0 &&
++         record.delivery_nonce != 0;
++}
++
++#if !TD_WINDOWS
++bool set_nonblocking_close_on_exec(int fd) noexcept {
++  auto status_flags = fcntl(fd, F_GETFL, 0);
++  auto descriptor_flags = fcntl(fd, F_GETFD, 0);
++  return status_flags >= 0 && descriptor_flags >= 0 && fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) >= 0 &&
++         fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) >= 0;
++}
++#endif
++
++}  // namespace
++
++UpdateTap::UpdateTap(td::string socket_path, td::string ack_socket_path) noexcept
++    : socket_path_(std::move(socket_path))
++    , ack_socket_path_(std::move(ack_socket_path))
++    , producer_instance_id_(make_producer_instance_id()) {
++#if !TD_WINDOWS
++  if (socket_path_.empty() || socket_path_.size() >= sizeof(sockaddr_un::sun_path)) {
++    error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++
++  fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
++  if (fd_ < 0) {
++    error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++
++  if (!set_nonblocking_close_on_exec(fd_)) {
++    close(fd_);
++    fd_ = -1;
++    error_count_.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  if (ack_socket_path_.empty()) {
++    return;
++  }
++  if (ack_socket_path_.size() >= sizeof(sockaddr_un::sun_path)) {
++    managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  struct stat path_stat {};
++  if (lstat(ack_socket_path_.c_str(), &path_stat) == 0) {
++    if (!S_ISSOCK(path_stat.st_mode) || unlink(ack_socket_path_.c_str()) != 0) {
++      managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++      return;
++    }
++  } else if (errno != ENOENT) {
++    managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++
++  ack_fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
++  if (ack_fd_ < 0 || !set_nonblocking_close_on_exec(ack_fd_)) {
++    if (ack_fd_ >= 0) {
++      close(ack_fd_);
++      ack_fd_ = -1;
++    }
++    managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  sockaddr_un ack_address{};
++  ack_address.sun_family = AF_UNIX;
++  std::memcpy(ack_address.sun_path, ack_socket_path_.data(), ack_socket_path_.size());
++  ack_address.sun_path[ack_socket_path_.size()] = '\0';
++  auto ack_address_length =
++      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + ack_socket_path_.size() + 1);
++  if (bind(ack_fd_, reinterpret_cast<const sockaddr *>(&ack_address), ack_address_length) != 0 ||
++      chmod(ack_socket_path_.c_str(), 0660) != 0) {
++    close(ack_fd_);
++    ack_fd_ = -1;
++    unlink(ack_socket_path_.c_str());
++    managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++  }
++#else
++  error_count_.fetch_add(1, std::memory_order_relaxed);
++#endif
++}
++
++UpdateTap::~UpdateTap() {
++#if !TD_WINDOWS
++  if (fd_ >= 0) {
++    close(fd_);
++  }
++  if (ack_fd_ >= 0) {
++    close(ack_fd_);
++    unlink(ack_socket_path_.c_str());
++  }
++#endif
++}
++
++void UpdateTap::send_update(td::uint64 bot_id, bool is_test_dc, td::uint32 update_id, td::uint32 expires_at,
++                            td::Slice payload) noexcept {
++  send_event(FRAME_TYPE_UPDATE, bot_id, is_test_dc, update_id, expires_at, 0, payload);
++}
++
++void UpdateTap::queue_managed_bot_lifecycle(td::TQueue &tqueue, td::int32 unix_time_now, double monotonic_now,
++                                            td::uint64 parent_bot_id, bool is_test_dc, td::uint64 owner_user_id,
++                                            td::uint64 child_bot_id) noexcept {
++  if (parent_bot_id == 0 || owner_user_id == 0 || child_bot_id == 0 || unix_time_now <= 0) {
++    managed_lifecycle_persistence_error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  if (tqueue.get_size(MANAGED_LIFECYCLE_QUEUE_ID) >= MAX_MANAGED_LIFECYCLE_EVENTS) {
++    managed_lifecycle_overflow_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++
++  lifecycle_nonce_sequence_++;
++  auto delivery_nonce = mix_u64(producer_instance_id_ ^ lifecycle_nonce_sequence_) &
++                        static_cast<td::uint64>(std::numeric_limits<td::int64>::max());
++  if (delivery_nonce == 0) {
++    delivery_nonce = 1;
++  }
++  ManagedLifecycleRecord record{is_test_dc, parent_bot_id, owner_user_id, child_bot_id, delivery_nonce};
++  auto expires_at =
++      unix_time_now > std::numeric_limits<td::int32>::max() - MANAGED_LIFECYCLE_RETENTION_SECONDS
++          ? std::numeric_limits<td::int32>::max()
++          : unix_time_now + MANAGED_LIFECYCLE_RETENTION_SECONDS;
++  auto result = tqueue.push(MANAGED_LIFECYCLE_QUEUE_ID, encode_managed_lifecycle_record(record), expires_at, 0,
++                            td::TQueue::EventId());
++  if (result.is_error()) {
++    managed_lifecycle_persistence_error_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  managed_lifecycle_persisted_count_.fetch_add(1, std::memory_order_relaxed);
++  replay_managed_bot_lifecycle(tqueue, unix_time_now, monotonic_now);
++}
++
++void UpdateTap::replay_managed_bot_lifecycle(td::TQueue &tqueue, td::int32 unix_time_now,
++                                             double monotonic_now) noexcept {
++#if !TD_WINDOWS
++  drain_managed_lifecycle_acks(tqueue, unix_time_now);
++  if (monotonic_now < next_lifecycle_replay_at_) {
++    return;
++  }
++  emit_managed_lifecycle_head(tqueue, unix_time_now, monotonic_now);
++#else
++  static_cast<void>(tqueue);
++  static_cast<void>(unix_time_now);
++  static_cast<void>(monotonic_now);
++#endif
++}
++
++td::uint64 UpdateTap::send_event(td::uint8 frame_type, td::uint64 bot_id, bool is_test_dc, td::uint32 update_id,
++                                 td::uint32 expires_at, td::uint64 reserved, td::Slice payload) noexcept {
++#if !TD_WINDOWS
++  if (fd_ < 0 || payload.size() > MAX_UPDATE_PAYLOAD_SIZE) {
++    error_count_.fetch_add(1, std::memory_order_relaxed);
++    dropped_event_count_.fetch_add(1, std::memory_order_relaxed);
++    return 0;
++  }
++
++  sockaddr_un address{};
++  address.sun_family = AF_UNIX;
++  std::memcpy(address.sun_path, socket_path_.data(), socket_path_.size());
++  address.sun_path[socket_path_.size()] = '\0';
++  auto address_length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + socket_path_.size() + 1);
++
++  auto total_length = payload.size();
++  auto fragment_count = td::max<std::size_t>(1, (total_length + MAX_FRAGMENT_PAYLOAD_SIZE - 1) /
++                                                   MAX_FRAGMENT_PAYLOAD_SIZE);
++  auto event_sequence = event_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
++  std::array<td::uint8, HEADER_SIZE> header;
++
++  for (std::size_t fragment_index = 0; fragment_index < fragment_count; fragment_index++) {
++    auto fragment_offset = fragment_index * MAX_FRAGMENT_PAYLOAD_SIZE;
++    auto fragment_length = td::min(MAX_FRAGMENT_PAYLOAD_SIZE, total_length - fragment_offset);
++
++    header[0] = 'P';
++    header[1] = 'G';
++    header[2] = 'U';
++    header[3] = 'T';
++    header[4] = FRAME_VERSION;
++    header[5] = frame_type;
++    header[6] = is_test_dc ? FLAG_TEST_DC : 0;
++    header[7] = static_cast<td::uint8>(HEADER_SIZE);
++    store_u64(header.data() + 8, producer_instance_id_);
++    store_u64(header.data() + 16, event_sequence);
++    store_u64(header.data() + 24, bot_id);
++    store_u32(header.data() + 32, update_id);
++    store_u32(header.data() + 36, expires_at);
++    store_u32(header.data() + 40, static_cast<td::uint32>(total_length));
++    store_u32(header.data() + 44, static_cast<td::uint32>(fragment_offset));
++    store_u16(header.data() + 48, static_cast<td::uint16>(fragment_index));
++    store_u16(header.data() + 50, static_cast<td::uint16>(fragment_count));
++    store_u32(header.data() + 52, static_cast<td::uint32>(fragment_length));
++    store_u64(header.data() + 56, reserved);
++
++    auto datagram_length = HEADER_SIZE + fragment_length;
++    iovec vectors[2]{};
++    vectors[0].iov_base = header.data();
++    vectors[0].iov_len = header.size();
++    vectors[1].iov_base =
++        fragment_length == 0 ? nullptr : const_cast<char *>(payload.data() + fragment_offset);
++    vectors[1].iov_len = fragment_length;
++
++    msghdr message{};
++    message.msg_name = &address;
++    message.msg_namelen = address_length;
++    message.msg_iov = vectors;
++    message.msg_iovlen = fragment_length == 0 ? 1 : 2;
++#ifdef MSG_NOSIGNAL
++    constexpr int SEND_FLAGS = MSG_DONTWAIT | MSG_NOSIGNAL;
++#else
++    constexpr int SEND_FLAGS = MSG_DONTWAIT;
++#endif
++    auto sent_size = sendmsg(fd_, &message, SEND_FLAGS);
++    if (sent_size < 0 || static_cast<std::size_t>(sent_size) != datagram_length) {
++      error_count_.fetch_add(1, std::memory_order_relaxed);
++      dropped_event_count_.fetch_add(1, std::memory_order_relaxed);
++      return 0;
++    }
++    sent_datagram_count_.fetch_add(1, std::memory_order_relaxed);
++  }
++  sent_event_count_.fetch_add(1, std::memory_order_relaxed);
++  return event_sequence;
++#else
++  static_cast<void>(frame_type);
++  static_cast<void>(bot_id);
++  static_cast<void>(is_test_dc);
++  static_cast<void>(update_id);
++  static_cast<void>(expires_at);
++  static_cast<void>(reserved);
++  static_cast<void>(payload);
++  error_count_.fetch_add(1, std::memory_order_relaxed);
++  dropped_event_count_.fetch_add(1, std::memory_order_relaxed);
++  return 0;
++#endif
++}
++
++bool UpdateTap::emit_managed_lifecycle_head(td::TQueue &tqueue, td::int32 unix_time_now,
++                                            double monotonic_now) noexcept {
++#if !TD_WINDOWS
++  auto size_before = tqueue.get_size(MANAGED_LIFECYCLE_QUEUE_ID);
++  if (size_before == 0) {
++    inflight_event_sequence_ = 0;
++    inflight_event_id_ = 0;
++    return false;
++  }
++  auto head = tqueue.get_head(MANAGED_LIFECYCLE_QUEUE_ID);
++  td::TQueue::Event event_buffer[1];
++  td::MutableSpan<td::TQueue::Event> events(event_buffer, 1);
++  auto result = tqueue.get(MANAGED_LIFECYCLE_QUEUE_ID, head, false, unix_time_now, events);
++  auto size_after = tqueue.get_size(MANAGED_LIFECYCLE_QUEUE_ID);
++  if (size_after < size_before) {
++    managed_lifecycle_expired_count_.fetch_add(size_before - size_after, std::memory_order_relaxed);
++  }
++  if (result.is_error()) {
++    managed_lifecycle_persistence_error_count_.fetch_add(1, std::memory_order_relaxed);
++    return false;
++  }
++  if (events.empty()) {
++    inflight_event_sequence_ = 0;
++    inflight_event_id_ = 0;
++    return false;
++  }
++
++  ManagedLifecycleRecord record;
++  if (!decode_managed_lifecycle_record(events[0].data, record)) {
++    managed_lifecycle_persistence_error_count_.fetch_add(1, std::memory_order_relaxed);
++    tqueue.forget(MANAGED_LIFECYCLE_QUEUE_ID, events[0].id);
++    inflight_event_sequence_ = 0;
++    inflight_event_id_ = 0;
++    next_lifecycle_replay_at_ = monotonic_now + MANAGED_LIFECYCLE_REPLAY_INTERVAL;
++    return false;
++  }
++
++  std::array<td::uint8, MANAGED_LIFECYCLE_PAYLOAD_SIZE> payload{};
++  store_u64(payload.data(), record.owner_user_id);
++  store_u64(payload.data() + 8, record.child_bot_id);
++  auto sequence = send_event(FRAME_TYPE_MANAGED_BOT_LIFECYCLE, record.parent_bot_id, record.is_test_dc,
++                             static_cast<td::uint32>(events[0].id.value()),
++                             static_cast<td::uint32>(events[0].expires_at), record.delivery_nonce,
++                             td::Slice(reinterpret_cast<const char *>(payload.data()), payload.size()));
++  next_lifecycle_replay_at_ = monotonic_now + MANAGED_LIFECYCLE_REPLAY_INTERVAL;
++  if (sequence == 0) {
++    return false;
++  }
++  inflight_event_sequence_ = sequence;
++  inflight_event_id_ = events[0].id.value();
++  managed_lifecycle_replayed_count_.fetch_add(1, std::memory_order_relaxed);
++  return true;
++#else
++  static_cast<void>(tqueue);
++  static_cast<void>(unix_time_now);
++  static_cast<void>(monotonic_now);
++  return false;
++#endif
++}
++
++void UpdateTap::drain_managed_lifecycle_acks(td::TQueue &tqueue, td::int32 unix_time_now) noexcept {
++#if !TD_WINDOWS
++  if (ack_fd_ < 0) {
++    return;
++  }
++  for (std::size_t ack_index = 0; ack_index < MAX_ACKS_PER_TICK; ack_index++) {
++    std::array<td::uint8, ACK_FRAME_SIZE + 1> ack{};
++    auto received = recv(ack_fd_, ack.data(), ack.size(), MSG_DONTWAIT);
++    if (received < 0) {
++      if (errno != EAGAIN && errno != EWOULDBLOCK) {
++        managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++      }
++      return;
++    }
++    if (static_cast<std::size_t>(received) != ACK_FRAME_SIZE || std::memcmp(ack.data(), "PGUA", 4) != 0 ||
++        ack[4] != FRAME_VERSION || ack[5] != FRAME_TYPE_MANAGED_BOT_LIFECYCLE ||
++        (ack[6] & ~FLAG_TEST_DC) != 0 || ack[7] != HEADER_SIZE || load_u64(ack.data() + 8) != producer_instance_id_ ||
++        load_u64(ack.data() + 16) != inflight_event_sequence_ ||
++        load_u32(ack.data() + 32) != static_cast<td::uint32>(inflight_event_id_) ||
++        load_u32(ack.data() + 40) != MANAGED_LIFECYCLE_PAYLOAD_SIZE || load_u32(ack.data() + 44) != 0 ||
++        ack[48] != 0 || ack[49] != 0 || ack[50] != 0 || ack[51] != 1 ||
++        load_u32(ack.data() + 52) != MANAGED_LIFECYCLE_PAYLOAD_SIZE) {
++      managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++      continue;
++    }
++
++    auto size_before = tqueue.get_size(MANAGED_LIFECYCLE_QUEUE_ID);
++    if (size_before == 0) {
++      managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++      continue;
++    }
++    auto head = tqueue.get_head(MANAGED_LIFECYCLE_QUEUE_ID);
++    td::TQueue::Event event_buffer[1];
++    td::MutableSpan<td::TQueue::Event> events(event_buffer, 1);
++    auto result = tqueue.get(MANAGED_LIFECYCLE_QUEUE_ID, head, false, unix_time_now, events);
++    auto size_after = tqueue.get_size(MANAGED_LIFECYCLE_QUEUE_ID);
++    if (size_after < size_before) {
++      managed_lifecycle_expired_count_.fetch_add(size_before - size_after, std::memory_order_relaxed);
++    }
++    ManagedLifecycleRecord record;
++    if (result.is_error() || events.empty() || events[0].id.value() != inflight_event_id_ ||
++        !decode_managed_lifecycle_record(events[0].data, record) ||
++        ack[6] != (record.is_test_dc ? FLAG_TEST_DC : 0) || load_u64(ack.data() + 24) != record.parent_bot_id ||
++        load_u32(ack.data() + 36) != static_cast<td::uint32>(events[0].expires_at) ||
++        load_u64(ack.data() + 56) != record.delivery_nonce ||
++        load_u64(ack.data() + HEADER_SIZE) != record.owner_user_id ||
++        load_u64(ack.data() + HEADER_SIZE + 8) != record.child_bot_id) {
++      managed_lifecycle_ack_error_count_.fetch_add(1, std::memory_order_relaxed);
++      continue;
++    }
++
++    tqueue.forget(MANAGED_LIFECYCLE_QUEUE_ID, events[0].id);
++    inflight_event_sequence_ = 0;
++    inflight_event_id_ = 0;
++    next_lifecycle_replay_at_ = 0.0;
++    managed_lifecycle_acked_count_.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++#else
++  static_cast<void>(tqueue);
++  static_cast<void>(unix_time_now);
++#endif
++}
++
++td::uint64 UpdateTap::sent_event_count() const noexcept {
++  return sent_event_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::sent_datagram_count() const noexcept {
++  return sent_datagram_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::dropped_event_count() const noexcept {
++  return dropped_event_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::error_count() const noexcept {
++  return error_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_persisted_count() const noexcept {
++  return managed_lifecycle_persisted_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_acked_count() const noexcept {
++  return managed_lifecycle_acked_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_replayed_count() const noexcept {
++  return managed_lifecycle_replayed_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_overflow_count() const noexcept {
++  return managed_lifecycle_overflow_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_persistence_error_count() const noexcept {
++  return managed_lifecycle_persistence_error_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_expired_count() const noexcept {
++  return managed_lifecycle_expired_count_.load(std::memory_order_relaxed);
++}
++
++td::uint64 UpdateTap::managed_lifecycle_ack_error_count() const noexcept {
++  return managed_lifecycle_ack_error_count_.load(std::memory_order_relaxed);
++}
++
++std::size_t UpdateTap::managed_lifecycle_pending_count(const td::TQueue &tqueue) const noexcept {
++  return tqueue.get_size(MANAGED_LIFECYCLE_QUEUE_ID);
++}
++
++}  // namespace telegram_bot_api
+diff --git a/telegram-bot-api/UpdateTap.h b/telegram-bot-api/UpdateTap.h
+new file mode 100644
+index 0000000..06606ec
+--- /dev/null
++++ b/telegram-bot-api/UpdateTap.h
+@@ -0,0 +1,91 @@
++//
++// Copyright (c) 2026 Phenogram contributors
++//
++// Distributed under the Boost Software License, Version 1.0. (See accompanying
++// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
++//
++#pragma once
++
++#include "td/utils/common.h"
++#include "td/utils/Slice.h"
++
++#include <atomic>
++#include <cstddef>
++
++namespace td {
++class TQueue;
++}
++
++namespace telegram_bot_api {
++
++// Type 1 is a best-effort non-blocking observer. Type 2 is appended to a
++// bounded local TQueue only after native delivery handling and replayed with a
++// non-blocking ACK channel. Neither path may participate in canonical delivery.
++class UpdateTap final {
++ public:
++  static constexpr std::size_t HEADER_SIZE = 64;
++  static constexpr std::size_t MAX_DATAGRAM_SIZE = 32768;
++  static constexpr std::size_t MAX_FRAGMENT_PAYLOAD_SIZE = MAX_DATAGRAM_SIZE - HEADER_SIZE;
++  static constexpr std::size_t MAX_UPDATE_PAYLOAD_SIZE = 1 << 18;
++
++  static constexpr td::int64 MANAGED_LIFECYCLE_QUEUE_ID = -0x50475554LL;
++  static constexpr std::size_t MAX_MANAGED_LIFECYCLE_EVENTS = 10000;
++  static constexpr td::int32 MANAGED_LIFECYCLE_RETENTION_SECONDS = 7 * 86400;
++
++  explicit UpdateTap(td::string socket_path, td::string ack_socket_path = {}) noexcept;
++  UpdateTap(const UpdateTap &) = delete;
++  UpdateTap &operator=(const UpdateTap &) = delete;
++  UpdateTap(UpdateTap &&) = delete;
++  UpdateTap &operator=(UpdateTap &&) = delete;
++  ~UpdateTap();
++
++  void send_update(td::uint64 bot_id, bool is_test_dc, td::uint32 update_id, td::uint32 expires_at,
++                   td::Slice payload) noexcept;
++  void queue_managed_bot_lifecycle(td::TQueue &tqueue, td::int32 unix_time_now, double monotonic_now,
++                                   td::uint64 parent_bot_id, bool is_test_dc, td::uint64 owner_user_id,
++                                   td::uint64 child_bot_id) noexcept;
++  void replay_managed_bot_lifecycle(td::TQueue &tqueue, td::int32 unix_time_now, double monotonic_now) noexcept;
++
++  td::uint64 sent_event_count() const noexcept;
++  td::uint64 sent_datagram_count() const noexcept;
++  td::uint64 dropped_event_count() const noexcept;
++  td::uint64 error_count() const noexcept;
++  td::uint64 managed_lifecycle_persisted_count() const noexcept;
++  td::uint64 managed_lifecycle_acked_count() const noexcept;
++  td::uint64 managed_lifecycle_replayed_count() const noexcept;
++  td::uint64 managed_lifecycle_overflow_count() const noexcept;
++  td::uint64 managed_lifecycle_persistence_error_count() const noexcept;
++  td::uint64 managed_lifecycle_expired_count() const noexcept;
++  td::uint64 managed_lifecycle_ack_error_count() const noexcept;
++  std::size_t managed_lifecycle_pending_count(const td::TQueue &tqueue) const noexcept;
++
++ private:
++  td::uint64 send_event(td::uint8 frame_type, td::uint64 bot_id, bool is_test_dc, td::uint32 update_id,
++                        td::uint32 expires_at, td::uint64 reserved, td::Slice payload) noexcept;
++  void drain_managed_lifecycle_acks(td::TQueue &tqueue, td::int32 unix_time_now) noexcept;
++  bool emit_managed_lifecycle_head(td::TQueue &tqueue, td::int32 unix_time_now, double monotonic_now) noexcept;
++
++  td::string socket_path_;
++  td::string ack_socket_path_;
++  int fd_{-1};
++  int ack_fd_{-1};
++  td::uint64 producer_instance_id_{0};
++  std::atomic<td::uint64> event_sequence_{0};
++  td::uint64 lifecycle_nonce_sequence_{0};
++  double next_lifecycle_replay_at_{0.0};
++  td::uint64 inflight_event_sequence_{0};
++  td::int32 inflight_event_id_{0};
++  std::atomic<td::uint64> sent_event_count_{0};
++  std::atomic<td::uint64> sent_datagram_count_{0};
++  std::atomic<td::uint64> dropped_event_count_{0};
++  std::atomic<td::uint64> error_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_persisted_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_acked_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_replayed_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_overflow_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_persistence_error_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_expired_count_{0};
++  std::atomic<td::uint64> managed_lifecycle_ack_error_count_{0};
++};
++
++}  // namespace telegram_bot_api
+diff --git a/telegram-bot-api/UpdateTapTest.cpp b/telegram-bot-api/UpdateTapTest.cpp
+new file mode 100644
+index 0000000..288592d
+--- /dev/null
++++ b/telegram-bot-api/UpdateTapTest.cpp
+@@ -0,0 +1,371 @@
++//
++// Copyright (c) 2026 Phenogram contributors
++//
++// Distributed under the Boost Software License, Version 1.0. (See accompanying
++// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
++//
++#include "telegram-bot-api/ClientParameters.h"
++#include "telegram-bot-api/UpdateTap.h"
++
++#include "td/db/TQueue.h"
++
++#include <algorithm>
++#include <array>
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#include <cassert>
++#include <chrono>
++#include <cstring>
++#include <iostream>
++#include <string>
++#include <thread>
++#include <vector>
++
++#if !TD_WINDOWS
++#include <cstddef>
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/un.h>
++#include <unistd.h>
++#endif
++
++namespace {
++
++#if !TD_WINDOWS
++
++using telegram_bot_api::UpdateTap;
++
++void test_gateway_drain_fence_orders_late_queries() {
++  telegram_bot_api::SharedData shared_data;
++  auto prod_id = shared_data.register_active_bot_query("123456:old-secret", false);
++  auto test_id = shared_data.register_active_bot_query("123456:old-secret", true);
++  assert(prod_id == 123456);
++  assert(test_id == 123456);
++  assert(shared_data.get_active_bot_query_count(prod_id, false) == 1);
++  assert(shared_data.get_active_bot_query_count(test_id, true) == 1);
++
++  assert(shared_data.install_gateway_drain_fence("123456:old-secret", false, 41) == prod_id);
++  assert(shared_data.is_gateway_query_fenced("123456:old-secret", false, 40));
++  assert(shared_data.is_gateway_query_fenced("123456:old-secret", false, 41));
++  assert(!shared_data.is_gateway_query_fenced("123456:old-secret", false, 42));
++  assert(!shared_data.is_gateway_query_fenced("123456:new-secret", false, 41));
++  assert(!shared_data.is_gateway_query_fenced("123456:old-secret", true, 41));
++
++  shared_data.unregister_active_bot_query(prod_id, false);
++  shared_data.unregister_active_bot_query(test_id, true);
++  assert(shared_data.get_active_bot_query_count(prod_id, false) == 0);
++  assert(shared_data.get_active_bot_query_count(test_id, true) == 0);
++}
++
++td::uint16 load_u16(const td::uint8 *source) {
++  return static_cast<td::uint16>((static_cast<td::uint16>(source[0]) << 8) | source[1]);
++}
++
++td::uint32 load_u32(const td::uint8 *source) {
++  return (static_cast<td::uint32>(source[0]) << 24) | (static_cast<td::uint32>(source[1]) << 16) |
++         (static_cast<td::uint32>(source[2]) << 8) | source[3];
++}
++
++td::uint64 load_u64(const td::uint8 *source) {
++  return (static_cast<td::uint64>(load_u32(source)) << 32) | load_u32(source + 4);
++}
++
++class UnixDatagramReceiver final {
++ public:
++  explicit UnixDatagramReceiver(std::string path, bool small_buffer = false) : path_(std::move(path)) {
++    unlink(path_.c_str());
++    fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
++    assert(fd_ >= 0);
++    int receive_buffer_size = small_buffer ? 4096 : 1 << 20;
++    assert(setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &receive_buffer_size, sizeof(receive_buffer_size)) == 0);
++    timeval timeout{1, 0};
++    assert(setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
++
++    sockaddr_un address{};
++    address.sun_family = AF_UNIX;
++    assert(path_.size() < sizeof(address.sun_path));
++    std::memcpy(address.sun_path, path_.data(), path_.size());
++    address.sun_path[path_.size()] = '\0';
++    auto address_length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path_.size() + 1);
++    auto bind_result = bind(fd_, reinterpret_cast<const sockaddr *>(&address), address_length);
++    if (bind_result != 0) {
++      std::cerr << "Failed to bind " << path_ << ": " << std::strerror(errno) << std::endl;
++    }
++    assert(bind_result == 0);
++  }
++
++  UnixDatagramReceiver(const UnixDatagramReceiver &) = delete;
++  UnixDatagramReceiver &operator=(const UnixDatagramReceiver &) = delete;
++
++  ~UnixDatagramReceiver() {
++    if (fd_ >= 0) {
++      close(fd_);
++    }
++    unlink(path_.c_str());
++  }
++
++  std::vector<td::uint8> receive() const {
++    std::array<td::uint8, UpdateTap::MAX_DATAGRAM_SIZE + 1> buffer{};
++    auto size = recv(fd_, buffer.data(), buffer.size(), 0);
++    if (size < static_cast<ssize_t>(UpdateTap::HEADER_SIZE)) {
++      std::cerr << "Receive failed or short on " << path_ << ": size=" << size
++                << " error=" << std::strerror(errno) << std::endl;
++    }
++    assert(size >= static_cast<ssize_t>(UpdateTap::HEADER_SIZE));
++    assert(size <= static_cast<ssize_t>(UpdateTap::MAX_DATAGRAM_SIZE));
++    return {buffer.begin(), buffer.begin() + size};
++  }
++
++ private:
++  std::string path_;
++  int fd_{-1};
++};
++
++std::string make_socket_path(const char *suffix) {
++  return "/tmp/phenogram-update-tap-" + std::to_string(getpid()) + "-" + suffix + ".sock";
++}
++
++void validate_header(const std::vector<td::uint8> &frame, td::uint64 bot_id, td::uint32 update_id,
++                     td::uint32 expires_at, std::size_t total_length, std::size_t fragment_index,
++                     std::size_t fragment_count, std::size_t fragment_offset, std::size_t fragment_length,
++                     bool is_test_dc, td::uint8 frame_type = 1, td::uint64 reserved = 0) {
++  assert(std::memcmp(frame.data(), "PGUT", 4) == 0);
++  assert(frame[4] == 1);
++  assert(frame[5] == frame_type);
++  assert(frame[6] == (is_test_dc ? 1 : 0));
++  assert(frame[7] == UpdateTap::HEADER_SIZE);
++  assert(load_u64(frame.data() + 8) != 0);
++  assert(load_u64(frame.data() + 16) != 0);
++  assert(load_u64(frame.data() + 24) == bot_id);
++  assert(load_u32(frame.data() + 32) == update_id);
++  assert(load_u32(frame.data() + 36) == expires_at);
++  assert(load_u32(frame.data() + 40) == total_length);
++  assert(load_u32(frame.data() + 44) == fragment_offset);
++  assert(load_u16(frame.data() + 48) == fragment_index);
++  assert(load_u16(frame.data() + 50) == fragment_count);
++  assert(load_u32(frame.data() + 52) == fragment_length);
++  assert(load_u64(frame.data() + 56) == reserved);
++  assert(frame.size() == UpdateTap::HEADER_SIZE + fragment_length);
++}
++
++void send_datagram(const std::string &path, const std::vector<td::uint8> &frame) {
++  auto fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++  assert(fd >= 0);
++  sockaddr_un address{};
++  address.sun_family = AF_UNIX;
++  assert(path.size() < sizeof(address.sun_path));
++  std::memcpy(address.sun_path, path.data(), path.size());
++  address.sun_path[path.size()] = '\0';
++  auto address_length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
++  assert(sendto(fd, frame.data(), frame.size(), 0, reinterpret_cast<const sockaddr *>(&address), address_length) ==
++         static_cast<ssize_t>(frame.size()));
++  close(fd);
++}
++
++void test_managed_bot_lifecycle_is_durable_until_exact_ack() {
++  auto path = make_socket_path("managed-bot");
++  auto ack_path = make_socket_path("managed-bot-ack");
++  UnixDatagramReceiver receiver(path);
++  UpdateTap tap(path, ack_path);
++  auto tqueue = td::TQueue::create();
++  constexpr td::int32 now = 2000000000;
++
++  tap.queue_managed_bot_lifecycle(*tqueue, now, 1.0, 123456789, true, 444444444, 987654321);
++  auto frame = receiver.receive();
++  auto event_id = load_u32(frame.data() + 32);
++  auto expires_at = load_u32(frame.data() + 36);
++  auto delivery_nonce = load_u64(frame.data() + 56);
++  auto first_sequence = load_u64(frame.data() + 16);
++  assert(event_id != 0);
++  assert(expires_at == now + UpdateTap::MANAGED_LIFECYCLE_RETENTION_SECONDS);
++  assert(delivery_nonce != 0);
++  validate_header(frame, 123456789, event_id, expires_at, 16, 0, 1, 0, 16, true, 2, delivery_nonce);
++  assert(load_u64(frame.data() + UpdateTap::HEADER_SIZE) == 444444444);
++  assert(load_u64(frame.data() + UpdateTap::HEADER_SIZE + 8) == 987654321);
++  assert(tap.managed_lifecycle_pending_count(*tqueue) == 1);
++  assert(tap.managed_lifecycle_persisted_count() == 1);
++
++  // A lost frame or acknowledgement leaves the queue head intact. The replay
++  // keeps the durable event ID and nonce while assigning a fresh wire sequence.
++  tap.replay_managed_bot_lifecycle(*tqueue, now, 2.1);
++  auto replay = receiver.receive();
++  validate_header(replay, 123456789, event_id, expires_at, 16, 0, 1, 0, 16, true, 2, delivery_nonce);
++  assert(load_u64(replay.data() + 16) != first_sequence);
++  assert(tap.managed_lifecycle_replayed_count() == 2);
++
++  auto bad_ack = replay;
++  std::memcpy(bad_ack.data(), "PGUA", 4);
++  bad_ack.back() ^= 1;
++  send_datagram(ack_path, bad_ack);
++  tap.replay_managed_bot_lifecycle(*tqueue, now, 2.2);
++  assert(tap.managed_lifecycle_pending_count(*tqueue) == 1);
++  assert(tap.managed_lifecycle_ack_error_count() == 1);
++
++  auto good_ack = replay;
++  std::memcpy(good_ack.data(), "PGUA", 4);
++  send_datagram(ack_path, good_ack);
++  tap.replay_managed_bot_lifecycle(*tqueue, now, 2.3);
++  assert(tap.managed_lifecycle_pending_count(*tqueue) == 0);
++  assert(tap.managed_lifecycle_acked_count() == 1);
++}
++
++void test_single_frame_and_recovery() {
++  auto path = make_socket_path("single");
++  unlink(path.c_str());
++  UpdateTap tap(path);
++
++  const std::string payload = "\"message\":{\"message_id\":42}";
++  tap.send_update(123456789, false, 717, 2000000000, td::Slice(payload));
++  assert(tap.dropped_event_count() == 1);
++  assert(tap.error_count() == 1);
++
++  {
++    UnixDatagramReceiver receiver(path);
++    tap.send_update(123456789, false, 718, 2000000001, td::Slice(payload));
++    if (tap.sent_event_count() != 1) {
++      std::cerr << "Recovery send failed: errors=" << tap.error_count()
++                << " dropped=" << tap.dropped_event_count() << std::endl;
++    }
++    auto frame = receiver.receive();
++    validate_header(frame, 123456789, 718, 2000000001, payload.size(), 0, 1, 0, payload.size(), false);
++    assert(std::memcmp(frame.data() + UpdateTap::HEADER_SIZE, payload.data(), payload.size()) == 0);
++  }
++
++  assert(tap.sent_event_count() == 1);
++  assert(tap.sent_datagram_count() == 1);
++  assert(tap.dropped_event_count() == 1);
++}
++
++void test_managed_lifecycle_queue_is_bounded_and_expires_fail_open() {
++  auto path = make_socket_path("managed-bounded");
++  unlink(path.c_str());
++  UpdateTap tap(path);
++  auto tqueue = td::TQueue::create();
++  constexpr td::int32 now = 1000000000;
++  for (std::size_t i = 0; i < UpdateTap::MAX_MANAGED_LIFECYCLE_EVENTS; i++) {
++    tap.queue_managed_bot_lifecycle(*tqueue, now, 1.0, 100, false, 200,
++                                    static_cast<td::uint64>(300 + i));
++  }
++  assert(tap.managed_lifecycle_pending_count(*tqueue) == UpdateTap::MAX_MANAGED_LIFECYCLE_EVENTS);
++  tap.queue_managed_bot_lifecycle(*tqueue, now, 1.0, 100, false, 200, 999999);
++  assert(tap.managed_lifecycle_pending_count(*tqueue) == UpdateTap::MAX_MANAGED_LIFECYCLE_EVENTS);
++  assert(tap.managed_lifecycle_overflow_count() == 1);
++
++  tap.replay_managed_bot_lifecycle(*tqueue, now + UpdateTap::MANAGED_LIFECYCLE_RETENTION_SECONDS + 1, 2.1);
++  assert(tap.managed_lifecycle_pending_count(*tqueue) == 0);
++  assert(tap.managed_lifecycle_expired_count() == UpdateTap::MAX_MANAGED_LIFECYCLE_EVENTS);
++}
++
++#if !TD_DARWIN
++void test_fragmentation() {
++  auto path = make_socket_path("fragmentation");
++  UnixDatagramReceiver receiver(path);
++  UpdateTap tap(path);
++
++  std::string payload(UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE + 4096, '\0');
++  for (std::size_t i = 0; i < payload.size(); i++) {
++    payload[i] = static_cast<char>('a' + (i % 23));
++  }
++  const std::size_t expected_fragment_count =
++      (payload.size() + UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE - 1) / UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE;
++  const std::size_t maximum_fragment_count =
++      (UpdateTap::MAX_UPDATE_PAYLOAD_SIZE + UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE - 1) /
++      UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE;
++  assert(expected_fragment_count == 2);
++  assert(maximum_fragment_count == 9);
++  std::vector<std::vector<td::uint8>> frames;
++  frames.reserve(expected_fragment_count);
++  std::thread receiver_thread([&] {
++    for (std::size_t fragment_index = 0; fragment_index < expected_fragment_count; fragment_index++) {
++      frames.push_back(receiver.receive());
++    }
++  });
++  tap.send_update(987654321, true, 1999999999, 2000000100, td::Slice(payload));
++  receiver_thread.join();
++
++  std::string reconstructed(payload.size(), '\0');
++  td::uint64 producer_id = 0;
++  td::uint64 sequence = 0;
++  for (std::size_t fragment_index = 0; fragment_index < expected_fragment_count; fragment_index++) {
++    const auto &frame = frames[fragment_index];
++    auto fragment_offset = fragment_index * UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE;
++    auto fragment_length = std::min(UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE, payload.size() - fragment_offset);
++    validate_header(frame, 987654321, 1999999999, 2000000100, payload.size(), fragment_index,
++                    expected_fragment_count, fragment_offset, fragment_length, true);
++    if (fragment_index == 0) {
++      producer_id = load_u64(frame.data() + 8);
++      sequence = load_u64(frame.data() + 16);
++    } else {
++      assert(load_u64(frame.data() + 8) == producer_id);
++      assert(load_u64(frame.data() + 16) == sequence);
++    }
++    std::memcpy(&reconstructed[fragment_offset], frame.data() + UpdateTap::HEADER_SIZE, fragment_length);
++  }
++  assert(reconstructed == payload);
++  assert(tap.sent_event_count() == 1);
++  assert(tap.sent_datagram_count() == expected_fragment_count);
++  assert(tap.dropped_event_count() == 0);
++  assert(tap.error_count() == 0);
++  std::cout << "UpdateTap fragmentation: exercised_bytes=" << payload.size()
++            << " exercised_fragments=" << expected_fragment_count
++            << " max_bytes=" << UpdateTap::MAX_UPDATE_PAYLOAD_SIZE
++            << " max_fragments=" << maximum_fragment_count << std::endl;
++}
++#endif
++
++void test_oversize_is_dropped() {
++  auto path = make_socket_path("oversize");
++  UnixDatagramReceiver receiver(path);
++  UpdateTap tap(path);
++  std::string payload(UpdateTap::MAX_UPDATE_PAYLOAD_SIZE + 1, 'x');
++  tap.send_update(1, false, 1, 1, td::Slice(payload));
++  assert(tap.sent_event_count() == 0);
++  assert(tap.sent_datagram_count() == 0);
++  assert(tap.dropped_event_count() == 1);
++  assert(tap.error_count() == 1);
++}
++
++void test_backpressure_never_blocks() {
++  auto path = make_socket_path("backpressure");
++  UnixDatagramReceiver receiver(path, true);
++  UpdateTap tap(path);
++  std::string payload(UpdateTap::MAX_FRAGMENT_PAYLOAD_SIZE, 'b');
++
++  auto started_at = std::chrono::steady_clock::now();
++  constexpr td::uint64 EVENT_COUNT = 1000;
++  for (td::uint64 i = 0; i < EVENT_COUNT; i++) {
++    tap.send_update(2, false, static_cast<td::uint32>(i + 1), 2000000000, td::Slice(payload));
++  }
++  auto elapsed = std::chrono::steady_clock::now() - started_at;
++
++  assert(tap.sent_event_count() + tap.dropped_event_count() == EVENT_COUNT);
++  assert(tap.dropped_event_count() > 0);
++  assert(tap.error_count() >= tap.dropped_event_count());
++  assert(elapsed < std::chrono::seconds(3));
++  std::cout << "UpdateTap backpressure: attempted=" << EVENT_COUNT
++            << " sent=" << tap.sent_event_count() << " dropped=" << tap.dropped_event_count()
++            << " errors=" << tap.error_count() << " elapsed_us="
++            << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << std::endl;
++}
++
++#endif
++
++}  // namespace
++
++int main() {
++#if !TD_WINDOWS
++  test_gateway_drain_fence_orders_late_queries();
++  test_single_frame_and_recovery();
++  test_managed_bot_lifecycle_is_durable_until_exact_ack();
++  test_managed_lifecycle_queue_is_bounded_and_expires_fail_open();
++#if !TD_DARWIN
++  test_fragmentation();
++#endif
++  test_oversize_is_dropped();
++  test_backpressure_never_blocks();
++  std::cout << "UpdateTap tests passed" << std::endl;
++#endif
++  return 0;
++}
+diff --git a/telegram-bot-api/telegram-bot-api.cpp b/telegram-bot-api/telegram-bot-api.cpp
+index 15504b1..57883ce 100644
+--- a/telegram-bot-api/telegram-bot-api.cpp
++++ b/telegram-bot-api/telegram-bot-api.cpp
+@@ -10,6 +10,7 @@
+ #include "telegram-bot-api/HttpServer.h"
+ #include "telegram-bot-api/HttpStatConnection.h"
+ #include "telegram-bot-api/Stats.h"
++#include "telegram-bot-api/UpdateTap.h"
+ #include "telegram-bot-api/Watchdog.h"
+
+ #include "td/db/binlog/Binlog.h"
+@@ -186,6 +187,8 @@ int main(int argc, char *argv[]) {
+   td::string temporary_directory;
+   td::string username;
+   td::string groupname;
++  td::string update_tap_socket;
++  td::string update_tap_ack_socket;
+   td::uint64 max_connections = 0;
+   td::uint64 cpu_affinity = 0;
+   td::uint64 main_thread_affinity = 0;
+@@ -274,6 +277,12 @@ int main(int argc, char *argv[]) {
+
+   options.add_option('u', "username", "effective user name to switch to", td::OptionParser::parse_string(username));
+   options.add_option('g', "groupname", "effective group name to switch to", td::OptionParser::parse_string(groupname));
++  options.add_option('\0', "update-tap-socket",
++                     "AF_UNIX SOCK_DGRAM path for best-effort non-blocking update copies",
++                     td::OptionParser::parse_string(update_tap_socket));
++  options.add_option('\0', "update-tap-ack-socket",
++                     "private AF_UNIX SOCK_DGRAM path for managed lifecycle acknowledgements",
++                     td::OptionParser::parse_string(update_tap_ack_socket));
+   options.add_checked_option('c', "max-connections", "maximum number of open file descriptors",
+                              td::OptionParser::parse_integer(max_connections));
+ #if TD_HAVE_THREAD_AFFINITY
+@@ -316,6 +325,12 @@ int main(int argc, char *argv[]) {
+     }
+     return td::Status::OK();
+   });
++  options.add_check([&] {
++    if (update_tap_socket.empty() != update_tap_ack_socket.empty()) {
++      return td::Status::Error("--update-tap-socket and --update-tap-ack-socket must be specified together");
++    }
++    return td::Status::OK();
++  });
+   auto r_non_options = options.run(argc, argv, 0);
+   if (need_print_usage) {
+     LOG(PLAIN) << options;
+@@ -441,6 +456,11 @@ int main(int argc, char *argv[]) {
+
+   parameters->working_directory_ = std::move(working_directory);
+
++  if (!update_tap_socket.empty()) {
++    parameters->update_tap_ =
++        std::make_shared<UpdateTap>(std::move(update_tap_socket), std::move(update_tap_ack_socket));
++  }
++
+   if (parameters->default_max_webhook_connections_ <= 0) {
+     parameters->default_max_webhook_connections_ = parameters->local_mode_ ? 100 : 40;
+   }

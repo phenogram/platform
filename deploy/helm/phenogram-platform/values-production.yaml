@@ -43,7 +43,14 @@ ingress:
   api:
     host: api.phenogram.io
     annotations:
-      nginx.ingress.kubernetes.io/proxy-body-size: "2000m"
+      nginx.ingress.kubernetes.io/enable-access-log: "false"
+      nginx.ingress.kubernetes.io/server-snippet: |
+        error_log /dev/null crit;
+        merge_slashes off;
+        large_client_header_buffers 4 256k;
+        client_header_timeout 500s;
+        client_body_timeout 500s;
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
       nginx.ingress.kubernetes.io/proxy-buffering: "off"
       nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
       nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
@@ -73,6 +80,43 @@ telegramBotApi:
   persistence:
     storageClass: standard
     size: 20Gi
+
+dataPlane:
+  # Shadow resources stay off until the internal route snapshot endpoint,
+  # collector image, and a dedicated canary bot have been verified together.
+  enabled: false
+  publicCutover: false
+  gateway:
+    image:
+      repository: ghcr.io/phenogram/data-plane-gateway
+    persistence:
+      storageClass: standard
+  official:
+    image:
+      repository: ghcr.io/phenogram/telegram-bot-api
+    collector:
+      image:
+        repository: ghcr.io/phenogram/platform
+    fileServer:
+      image:
+        repository: ghcr.io/phenogram/data-plane-gateway
+    pools:
+      - name: standard
+        localMode: false
+        persistence:
+          storageClass: standard
+          accessModes:
+            - ReadWriteOnce
+          size: 20Gi
+          retain: true
+      - name: local
+        localMode: true
+        persistence:
+          storageClass: standard
+          accessModes:
+            - ReadWriteOnce
+          size: 100Gi
+          retain: true
 
 networkPolicy:
   ingressController:

@@ -112,6 +112,27 @@ spec:
     - host: {{ .Values.ingress.api.host | quote }}
       http:
         paths:
+          {{- if and .Values.dataPlane.enabled .Values.dataPlane.publicCutover }}
+          # Only the native Telegram API shapes move to the database-independent
+          # gateway. /telegram, /events, and /public remain on the control app.
+          # ImplementationSpecific is intentional: ingress-nginx's prefix
+          # location matches Telegram's segment-less /bot<TOKEN> form, whereas
+          # Kubernetes Prefix semantics would only match /bot or /bot/... .
+          - path: /bot
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ $fullname }}-data-plane-gateway
+                port:
+                  name: public-http
+          - path: /file
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ $fullname }}-data-plane-gateway
+                port:
+                  name: public-http
+          {{- end }}
           # Route the machine origin into the application and let its strict
           # host-aware router reject every non-machine path. A root Prefix is
           # portable across ingress controllers and includes Telegram's

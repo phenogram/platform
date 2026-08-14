@@ -62,6 +62,7 @@ secrets:
   githubOauthClientSecretKey: GITHUB_OAUTH_CLIENT_SECRET
   telegramApiIdKey: TELEGRAM_API_ID
   telegramApiHashKey: TELEGRAM_API_HASH
+  dataPlaneSyncTokenKey: DATA_PLANE_SYNC_TOKEN
 
 service:
   type: ClusterIP
@@ -93,10 +94,22 @@ ingress:
   api:
     host: api.phenogram.io
     annotations:
-      # Telegram-compatible uploads can reach the local Bot API server's
-      # 2,000 MB limit. Streaming both request and response bodies also keeps
-      # large files and SSE events out of ingress-nginx buffers.
-      nginx.ingress.kubernetes.io/proxy-body-size: "2000m"
+      # Raw Telegram bot tokens are part of /bot<TOKEN> and /file/bot<TOKEN>
+      # request paths. They must never enter ingress access or error logs.
+      nginx.ingress.kubernetes.io/enable-access-log: "false"
+      # This cluster explicitly permits Critical-risk server snippets. Keep the
+      # API host's nginx error log on /dev/null; token-free gateway telemetry
+      # remains available for operational diagnostics.
+      nginx.ingress.kubernetes.io/server-snippet: |
+        error_log /dev/null crit;
+        merge_slashes off;
+        large_client_header_buffers 4 256k;
+        client_header_timeout 500s;
+        client_body_timeout 500s;
+      # Do not add an aggregate ingress limit. The official server enforces
+      # Telegram's per-file limits itself, including multipart requests with
+      # more than one file. Streaming keeps those bodies out of nginx buffers.
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
       nginx.ingress.kubernetes.io/proxy-buffering: "off"
       nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
       nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
@@ -216,3 +229,133 @@ telegramBotApi:
     limits:
       cpu: "2"
       memory: 2Gi
+
+# The replacement Telegram data plane is deliberately staged behind two
+# switches. `enabled` creates private shadow resources. `publicCutover` moves
+# only /bot* and /file* at api.phenogram.io after bot-by-bot migration.
+dataPlane:
+  enabled: false
+  publicCutover: false
+  gateway:
+    image:
+      repository: ghcr.io/phenogram/data-plane-gateway
+      tag: ""
+      digest: ""
+      pullPolicy: IfNotPresent
+    publicPort: 8080
+    adminPort: 9090
+    terminationGracePeriodSeconds: 120
+    routeSnapshot:
+      url: http://phenogram/api/internal/data-plane/routes
+      path: /var/lib/phenogram-gateway/routes.json
+      refreshSeconds: 5
+    telemetry:
+      url: http://phenogram/api/internal/data-plane/telemetry
+      queueCapacity: 4096
+    persistence:
+      storageClass: ""
+      accessModes:
+        - ReadWriteOnce
+      size: 256Mi
+      retain: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: "1"
+        memory: 256Mi
+    probes:
+      startup:
+        failureThreshold: 60
+        periodSeconds: 2
+        timeoutSeconds: 2
+      readiness:
+        failureThreshold: 3
+        periodSeconds: 5
+        timeoutSeconds: 2
+      liveness:
+        failureThreshold: 3
+        periodSeconds: 15
+        timeoutSeconds: 2
+  official:
+    port: 8081
+    dataDir: /var/lib/telegram-bot-api
+    stats:
+      # The official statistics endpoint contains process-wide details and is
+      # reachable only by sidecars in the same pod network namespace.
+      listenAddress: 127.0.0.1
+      port: 8083
+      pollIntervalSeconds: "15"
+    image:
+      repository: ghcr.io/phenogram/telegram-bot-api
+      tag: ""
+      digest: ""
+      pullPolicy: IfNotPresent
+    terminationGracePeriodSeconds: 120
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    fileServer:
+      port: 8082
+      image:
+        # This is the same binary as the gateway, but its digest is advanced
+        # independently so a gateway-only rollout cannot restart Telegram.
+        repository: ghcr.io/phenogram/data-plane-gateway
+        tag: ""
+        digest: ""
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 25m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+    collector:
+      enabled: true
+      controlPort: 8084
+      # Pin this independently in production. A normal control-plane release
+      # must not restart the native Bot API pods merely because the app image
+      # changed.
+      image:
+        repository: ghcr.io/phenogram/platform
+        tag: ""
+        digest: ""
+        pullPolicy: IfNotPresent
+      command: /usr/local/bin/phenogram-tap-collector
+      socketDirectory: /run/phenogram-tap
+      socketPath: /run/phenogram-tap/tap.sock
+      ackSocketPath: /run/phenogram-tap/ack.sock
+      maxEventBytes: "262144"
+      maxInflightEvents: "256"
+      maxInflightBytes: "33554432"
+      reassemblyTimeoutMs: "5000"
+      resources:
+        requests:
+          cpu: 25m
+          memory: 48Mi
+        limits:
+          cpu: 250m
+          memory: 256Mi
+    pools:
+      - name: standard
+        localMode: false
+        persistence:
+          storageClass: ""
+          accessModes:
+            - ReadWriteOnce
+          size: 20Gi
+          retain: true
+      - name: local
+        localMode: true
+        persistence:
+          storageClass: ""
+          accessModes:
+            - ReadWriteOnce
+          size: 100Gi
+          retain: true
