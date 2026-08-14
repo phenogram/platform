@@ -72,7 +72,7 @@ postgresql:
     existingSecret: phenogram-backup-secrets
 
 telegramBotApi:
-  enabled: true
+  enabled: false
   image:
     repository: ghcr.io/phenogram/telegram-bot-api
     tag: ""
@@ -82,10 +82,9 @@ telegramBotApi:
     size: 20Gi
 
 dataPlane:
-  # Keep the replacement data plane private until its pinned shadow resources
-  # are healthy on Contabo. Public /bot and /file traffic remains unchanged.
+  # The pinned official pools and gateway passed their Contabo shadow checks.
   enabled: true
-  publicCutover: false
+  publicCutover: true
   gateway:
     image:
       repository: ghcr.io/phenogram/data-plane-gateway

@@ -94,6 +94,7 @@ jobs:
             --namespace phenogram \
             --values deploy/helm/phenogram-platform/values-production.yaml \
             --set dataPlane.enabled=true \
+            --set dataPlane.publicCutover=false \
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
             --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
@@ -177,6 +178,7 @@ jobs:
             --values deploy/helm/phenogram-platform/values-production.yaml \
             --set dataPlane.enabled=true \
             --set dataPlane.publicCutover=true \
+            --set telegramBotApi.enabled=true \
             --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
             --set-string dataPlane.official.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
             --set-string dataPlane.official.collector.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
