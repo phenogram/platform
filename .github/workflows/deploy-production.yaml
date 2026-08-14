@@ -70,6 +70,8 @@ jobs:
           helm template phenogram deploy/helm/phenogram-platform \
             --namespace phenogram \
             --values deploy/helm/phenogram-platform/values-production.yaml \
+            --set dataPlane.enabled=false \
+            --set dataPlane.publicCutover=false \
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
             --set-string dataPlane.gateway.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
