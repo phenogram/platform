@@ -10,10 +10,32 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 
-STATE: dict[str, object] = {"webhook": {}, "calls": [], "deliveries": []}
+STATE: dict[str, object] = {
+    "webhook": {},
+    "child_webhook": {},
+    "calls": [],
+    "deliveries": [],
+}
 BOT_PATH = re.compile(r"^/bot([^/]+)/([^/]+)$")
 FILE_PATH = re.compile(r"^/file/bot([^/]+)/(.+)$")
-EXPECTED_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+MANAGER_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+CHILD_TOKEN = "987654321:abcdefghijklmnopqrstuvwxyzABCDEF"
+CHILD_BOT_ID = 987654321
+
+BOT_IDENTITIES = {
+    "manager": {
+        "id": 123456789,
+        "is_bot": True,
+        "first_name": "Phenogram Test",
+        "username": "phenogram_test_bot",
+    },
+    "child": {
+        "id": CHILD_BOT_ID,
+        "is_bot": True,
+        "first_name": "Managed E2E Child",
+        "username": "managed_e2e_child_bot",
+    },
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -25,7 +47,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         file_match = FILE_PATH.match(urlparse(self.path).path)
         if file_match:
-            if file_match.group(1) != EXPECTED_TOKEN:
+            if self.bot_name(file_match.group(1)) is None:
                 self.respond(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})
                 return
             data = b"phenogram-test-file\n"
@@ -41,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/__reset":
             STATE["webhook"] = {}
+            STATE["child_webhook"] = {}
             STATE["calls"] = []
             STATE["deliveries"] = []
             self.respond(200, {"ok": True})
@@ -66,16 +89,31 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"ok": False, "error_code": 404, "description": "Not Found"})
             return
         token, method = match.groups()
-        if token != EXPECTED_TOKEN:
+        bot_name = self.bot_name(token)
+        if bot_name is None:
             self.respond(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})
             return
         params = self.params(parsed.query)
         normalized = method.lower()
-        STATE["calls"].append({"method": method, "params": params})
+        STATE["calls"].append({"bot": bot_name, "method": method, "params": params})
         if normalized == "getme":
-            result = {"id": 123456789, "is_bot": True, "first_name": "Phenogram Test", "username": "phenogram_test_bot"}
+            result = BOT_IDENTITIES[bot_name]
+        elif normalized == "getmanagedbottoken":
+            if bot_name != "manager" or int(params.get("user_id", 0)) != CHILD_BOT_ID:
+                self.respond(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: managed bot not found",
+                    },
+                )
+                return
+            # This credential is deliberately returned only on the API wire. It
+            # is never copied into STATE, request history, or HTTP logs.
+            result = CHILD_TOKEN
         elif normalized == "getwebhookinfo":
-            webhook = STATE["webhook"]
+            webhook = self.webhook(bot_name)
             result = {
                 "url": webhook.get("url", ""),
                 "has_custom_certificate": webhook.get("has_custom_certificate", False),
@@ -85,10 +123,10 @@ class Handler(BaseHTTPRequestHandler):
                 if field in webhook:
                     result[field] = webhook[field]
         elif normalized == "setwebhook":
-            STATE["webhook"] = params
+            STATE[self.webhook_key(bot_name)] = params
             result = True
         elif normalized == "deletewebhook":
-            STATE["webhook"] = {}
+            STATE[self.webhook_key(bot_name)] = {}
             result = True
         elif normalized == "sendmessage":
             result = {
@@ -103,6 +141,23 @@ class Handler(BaseHTTPRequestHandler):
         else:
             result = {"method": method, "echo": params}
         self.respond(200, {"ok": True, "result": result})
+
+    @staticmethod
+    def bot_name(token: str) -> str | None:
+        if token == MANAGER_TOKEN:
+            return "manager"
+        if token == CHILD_TOKEN:
+            return "child"
+        return None
+
+    @staticmethod
+    def webhook_key(bot_name: str) -> str:
+        return "webhook" if bot_name == "manager" else "child_webhook"
+
+    def webhook(self, bot_name: str) -> dict[str, object]:
+        webhook = STATE[self.webhook_key(bot_name)]
+        assert isinstance(webhook, dict)
+        return webhook
 
     def params(self, query: str) -> dict[str, object]:
         values: dict[str, object] = {key: item[-1] for key, item in parse_qs(query).items()}
@@ -129,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     STATE["webhook"] = {}
+    STATE["child_webhook"] = {}
     STATE["calls"] = []
     STATE["deliveries"] = []
     port = int(os.environ.get("MOCK_TELEGRAM_PORT", "18081"))

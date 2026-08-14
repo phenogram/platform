@@ -1,5 +1,6 @@
 {{- if .Values.ingress.enabled }}
 {{- $fullname := include "phenogram.fullname" . -}}
+{{- $apiAnnotations := mergeOverwrite (dict) .Values.ingress.annotations .Values.ingress.api.annotations -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -9,7 +10,7 @@ metadata:
   labels:
     {{- include "phenogram.labels" . | nindent 4 }}
     app.kubernetes.io/component: landing-ingress
-  {{- with omit .Values.ingress.annotations "traefik.ingress.kubernetes.io/router.pathmatcher" }}
+  {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -56,7 +57,7 @@ metadata:
   labels:
     {{- include "phenogram.labels" . | nindent 4 }}
     app.kubernetes.io/component: app-ingress
-  {{- with omit .Values.ingress.annotations "traefik.ingress.kubernetes.io/router.pathmatcher" }}
+  {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -92,7 +93,7 @@ metadata:
   labels:
     {{- include "phenogram.labels" . | nindent 4 }}
     app.kubernetes.io/component: api-ingress
-  {{- with .Values.ingress.annotations }}
+  {{- with $apiAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -110,15 +111,15 @@ spec:
     - host: {{ .Values.ingress.api.host | quote }}
       http:
         paths:
-          # Traefik's explicit PathPrefix matcher is required for the Telegram
-          # shape /bot<TOKEN>/..., which is not a Kubernetes path-segment prefix.
-          {{- range list "/bot" "/file" "/telegram" "/events" "/public" }}
-          - path: {{ . | quote }}
+          # Route the machine origin into the application and let its strict
+          # host-aware router reject every non-machine path. A root Prefix is
+          # portable across ingress controllers and includes Telegram's
+          # segment-less /bot<TOKEN>/... compatibility shape.
+          - path: /
             pathType: Prefix
             backend:
               service:
                 name: {{ $fullname }}
                 port:
                   name: http
-          {{- end }}
 {{- end }}

@@ -26,6 +26,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = AppState::new(config, pool)?;
 
     tokio::spawn(phenogram_platform::retention::run(state.clone()));
+    tokio::spawn(phenogram_platform::telegram::run_managed_bot_sync_worker(
+        state.clone(),
+    ));
     for _ in 0..4 {
         tokio::spawn(phenogram_platform::telegram::run_delivery_worker(
             state.clone(),

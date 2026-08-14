@@ -23,6 +23,7 @@
     health: null,
     csrfToken: null,
     bots: [],
+    botCoverage: null,
     selectedBotId: null,
     bot: null,
     activity: [],
@@ -203,6 +204,108 @@
     return 30;
   };
 
+  const isManagedBot = (bot) => bot?.is_managed === true || String(bot?.bot_kind || "").toLowerCase() === "managed";
+  const connectedBots = () => state.bots.filter((bot) => !isManagedBot(bot));
+  const botManagerId = (bot) => String(bot?.manager_bot_id || "");
+  const botRetentionDays = (bot) => {
+    const effective = Number(bot?.effective_retention_days);
+    return Number.isFinite(effective) && effective > 0 ? effective : retentionDays();
+  };
+  const retentionLabel = (bot) => botRetentionDays(bot) === 1 ? "24-hour history" : `${formatNumber(botRetentionDays(bot))}-day history`;
+  const retentionValue = (bot) => botRetentionDays(bot) === 1 ? "24 hours" : `${formatNumber(botRetentionDays(bot))} days`;
+  const botRetentionWarning = (bot) => {
+    const warning = String(bot?.retention_warning || "").toLowerCase();
+    return ["manager_missing", "free_plan", "plan_limit"].includes(warning) ? warning : null;
+  };
+  const botNeedsRetentionWarning = (bot) => isManagedBot(bot)
+    && (botRetentionWarning(bot) != null || bot?.plan_covered === false || botRetentionDays(bot) <= 1);
+  const telegramBotId = (bot) => String(bot?.telegram_bot_id || bot?.telegram_id || "");
+  const findManagerBot = (bot) => {
+    const managerId = botManagerId(bot);
+    if (managerId) {
+      const manager = state.bots.find((candidate) => botId(candidate) === managerId && botId(candidate) !== botId(bot));
+      if (manager) return manager;
+    }
+    const managerTelegramId = String(bot?.manager_telegram_bot_id || "");
+    return managerTelegramId
+      ? state.bots.find((candidate) => telegramBotId(candidate) === managerTelegramId && botId(candidate) !== botId(bot)) || null
+      : null;
+  };
+  const managerLabel = (bot) => {
+    const manager = findManagerBot(bot);
+    if (manager) return botUsername(manager) !== "Telegram bot" ? botUsername(manager) : botName(manager);
+    const username = String(bot?.manager_username || "").replace(/^@/, "");
+    const managerTelegramId = String(bot?.manager_telegram_bot_id || "");
+    return username ? `@${username}` : bot?.manager_display_name || (managerTelegramId ? `bot ${managerTelegramId}` : "manager bot");
+  };
+  const botAncestorChain = (bot) => {
+    if (!bot) return [];
+    const ancestors = [];
+    const seen = new Set([botId(bot)]);
+    let current = bot;
+    while (isManagedBot(current)) {
+      const manager = findManagerBot(current);
+      const id = botId(manager);
+      if (!manager || !id || seen.has(id)) break;
+      ancestors.unshift(manager);
+      seen.add(id);
+      current = manager;
+    }
+    return [...ancestors, bot];
+  };
+  const managedDescendantCount = (bot) => state.bots.filter((candidate) => isManagedBot(candidate)
+    && botAncestorChain(candidate).slice(0, -1).some((ancestor) => botId(ancestor) === botId(bot))).length;
+  const sortBots = (bots) => [...bots].sort((left, right) => botName(left).localeCompare(botName(right), undefined, { sensitivity: "base" }));
+  const botHierarchy = () => {
+    const childrenByManager = new Map();
+    state.bots.filter(isManagedBot).forEach((bot) => {
+      const manager = findManagerBot(bot);
+      if (!manager) return;
+      const managerId = botId(manager);
+      const children = childrenByManager.get(managerId) || [];
+      children.push(bot);
+      childrenByManager.set(managerId, children);
+    });
+    childrenByManager.forEach((children, id) => childrenByManager.set(id, sortBots(children)));
+
+    const included = new Set();
+    const buildNode = (bot, ancestors = new Set()) => {
+      const id = botId(bot);
+      included.add(id);
+      const path = new Set(ancestors);
+      path.add(id);
+      const children = (childrenByManager.get(id) || [])
+        .filter((child) => !path.has(botId(child)) && !included.has(botId(child)))
+        .map((child) => buildNode(child, path));
+      return { bot, children };
+    };
+
+    const roots = sortBots(connectedBots()).map((bot) => buildNode(bot));
+    const remaining = () => sortBots(state.bots.filter((bot) => isManagedBot(bot) && !included.has(botId(bot))));
+    const orphans = [];
+    remaining().filter((bot) => !findManagerBot(bot)).forEach((bot) => {
+      if (!included.has(botId(bot))) orphans.push(buildNode(bot));
+    });
+    while (remaining().length) orphans.push(buildNode(remaining()[0]));
+    return { roots, orphans };
+  };
+  const coverageStats = () => {
+    const coverage = state.botCoverage || {};
+    const fallbackCovered = state.bots.filter((bot) => bot?.plan_covered !== false).length;
+    const fallbackUncovered = state.bots.filter((bot) => bot?.plan_covered === false).length;
+    const coveredValue = Number(coverage.covered_bot_count);
+    const uncoveredValue = Number(coverage.uncovered_bot_count);
+    const limitValue = Number(coverage.bot_limit);
+    const covered = Number.isFinite(coveredValue) ? coveredValue : fallbackCovered;
+    const uncovered = Number.isFinite(uncoveredValue) ? uncoveredValue : fallbackUncovered;
+    return {
+      covered,
+      uncovered,
+      total: covered + uncovered,
+      limit: Number.isFinite(limitValue) ? limitValue : membershipLimit(),
+    };
+  };
+
   const formatNumber = (value) => {
     const number = Number(value);
     return Number.isFinite(number) ? new Intl.NumberFormat(undefined, { notation: number > 9999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(number) : "—";
@@ -342,6 +445,7 @@
     state.membership = null;
     state.csrfToken = null;
     state.bots = [];
+    state.botCoverage = null;
     state.mobileMenu = false;
     state.phase = "guest";
     closeModal({ restoreFocus: false });
@@ -416,8 +520,10 @@
       if (state.sessionVersion !== sessionVersion || !requestIsCurrent("bots", ticket)) return;
       const bots = listFrom(payload, "bots");
       state.bots = bots;
+      state.botCoverage = payload?.coverage || payload?.data?.coverage || null;
       if (!state.selectedBotId || !bots.some((bot) => botId(bot) === String(state.selectedBotId))) {
-        selectBot(bots[0] ? botId(bots[0]) : null);
+        const preferred = bots.find((bot) => !isManagedBot(bot)) || bots[0];
+        selectBot(preferred ? botId(preferred) : null);
       }
     } catch (error) {
       if (state.sessionVersion !== sessionVersion || !requestIsCurrent("bots", ticket)) return;
@@ -437,7 +543,8 @@
       const payload = await api(`/bots/${encodeURIComponent(id)}`);
       if (!botRequestIsCurrent("bot", ticket, id, contextVersion)) return;
       const core = unwrap(payload, "bot") || payload;
-      state.bot = { ...(core || {}), ...(payload?.stats || {}), integration: payload?.integration || core?.integration };
+      const existing = state.bots.find((candidate) => botId(candidate) === String(id));
+      state.bot = { ...(existing || {}), ...(core || {}), ...(payload?.stats || {}), integration: payload?.integration || core?.integration };
       if (payload?.membership) state.membership = payload.membership;
       const index = state.bots.findIndex((candidate) => botId(candidate) === String(id));
       if (state.bot && index >= 0) state.bots[index] = { ...state.bots[index], ...state.bot };
@@ -758,9 +865,106 @@
     </main>`;
   }
 
+  const descendantCount = (node) => node.children.reduce((count, child) => count + 1 + descendantCount(child), 0);
+
+  function renderSidebarBotNode(node) {
+    const bot = node.bot;
+    const id = botId(bot);
+    const selected = id === String(state.selectedBotId);
+    const current = selected && state.route.name.startsWith("bot-");
+    const managed = isManagedBot(bot);
+    const warning = botNeedsRetentionWarning(bot);
+    const descendants = descendantCount(node);
+    const meta = managed
+      ? warning ? "24-hour history" : retentionLabel(bot)
+      : descendants ? `${descendants} managed bot${descendants === 1 ? "" : "s"}` : "Connected bot";
+    return `<li class="sidebar-bot-node ${managed ? "is-managed" : "is-connected"}"><a class="sidebar-bot ${selected ? "active" : ""} ${warning ? "has-warning" : ""}" href="${botPath(id, "overview")}"${current ? ' aria-current="page"' : ""}><span class="sidebar-bot__marker">${icon("bot")}</span><span class="sidebar-bot__copy"><strong>${esc(botName(bot))}</strong><span>${esc(meta)}</span></span>${warning ? '<span class="sidebar-bot__warning" aria-label="24-hour history">24h</span>' : ""}</a>${node.children.length ? `<ul>${node.children.map(renderSidebarBotNode).join("")}</ul>` : ""}</li>`;
+  }
+
+  function renderSidebarBotTree() {
+    const { roots, orphans } = botHierarchy();
+    if (!roots.length && !orphans.length) return "";
+    return `<nav class="sidebar-bot-scroll" aria-label="Bot hierarchy">${roots.length ? `<ul class="sidebar-bot-tree">${roots.map(renderSidebarBotNode).join("")}</ul>` : ""}${orphans.length ? `<div class="sidebar-orphans"><p>${icon("alert")}Manager not connected</p><ul class="sidebar-bot-tree">${orphans.map(renderSidebarBotNode).join("")}</ul></div>` : ""}</nav>`;
+  }
+
+  function renderPickerBotNode(node) {
+    const bot = node.bot;
+    const id = botId(bot);
+    const selected = id === String(state.selectedBotId);
+    const managed = isManagedBot(bot);
+    const warning = botNeedsRetentionWarning(bot);
+    const descendants = descendantCount(node);
+    const meta = managed
+      ? `Managed by ${managerLabel(bot)} · ${retentionLabel(bot)}`
+      : `${botUsername(bot)}${descendants ? ` · ${descendants} managed bot${descendants === 1 ? "" : "s"}` : ""}`;
+    return `<li><button class="bot-picker-item ${managed ? "is-managed" : ""} ${selected ? "active" : ""} ${warning ? "has-warning" : ""}" type="button" data-action="pick-bot" data-bot-id="${esc(id)}" aria-pressed="${selected ? "true" : "false"}"><span class="bot-avatar">${initials(botName(bot))}</span><span class="bot-picker-item__copy"><span><strong>${esc(botName(bot))}</strong>${managed ? '<em>Managed</em>' : ""}</span><small>${esc(meta)}</small></span>${warning ? '<span class="badge badge--warning">24-hour history</span>' : selected ? icon("check") : icon("chevron")}</button>${node.children.length ? `<ul>${node.children.map(renderPickerBotNode).join("")}</ul>` : ""}</li>`;
+  }
+
+  function renderBotPickerTree() {
+    const { roots, orphans } = botHierarchy();
+    if (!roots.length && !orphans.length) return '<div class="empty-state empty-state--modal"><p>No bots connected yet.</p></div>';
+    return `${roots.length ? `<section class="bot-picker-group" aria-labelledby="connected-bots-label"><h3 id="connected-bots-label">Connected managers and their bots</h3><ul class="bot-picker-tree">${roots.map(renderPickerBotNode).join("")}</ul></section>` : ""}${orphans.length ? `<section class="bot-picker-group bot-picker-group--warning" aria-labelledby="orphan-bots-label"><div class="bot-picker-group__warning"><span>${icon("alert")}</span><div><h3 id="orphan-bots-label">Manager not connected</h3><p>These bot families have no connected root manager. History coverage is shown for each bot.</p></div></div><ul class="bot-picker-tree">${orphans.map(renderPickerBotNode).join("")}</ul></section>` : ""}`;
+  }
+
+  function renderRetentionWarning(bot, { compact = false } = {}) {
+    if (!botNeedsRetentionWarning(bot)) return "";
+    const warning = botRetentionWarning(bot);
+    const coverage = coverageStats();
+    const title = warning === "manager_missing" ? "Manager not connected · 24-hour history"
+      : warning === "plan_limit" ? "Outside full-history coverage"
+        : "24-hour history for this managed bot";
+    const copy = warning === "manager_missing"
+      ? "This managed bot does not have a connected manager in this workspace, so only the last 24 hours are kept."
+      : warning === "plan_limit"
+        ? `Your plan covers ${coverage.covered} of ${coverage.total} bots with full history. Only the last 24 hours are kept for this bot.`
+        : warning === "free_plan"
+          ? "The Free plan keeps 24 hours of history for managed bots. Connected bots keep the plan’s full history."
+          : "Only the last 24 hours of updates and conversations are kept for this managed bot.";
+    return `<div class="status-banner retention-warning ${compact ? "retention-warning--compact" : ""}" role="status" aria-label="Managed bot retention warning">${icon("alert")}<div class="status-banner__copy"><strong>${esc(title)}</strong>${esc(copy)}</div></div>`;
+  }
+
+  function renderCoverageSummary({ compact = false } = {}) {
+    const coverage = coverageStats();
+    const percentage = coverage.total ? Math.round((coverage.covered / coverage.total) * 100) : 0;
+    const uncoveredCopy = coverage.uncovered
+      ? `${coverage.uncovered} managed bot${coverage.uncovered === 1 ? " keeps" : "s keep"} only 24 hours of history.`
+      : "Every bot keeps its full plan history.";
+    return `<section class="coverage-summary ${compact ? "coverage-summary--compact" : ""} ${coverage.uncovered ? "has-warning" : ""}" aria-label="Bot history coverage"><div class="coverage-summary__copy"><span class="stat-label">Full-history coverage</span><strong>${coverage.covered} of ${coverage.total} bots</strong><p>${esc(uncoveredCopy)} ${esc(membershipPlan())} includes full history for up to ${coverage.limit} bot${coverage.limit === 1 ? "" : "s"}.</p><progress class="progress" value="${percentage}" max="100" aria-label="${coverage.covered} of ${coverage.total} bots have full history">${percentage}%</progress></div><dl class="coverage-summary__stats"><div><dt>Covered</dt><dd>${coverage.covered}</dd></div><div class="${coverage.uncovered ? "is-warning" : ""}"><dt>24-hour</dt><dd>${coverage.uncovered}</dd></div><div><dt>Total</dt><dd>${coverage.total}</dd></div></dl></section>`;
+  }
+
+  function renderPortfolioBotNode(node) {
+    const bot = node.bot;
+    const managed = isManagedBot(bot);
+    const warning = botNeedsRetentionWarning(bot);
+    return `<li><a class="portfolio-bot ${managed ? "is-managed" : ""} ${warning ? "has-warning" : ""}" href="${botPath(botId(bot), "overview")}"><span class="portfolio-bot__marker">${icon("bot")}</span><span class="portfolio-bot__copy"><strong>${esc(botName(bot))}</strong><span>${esc(managed ? `Managed by ${managerLabel(bot)}` : botUsername(bot))}</span></span><span class="portfolio-bot__retention ${warning ? "is-warning" : ""}">${esc(retentionLabel(bot))}</span></a>${node.children.length ? `<ul>${node.children.map(renderPortfolioBotNode).join("")}</ul>` : ""}</li>`;
+  }
+
+  function renderPortfolioPanel() {
+    const { roots, orphans } = botHierarchy();
+    return `<section class="panel portfolio-panel"><div class="panel__head"><div><h2>Bot portfolio</h2><p>Managed bots appear automatically beneath their manager.</p></div><a class="btn btn--ghost btn--sm" href="#/bots">View all ${icon("chevron")}</a></div><div class="panel__body">${renderCoverageSummary({ compact: true })}<div class="portfolio-tree">${roots.length ? `<ul>${roots.map(renderPortfolioBotNode).join("")}</ul>` : ""}${orphans.length ? `<div class="portfolio-orphans"><p>${icon("alert")}Manager not connected</p><ul>${orphans.map(renderPortfolioBotNode).join("")}</ul></div>` : ""}</div></div></section>`;
+  }
+
+  function renderManagedBotNode(node) {
+    const bot = node.bot;
+    const warning = botNeedsRetentionWarning(bot);
+    return `<li><a class="managed-bot-row ${warning ? "has-warning" : ""}" href="${botPath(botId(bot), "overview")}"><span class="bot-avatar">${initials(botName(bot))}</span><span class="managed-bot-row__copy"><span><strong>${esc(botName(bot))}</strong><em>Managed</em></span><small>${esc(botUsername(bot))} · Managed by ${esc(managerLabel(bot))}</small></span><span class="managed-bot-row__state">${warning ? '<span class="badge badge--warning">24-hour history</span>' : `<span>${esc(retentionLabel(bot))}</span>`}${renderBotStatusBadge(bot)}</span><span class="managed-bot-row__arrow">${icon("chevron")}</span></a>${node.children.length ? `<ul>${node.children.map(renderManagedBotNode).join("")}</ul>` : ""}</li>`;
+  }
+
+  function renderBotFamily(node) {
+    const bot = node.bot;
+    const descendants = descendantCount(node);
+    return `<article class="bot-family"><div class="bot-family__eyebrow">${descendants ? "Connected manager" : "Connected bot"}</div>${renderBotCard(bot, descendants)}${node.children.length ? `<div class="bot-family__children"><div class="bot-family__children-head"><strong>Managed bots</strong><span>${descendants} total</span></div><ul>${node.children.map(renderManagedBotNode).join("")}</ul></div>` : '<div class="bot-family__empty">Managed bots will appear here automatically.</div>'}</article>`;
+  }
+
+  function renderBotFamilies() {
+    const { roots, orphans } = botHierarchy();
+    return `<div class="bot-families">${roots.map(renderBotFamily).join("")}${orphans.length ? `<section class="orphan-bot-family" aria-labelledby="orphan-family-title"><header><span class="orphan-bot-family__icon">${icon("alert")}</span><div><h2 id="orphan-family-title">Manager not connected</h2><p>These bot families have no connected root manager. Each bot below shows its own history coverage.</p></div><span class="badge badge--warning">${orphans.reduce((count, node) => count + 1 + descendantCount(node), 0)} bots</span></header><ul>${orphans.map(renderManagedBotNode).join("")}</ul></section>` : ""}</div>`;
+  }
+
   function renderApp() {
     const bot = currentBot();
     const routeName = state.route.name;
+    const botCrumb = bot ? botAncestorChain(bot).map((item) => botUsername(item) === "Telegram bot" ? botName(item) : botUsername(item)).join(" › ") : "";
     const titleMap = {
       overview: "Overview",
       bots: "Bots",
@@ -779,7 +983,7 @@
       <button class="mobile-overlay" type="button" data-action="close-menu" aria-label="Close navigation" aria-hidden="${state.mobileMenu ? "false" : "true"}" tabindex="${state.mobileMenu ? "0" : "-1"}"></button>
       <div class="app-main">
         <header class="topbar">
-          <div class="topbar__left"><button class="btn btn--ghost btn--icon mobile-menu-btn" type="button" data-action="toggle-menu" aria-label="${state.mobileMenu ? "Close" : "Open"} navigation" aria-controls="app-sidebar" aria-expanded="${state.mobileMenu ? "true" : "false"}">${icon(state.mobileMenu ? "close" : "menu")}</button><span class="topbar__title">${esc(titleMap[routeName] || "Phenogram")}</span>${bot && routeName.startsWith("bot-") ? `<span class="topbar__crumb">${esc(botUsername(bot))}</span>` : ""}</div>
+          <div class="topbar__left"><button class="btn btn--ghost btn--icon mobile-menu-btn" type="button" data-action="toggle-menu" aria-label="${state.mobileMenu ? "Close" : "Open"} navigation" aria-controls="app-sidebar" aria-expanded="${state.mobileMenu ? "true" : "false"}">${icon(state.mobileMenu ? "close" : "menu")}</button><span class="topbar__title">${esc(titleMap[routeName] || "Phenogram")}</span>${bot && routeName.startsWith("bot-") ? `<span class="topbar__crumb">${esc(botCrumb)}</span>` : ""}</div>
           <div class="topbar__actions"><span class="health-pill ${healthClass}">${healthClass === "is-down" ? "API issue" : "Platform online"}</span><button class="btn btn--secondary btn--sm" type="button" data-action="open-connect">${icon("plus")}<span>Connect bot</span></button></div>
         </header>
         <main id="main-content" tabindex="-1">${renderMain()}</main>
@@ -793,14 +997,18 @@
     const route = state.route.name;
     const routeActive = (...names) => names.includes(route) ? "active" : "";
     const identity = userDisplayName();
+    const switcherMeta = bot
+      ? isManagedBot(bot) ? `Managed by ${managerLabel(bot)}${botNeedsRetentionWarning(bot) ? " · 24-hour history" : ""}` : botUsername(bot)
+      : "Connect your first bot";
     return `<aside class="sidebar" id="app-sidebar" aria-label="Application navigation">
       <a class="brand sidebar__brand" href="#/overview"><span class="brand-mark"><span></span><span></span><span></span></span><span class="brand__word">Phenogram</span></a>
-      <button class="bot-switcher" type="button" data-action="open-bot-picker" aria-label="Switch bot">
+      <button class="bot-switcher ${bot && botNeedsRetentionWarning(bot) ? "has-warning" : ""}" type="button" data-action="open-bot-picker" aria-label="Switch bot${bot ? `, current bot ${esc(botName(bot))}` : ""}">
         <span class="bot-avatar">${bot ? initials(botName(bot)) : icon("bot")}</span>
-        <span class="bot-switcher__text"><strong>${esc(bot ? botName(bot) : "No bot selected")}</strong><span>${esc(bot ? botUsername(bot) : "Connect your first bot")}</span></span>${icon("chevron")}
+        <span class="bot-switcher__text"><strong>${esc(bot ? botName(bot) : "No bot selected")}</strong><span>${esc(switcherMeta)}</span></span>${icon("chevron")}
       </button>
       <p class="sidebar__section-label">Workspace</p>
       <nav class="side-nav"><a class="${routeActive("overview")}" href="#/overview">${icon("grid")}Overview</a><a class="${routeActive("bots")}" href="#/bots">${icon("bot")}Bots</a></nav>
+      ${state.bots.length ? `<p class="sidebar__section-label sidebar__section-label--bots">Bot hierarchy</p>${renderSidebarBotTree()}` : ""}
       ${bot ? `<p class="sidebar__section-label">Selected bot</p><nav class="side-nav"><a class="${routeActive("bot-overview")}" href="${botPath(botId(bot), "overview")}">${icon("pulse")}Health & activity</a><a class="${routeActive("bot-view")}" href="${botPath(botId(bot), "view")}">${icon("message")}Bot View</a><a class="${routeActive("bot-updates")}" href="${botPath(botId(bot), "updates")}">${icon("terminal")}Update log</a><a class="${routeActive("bot-integration")}" href="${botPath(botId(bot), "integration")}">${icon("link")}Delivery & API</a></nav>` : ""}
       <p class="sidebar__section-label">Manage</p>
       <nav class="side-nav"><a class="${routeActive("billing")}" href="#/billing">${icon("card")}Usage & billing</a><a class="${routeActive("settings", "bot-settings")}" href="#/settings">${icon("settings")}Settings</a></nav>
@@ -822,18 +1030,23 @@
   }
 
   function renderMain() {
+    let content;
     switch (state.route.name) {
-      case "overview": return renderOverview();
-      case "bots": return renderBots();
-      case "bot-overview": return renderBotOverview();
-      case "bot-updates": return renderUpdates();
-      case "bot-view": return renderBotView();
-      case "bot-integration": return renderIntegration();
-      case "bot-settings": return renderBotSettings();
-      case "billing": return renderBilling();
-      case "settings": return renderSettings();
-      default: return renderOverview();
+      case "overview": content = renderOverview(); break;
+      case "bots": content = renderBots(); break;
+      case "bot-overview": content = renderBotOverview(); break;
+      case "bot-updates": content = renderUpdates(); break;
+      case "bot-view": content = renderBotView(); break;
+      case "bot-integration": content = renderIntegration(); break;
+      case "bot-settings": content = renderBotSettings(); break;
+      case "billing": content = renderBilling(); break;
+      case "settings": content = renderSettings(); break;
+      default: content = renderOverview();
     }
+    const bot = currentBot();
+    return state.route.name.startsWith("bot-") && botNeedsRetentionWarning(bot)
+      ? `<div class="bot-route-alert">${renderRetentionWarning(bot)}</div>${content}`
+      : content;
   }
 
   function pageHeader(title, copy, actions = "") {
@@ -854,11 +1067,13 @@
     if (!bot) return `<div class="page">${pageHeader("Welcome to Phenogram", "Your bot operations workspace is ready.")}${renderNoBots()}</div>`;
     return `<div class="page">
       ${pageHeader("Good to see you.", `Here’s what ${botName(bot)} has seen in the last 24 hours.`, `<a class="btn btn--secondary" href="${botPath(botId(bot), "updates")}">${icon("pulse")}Live updates</a><a class="btn btn--primary" href="${botPath(botId(bot), "view")}">${icon("message")}Open Bot View</a>`)}
+      ${renderRetentionWarning(bot)}
       ${renderHealthHero(bot)}
       ${renderMetrics(bot)}
+      ${renderPortfolioPanel()}
       <div class="dashboard-grid">
         <section class="panel"><div class="panel__head"><div><h2>Recent activity</h2><p>API requests and update events for ${esc(botName(bot))}</p></div><a class="btn btn--ghost btn--sm" href="${botPath(botId(bot), "integration")}">API details ${icon("chevron")}</a></div>${renderActivityList()}</section>
-        <div class="panel-stack"><section class="panel"><div class="panel__head"><div><h2>Setup</h2><p>Your production readiness checklist</p></div></div><div class="panel__body">${renderChecklist(bot)}</div></section><section class="panel"><div class="panel__head"><div><h2>Plan usage</h2><p>${esc(membershipPlan())} · ${retentionDays()}-day retention</p></div><a class="btn btn--ghost btn--sm" href="#/billing">Manage</a></div><div class="panel__body">${renderUsage()}</div></section></div>
+        <div class="panel-stack"><section class="panel"><div class="panel__head"><div><h2>Setup</h2><p>Your production readiness checklist</p></div></div><div class="panel__body">${renderChecklist(bot)}</div></section><section class="panel"><div class="panel__head"><div><h2>Plan usage</h2><p>${esc(membershipPlan())} · ${esc(retentionLabel(bot))} for this bot</p></div><a class="btn btn--ghost btn--sm" href="#/billing">Manage</a></div><div class="panel__body">${renderUsage(bot)}</div></section></div>
       </div>
     </div>`;
   }
@@ -874,7 +1089,7 @@
     const copy = bad ? "Verify the bot token and review recent API activity." : degraded ? "The bot is connected, but an upstream setup step failed. Review its recent activity." : provisioning ? "Phenogram is registering its upstream webhook. Activity will appear when Telegram starts delivering updates." : unknown ? "Refresh this workspace before assuming the bot is ready." : "Phenogram is receiving and processing activity normally.";
     const lastUpdate = bot.last_update_at || bot.last_update || bot.latest_update_at;
     const lastApi = bot.last_api_call_at || bot.last_api_request_at || bot.last_request_at || bot.latest_activity_at;
-    return `<section class="health-hero ${bad ? "is-error" : warning ? "is-warning" : ""}"><span class="health-hero__icon">${icon(bad ? "alert" : warning ? "clock" : "check")}</span><div class="health-hero__copy"><h2>${title}</h2><p>${copy}</p></div><div class="health-hero__meta"><div><span>Last update</span><strong>${esc(relativeTime(lastUpdate))}</strong></div><div><span>Last API call</span><strong>${esc(relativeTime(lastApi))}</strong></div><div><span>Retention</span><strong>${retentionDays()} days</strong></div></div></section>`;
+    return `<section class="health-hero ${bad ? "is-error" : warning ? "is-warning" : ""}"><span class="health-hero__icon">${icon(bad ? "alert" : warning ? "clock" : "check")}</span><div class="health-hero__copy"><h2>${title}</h2><p>${copy}</p></div><div class="health-hero__meta"><div><span>Last update</span><strong>${esc(relativeTime(lastUpdate))}</strong></div><div><span>Last API call</span><strong>${esc(relativeTime(lastApi))}</strong></div><div><span>Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div></section>`;
   }
 
   function renderMetrics(bot) {
@@ -919,24 +1134,24 @@
     return `<div class="checklist">${items.map(([done, label]) => `<div class="check-item ${done ? "is-complete" : ""}"><span class="check-item__mark">${done ? icon("check") : ""}</span>${esc(label)}</div>`).join("")}</div>`;
   }
 
-  function renderUsage() {
-    const botLimit = membershipLimit();
-    const used = state.bots.length;
-    const percentage = Math.min(100, Math.round((used / Math.max(botLimit, 1)) * 100));
-    const retentionPercentage = Math.min(100, retentionDays() / 3.65);
-    return `<div class="usage-card"><div class="usage-card__row"><span>Bots</span><strong>${used} of ${botLimit}</strong></div><progress class="progress" value="${percentage}" max="100" aria-label="Bot capacity used">${percentage}%</progress></div><div class="usage-card"><div class="usage-card__row"><span>Update history</span><strong>${retentionDays()} days</strong></div><progress class="progress" value="${retentionPercentage}" max="100" aria-label="Retention relative to the Scale plan">${Math.round(retentionPercentage)}%</progress></div>`;
+  function renderUsage(bot) {
+    const coverage = coverageStats();
+    const coveragePercentage = coverage.total ? Math.round((coverage.covered / coverage.total) * 100) : 0;
+    const retentionPercentage = Math.min(100, botRetentionDays(bot) / 3.65);
+    return `<div class="usage-card ${coverage.uncovered ? "has-warning" : ""}"><div class="usage-card__row"><span>Full-history coverage</span><strong>${coverage.covered} of ${coverage.total}</strong></div><progress class="progress" value="${coveragePercentage}" max="100" aria-label="${coverage.covered} of ${coverage.total} bots have full history">${coveragePercentage}%</progress></div><div class="usage-card ${botNeedsRetentionWarning(bot) ? "has-warning" : ""}"><div class="usage-card__row"><span>This bot’s history</span><strong>${esc(retentionValue(bot))}</strong></div><progress class="progress" value="${retentionPercentage}" max="100" aria-label="History retained for ${esc(retentionValue(bot))}">${Math.round(retentionPercentage)}%</progress></div>`;
   }
 
   function renderBots() {
-    const actions = `<span class="muted page-header__usage">${state.bots.length} of ${membershipLimit()} used</span><button class="btn btn--primary" type="button" data-action="open-connect">${icon("plus")}Connect bot</button>`;
-    if (state.loading.bots) return `<div class="page">${pageHeader("Bots", "Manage Telegram bot ownership and open each bot's workspace.", actions)}<div class="bots-grid"><div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div></div></div>`;
-    if (state.errors.bots && !state.bots.length) return `<div class="page">${pageHeader("Bots", "Manage Telegram bot ownership and open each bot's workspace.", actions)}${renderRouteError(state.errors.bots)}</div>`;
-    return `<div class="page">${pageHeader("Bots", "Each token is verified with Telegram, encrypted, and never displayed after connection.", actions)}${state.bots.length ? `<div class="bots-grid">${state.bots.map(renderBotCard).join("")}</div>` : renderNoBots()}</div>`;
+    const coverage = coverageStats();
+    const actions = `<span class="muted page-header__usage">${coverage.covered} full history · ${coverage.total} total</span><button class="btn btn--primary" type="button" data-action="open-connect">${icon("plus")}Connect bot</button>`;
+    if (state.loading.bots) return `<div class="page">${pageHeader("Bots", "Connected managers and every bot they manage, in one place.", actions)}<div class="bots-grid"><div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div></div></div>`;
+    if (state.errors.bots && !state.bots.length) return `<div class="page">${pageHeader("Bots", "Connected managers and every bot they manage, in one place.", actions)}${renderRouteError(state.errors.bots)}</div>`;
+    return `<div class="page">${pageHeader("Bots", "Managed bots appear beneath their manager automatically. Open any bot to inspect it or reply from Bot View.", actions)}${state.bots.length ? `${renderCoverageSummary()}${renderBotFamilies()}` : renderNoBots()}</div>`;
   }
 
-  function renderBotCard(bot) {
+  function renderBotCard(bot, managedCount = 0) {
     const id = botId(bot);
-    return `<a class="bot-card" href="${botPath(id, "overview")}"><div class="bot-card__top"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><span class="bot-card__copy"><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></span>${renderBotStatusBadge(bot)}</div><div class="bot-card__meta"><div><span class="stat-label">Last update</span><strong>${esc(relativeTime(bot.last_update_at || bot.last_update))}</strong></div><div><span class="stat-label">Updates · 24h</span><strong>${esc(formatNumber(bot.updates_24h ?? bot.updates_count_24h))}</strong></div></div><div class="bot-card__foot"><span>${retentionDays()}-day retention</span><span>Open workspace ${icon("arrow")}</span></div></a>`;
+    return `<a class="bot-card bot-family__root" href="${botPath(id, "overview")}"><div class="bot-card__top"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><span class="bot-card__copy"><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></span>${renderBotStatusBadge(bot)}</div><div class="bot-card__meta"><div><span class="stat-label">Last update</span><strong>${esc(relativeTime(bot.last_update_at || bot.last_update))}</strong></div><div><span class="stat-label">Managed bots</span><strong>${managedCount}</strong></div><div><span class="stat-label">Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div><div class="bot-card__foot"><span>Connected bot</span><span>Open workspace ${icon("arrow")}</span></div></a>`;
   }
 
   function renderBotOverview() {
@@ -944,7 +1159,8 @@
     if (state.loading.bot && !bot) return `<div class="page"><div class="skeleton skeleton--page-title"></div><div class="skeleton-card"></div></div>`;
     if (state.errors.bot) return `<div class="page">${pageHeader("Bot workspace", "")}${renderRouteError(state.errors.bot)}</div>`;
     if (!bot) return `<div class="page">${renderNoBots("This bot could not be found. Choose another bot or connect a new one.")}</div>`;
-    return `<div class="page">${pageHeader(botName(bot), `${botUsername(bot)} · Bot health, API activity, and update delivery.`, `<a class="btn btn--secondary" href="${botPath(botId(bot), "settings")}">${icon("settings")}Settings</a><a class="btn btn--primary" href="${botPath(botId(bot), "view")}">${icon("message")}Open Bot View</a>`)}${renderHealthHero(bot)}${renderMetrics(bot)}<section class="panel"><div class="panel__head"><div><h2>API activity</h2><p>Most recent proxied calls and received updates</p></div><a class="btn btn--ghost btn--sm" href="${botPath(botId(bot), "updates")}">View update log ${icon("chevron")}</a></div>${renderActivityList(12)}</section></div>`;
+    const relationship = isManagedBot(bot) ? `${botUsername(bot)} · Managed by ${managerLabel(bot)}` : `${botUsername(bot)} · Connected bot`;
+    return `<div class="page">${pageHeader(botName(bot), `${relationship} · Bot health, API activity, and update delivery.`, `<a class="btn btn--secondary" href="${botPath(botId(bot), "settings")}">${icon("settings")}Settings</a><a class="btn btn--primary" href="${botPath(botId(bot), "view")}">${icon("message")}Open Bot View</a>`)}${renderHealthHero(bot)}${renderMetrics(bot)}<section class="panel"><div class="panel__head"><div><h2>API activity</h2><p>Most recent proxied calls and received updates</p></div><a class="btn btn--ghost btn--sm" href="${botPath(botId(bot), "updates")}">View update log ${icon("chevron")}</a></div>${renderActivityList(12)}</section></div>`;
   }
 
   const updatePayload = (item) => item?.payload ?? item?.update ?? item?.raw ?? item?.data ?? item ?? {};
@@ -976,11 +1192,12 @@
   function renderUpdates() {
     const bot = currentBot();
     if (!bot) return `<div class="page">${renderNoBots()}</div>`;
-    const cutoff = new Date(Date.now() - retentionDays() * 86400000);
+    const days = botRetentionDays(bot);
+    const cutoff = new Date(Date.now() - days * 86400000);
     const action = `<button class="btn btn--secondary" type="button" data-action="refresh-updates">${icon("refresh")}Refresh</button>`;
     return `<div class="page">
       ${pageHeader("Update log", `Search the exact updates received for ${botName(bot)} and inspect their stored payloads.`, action)}
-      <div class="status-banner status-banner--info">${icon("clock")}<div class="status-banner__copy"><strong>${retentionDays()}-day update history</strong>On your ${esc(membershipPlan())} plan, updates received before ${esc(new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(cutoff))} are removed automatically.</div></div>
+      <div class="status-banner status-banner--info">${icon("clock")}<div class="status-banner__copy"><strong>${esc(retentionLabel(bot))}</strong>Updates received before ${esc(new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(cutoff))} are removed automatically for this bot.</div></div>
       <form class="toolbar" id="update-filter-form">
         <div class="toolbar__search">${icon("search")}<label class="visually-hidden" for="update-query">Search updates</label><input class="search-input" id="update-query" name="query" type="search" value="${esc(state.filters.query)}" placeholder="Update ID, chat, or payload"></div>
         <label class="visually-hidden" for="update-type">Update type</label><select id="update-type" name="type"><option value="">All event types</option>${["message", "edited_message", "callback_query", "inline_query", "chat_member", "poll"].map((type) => `<option value="${type}" ${state.filters.type === type ? "selected" : ""}>${type}</option>`).join("")}</select>
@@ -1085,18 +1302,20 @@
 
   function renderBilling() {
     const plan = membershipPlan();
+    const coverage = coverageStats();
     const renewal = state.membership?.current_period_ends_at || state.membership?.renews_at || state.membership?.current_period_end || state.membership?.expires_at;
     return `<div class="page page--narrow">
-      ${pageHeader("Usage & billing", "Your plan controls bot capacity, update retention, and access to local Telegram Bot API routing.")}
-      <section class="panel"><div class="plan-summary"><span class="plan-summary__icon">${icon("card")}</span><div class="plan-summary__copy"><span>Current plan</span><h2>${esc(plan)}</h2><p>${renewal ? `Renews ${formatDate(renewal, "full")}` : "No payment method required for the Free plan"}</p></div>${plan.toLowerCase() === "free" ? '<button class="btn btn--white" type="button" data-action="request-plan" data-plan="Pro">Upgrade plan</button>' : '<span class="badge badge--success">Active</span>'}</div><div class="plan-features"><div class="plan-feature"><span class="stat-label">Connected bots</span><strong>${state.bots.length} / ${membershipLimit()}</strong></div><div class="plan-feature"><span class="stat-label">Update retention</span><strong>${retentionDays()} days</strong></div><div class="plan-feature"><span class="stat-label">Local Bot API routing</span><strong>${plan.toLowerCase() === "free" ? "Not included" : "Included"}</strong></div></div></section>
+      ${pageHeader("Usage & billing", "Your plan controls full-history coverage, update retention, and access to local Telegram Bot API routing.")}
+      <section class="panel"><div class="plan-summary"><span class="plan-summary__icon">${icon("card")}</span><div class="plan-summary__copy"><span>Current plan</span><h2>${esc(plan)}</h2><p>${renewal ? `Renews ${formatDate(renewal, "full")}` : "No payment method required for the Free plan"}</p></div>${plan.toLowerCase() === "free" ? '<button class="btn btn--white" type="button" data-action="request-plan" data-plan="Pro">Upgrade plan</button>' : '<span class="badge badge--success">Active</span>'}</div><div class="plan-features"><div class="plan-feature"><span class="stat-label">Bots in workspace</span><strong>${coverage.total}</strong></div><div class="plan-feature"><span class="stat-label">Full-history coverage</span><strong>${coverage.covered} / ${coverage.total}</strong></div><div class="plan-feature"><span class="stat-label">Plan retention</span><strong>${retentionDays()} days</strong></div></div></section>
+      ${coverage.uncovered ? renderCoverageSummary({ compact: true }) : ""}
       <div class="billing-plans">${billingPlan("Free", "$0", 1, 30, false)}${billingPlan("Pro", "$29", 5, 90, true)}${billingPlan("Scale", "$99", 25, 365, true)}</div>
-      <div class="status-banner section-gap">${icon("info")}<div class="status-banner__copy"><strong>Downgrades are safe</strong>If a future downgrade exceeds the bot limit, Phenogram will ask which bots remain active before the plan changes. Stored data is never removed without a clear retention warning.</div></div>
+      <div class="status-banner section-gap">${icon("info")}<div class="status-banner__copy"><strong>Coverage adjusts automatically</strong>If your workspace exceeds full-history coverage, affected managed bots keep 24 hours of history and remain available throughout the console.</div></div>
     </div>`;
   }
 
   function billingPlan(name, price, bots, retention, localApi) {
     const current = membershipPlan().toLowerCase() === name.toLowerCase();
-    return `<article class="billing-plan ${current ? "is-current" : ""}"><div class="billing-plan__head"><h3>${esc(name)}</h3>${current ? '<span class="badge badge--success">Current</span>' : ""}</div><div class="billing-plan__price">${price}<span> / month</span></div><ul><li>${icon("check")}${bots} bot${bots === 1 ? "" : "s"}</li><li>${icon("check")}${retention}-day update history</li><li>${icon("check")}${localApi ? "Local Bot API routing" : "Compatible API gateway"}</li></ul>${current ? '<button class="btn btn--secondary btn--block" type="button" disabled>Current plan</button>' : `<button class="btn btn--secondary btn--block" type="button" data-action="request-plan" data-plan="${esc(name)}">Choose ${esc(name)}</button>`}</article>`;
+    return `<article class="billing-plan ${current ? "is-current" : ""}"><div class="billing-plan__head"><h3>${esc(name)}</h3>${current ? '<span class="badge badge--success">Current</span>' : ""}</div><div class="billing-plan__price">${price}<span> / month</span></div><ul><li>${icon("check")}Full history for ${bots} bot${bots === 1 ? "" : "s"}</li><li>${icon("check")}${retention}-day update history</li><li>${icon("check")}${localApi ? "Local Bot API routing" : "Compatible API gateway"}</li></ul>${current ? '<button class="btn btn--secondary btn--block" type="button" disabled>Current plan</button>' : `<button class="btn btn--secondary btn--block" type="button" data-action="request-plan" data-plan="${esc(name)}">Choose ${esc(name)}</button>`}</article>`;
   }
 
   function renderSettings() {
@@ -1124,11 +1343,20 @@
     if (!bot) return `<div class="page">${renderNoBots()}</div>`;
     const fingerprint = bot.public_id || bot.public_key || "Assigned securely by Phenogram";
     const verified = !["token_invalid", "invalid"].includes(botStatus(bot));
+    const managed = isManagedBot(bot);
+    const connectedManager = managed && Boolean(botManagerId(bot));
+    const descendants = managedDescendantCount(bot);
+    const credentialRow = managed
+      ? `<div class="settings-row"><div class="settings-row__intro"><h3>Bot credential</h3><p>Kept current through ${esc(managerLabel(bot))}.</p></div><div class="form-note">${icon("lock")}The credential stays encrypted. Phenogram refreshes it automatically from the manager after Telegram reports a token change.</div></div>`
+      : `<div class="settings-row"><div class="settings-row__intro"><h3>Bot token</h3><p>Phenogram does not reveal stored credentials.</p></div><div class="form-note">${icon("lock")}The bot token is encrypted and cannot be viewed after connection. If it may be exposed, revoke it through BotFather and reconnect the bot.</div></div>`;
+    const removalPanel = connectedManager
+      ? `<section class="panel panel--spaced"><div class="panel__head"><div><h2>Managed relationship</h2><p>This bot is maintained through ${esc(managerLabel(bot))}</p></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Automatic availability</h3><p>Managed bots stay in the workspace while their manager relationship is active.</p></div><div class="form-note">${icon("info")}This bot cannot be removed separately while ${esc(managerLabel(bot))} manages it.</div></div></section>`
+      : `<section class="panel panel--spaced danger-zone"><div class="panel__head"><div><h2>Danger zone</h2><p>Permanent workspace actions</p></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Delete this bot</h3><p>${managed ? "Remove this managerless managed bot and its stored Phenogram data." : `Disconnect the token and remove its stored data.${descendants ? ` ${descendants} managed bot${descendants === 1 ? "" : "s"} beneath it will remain in Phenogram; direct children become managerless.` : ""}`}</p></div><div><button class="btn btn--danger" type="button" data-action="confirm-delete-bot">${icon("trash")}Delete ${esc(botName(bot))}</button></div></div></section>`;
     return `<div class="page page--narrow">
       ${pageHeader("Bot settings", `Ownership, credentials, and stored data for ${botName(bot)}.`)}
-      <section class="panel"><div class="panel__head"><div><h2>Telegram identity</h2><p>Verified server-side using Telegram getMe</p></div>${verified ? renderBotStatusBadge(bot) : '<span class="badge badge--danger">Token invalid</span>'}</div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Bot</h3><p>The Telegram identity associated with this workspace bot.</p></div><div class="identity-card"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><div><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Platform status</h3><p>Current provisioning and delivery state reported by Phenogram.</p></div><div>${renderBotStatusBadge(bot)}</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Public identifier</h3><p>Identifies this bot without authorizing Telegram API calls.</p></div><div><div class="fingerprint">${esc(fingerprint)}</div><p class="field__hint field__hint--spaced">This value is safe to reference publicly. Signed file links still expire separately.</p></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Bot token</h3><p>Phenogram does not reveal stored credentials.</p></div><div class="form-note">${icon("lock")}The bot token is encrypted and cannot be viewed after connection. If it may be exposed, revoke it through BotFather and reconnect the bot.</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Data retention</h3><p>Updates outside this window are removed automatically.</p></div><div><strong class="settings-value">${retentionDays()} days</strong><p class="field__hint field__hint--compact-spaced">Controlled by your ${esc(membershipPlan())} plan.</p></div></div></div></section>
+      <section class="panel"><div class="panel__head"><div><h2>Telegram identity</h2><p>Verified server-side using Telegram getMe</p></div>${verified ? renderBotStatusBadge(bot) : '<span class="badge badge--danger">Token invalid</span>'}</div><div class="settings-grid"><div class="settings-row"><div class="settings-row__intro"><h3>Bot</h3><p>The Telegram identity associated with this workspace bot.</p></div><div class="identity-card"><span class="bot-avatar bot-avatar--lg">${initials(botName(bot))}</span><div><strong>${esc(botName(bot))}</strong><span>${esc(botUsername(bot))}${managed ? ` · Managed by ${esc(managerLabel(bot))}` : ""}</span></div></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Platform status</h3><p>Current provisioning and delivery state reported by Phenogram.</p></div><div>${renderBotStatusBadge(bot)}</div></div><div class="settings-row"><div class="settings-row__intro"><h3>Public identifier</h3><p>Identifies this bot without authorizing Telegram API calls.</p></div><div><div class="fingerprint">${esc(fingerprint)}</div><p class="field__hint field__hint--spaced">This value is safe to reference publicly. Signed file links still expire separately.</p></div></div>${credentialRow}<div class="settings-row"><div class="settings-row__intro"><h3>Data retention</h3><p>Updates outside this window are removed automatically.</p></div><div><strong class="settings-value">${esc(retentionValue(bot))}</strong><p class="field__hint field__hint--compact-spaced">${botNeedsRetentionWarning(bot) ? "This managed bot is outside full-history coverage." : `Covered by your ${esc(membershipPlan())} plan.`}</p></div></div></div></section>
       ${renderRoutingSettings(bot)}
-      <section class="panel panel--spaced danger-zone"><div class="panel__head"><div><h2>Danger zone</h2><p>Permanent workspace actions</p></div></div><div class="settings-row"><div class="settings-row__intro"><h3>Delete this bot</h3><p>Disconnect the token and remove its stored Phenogram data.</p></div><div><button class="btn btn--danger" type="button" data-action="confirm-delete-bot">${icon("trash")}Delete ${esc(botName(bot))}</button></div></div></section>
+      ${removalPanel}
     </div>`;
   }
 
@@ -1146,17 +1374,22 @@
     if (!force && modalRoot.dataset.modalName === name && modalRoot.firstElementChild) return;
     modalRoot.dataset.modalName = name;
     if (name === "connect") {
-      const atLimit = state.bots.length >= membershipLimit();
+      const atLimit = connectedBots().length >= membershipLimit();
       modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-modal-panel><header class="modal__head"><div><h2 id="connect-title">${atLimit ? "Your bot limit is full" : "Connect a Telegram bot"}</h2><p>${atLimit ? `The ${membershipPlan()} plan includes ${membershipLimit()} bot${membershipLimit() === 1 ? "" : "s"}.` : "Paste the token from @BotFather."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header>${atLimit ? `<div class="modal__body"><div class="form-note">${icon("info")}Your existing bots stay active. Upgrade the workspace before connecting another bot.</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Not now</button><button class="btn btn--primary" type="button" data-action="go-billing">See plans</button></footer>` : `<form id="connect-bot-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="field"><div class="field__row"><label for="bot-token">Telegram bot token</label><span class="field__hint">From @BotFather</span></div><div class="input-wrap">${icon("lock")}<input id="bot-token" name="token" type="password" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="123456789:AA…" required></div><p class="field__hint">Your token is encrypted and will not be shown again.</p></div><div class="form-note">${icon("info")}Connecting transfers this bot’s webhook to Phenogram. If a webhook is already set, Phenogram will keep delivering updates to the same destination.</div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Verify and connect ${icon("arrow")}</button></footer></form>`}</section></div>`;
       return;
     }
     if (name === "bot-picker") {
-      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="picker-title" data-modal-panel><header class="modal__head"><div><h2 id="picker-title">Switch bot</h2><p>Choose the bot workspace you want to inspect.</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><div class="modal__body"><div class="bot-picker-list">${state.bots.map((bot) => `<button class="conversation ${botId(bot) === String(state.selectedBotId) ? "active" : ""}" type="button" data-action="pick-bot" data-bot-id="${esc(botId(bot))}"><span class="bot-avatar">${initials(botName(bot))}</span><span class="conversation__copy"><span class="conversation__line"><strong>${esc(botName(bot))}</strong>${botId(bot) === String(state.selectedBotId) ? icon("check") : ""}</span><span class="conversation__preview">${esc(botUsername(bot))}</span></span></button>`).join("") || '<div class="empty-state empty-state--modal"><p>No bots connected yet.</p></div>'}</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="open-connect">${icon("plus")}Connect another bot</button></footer></section></div>`;
+      modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="picker-title" data-modal-panel><header class="modal__head"><div><h2 id="picker-title">Switch bot</h2><p>Choose a connected manager or any bot beneath it.</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><div class="modal__body"><div class="bot-picker-list">${renderBotPickerTree()}</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="open-connect">${icon("plus")}Connect another bot</button></footer></section></div>`;
       return;
     }
     if (name === "delete-bot") {
       const bot = currentBot();
-      modalRoot.innerHTML = `<div class="modal-backdrop"><section class="modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" data-modal-panel><header class="modal__head"><div><h2 id="delete-title">Delete ${esc(botName(bot))}?</h2><p>This disconnects the bot and removes its stored Phenogram data.</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><form id="delete-bot-form"><div class="modal__body"><div class="status-banner status-banner--danger">${icon("alert")}<div class="status-banner__copy"><strong>This action cannot be undone</strong>The Telegram bot itself remains in Telegram, but Phenogram update history and console data for this bot will be deleted.</div></div><div class="field"><label for="delete-confirmation">Type <strong>${esc(botUsername(bot))}</strong> to confirm</label><input id="delete-confirmation" name="confirmation" type="text" autocomplete="off" data-expected="${esc(botUsername(bot))}" required></div><div data-form-error aria-live="polite"></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--danger" type="submit">${icon("trash")}Delete bot</button></footer></form></section></div>`;
+      const managed = isManagedBot(bot);
+      const descendants = managedDescendantCount(bot);
+      const impact = managed
+        ? "The Telegram bot remains in Telegram, but its Phenogram history and console data will be deleted."
+        : `The Telegram bot remains in Telegram, but its Phenogram history and console data will be deleted.${descendants ? ` ${descendants} managed bot${descendants === 1 ? "" : "s"} beneath it will remain in Phenogram; direct children become managerless, and each bot keeps the retention shown in its own status.` : ""}`;
+      modalRoot.innerHTML = `<div class="modal-backdrop"><section class="modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" data-modal-panel><header class="modal__head"><div><h2 id="delete-title">Delete ${esc(botName(bot))}?</h2><p>${managed ? "This removes the managerless bot and its stored Phenogram data." : "This disconnects the bot and removes its stored Phenogram data."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header><form id="delete-bot-form"><div class="modal__body"><div class="status-banner status-banner--danger">${icon("alert")}<div class="status-banner__copy"><strong>This action cannot be undone</strong>${esc(impact)}</div></div><div class="field"><label for="delete-confirmation">Type <strong>${esc(botUsername(bot))}</strong> to confirm</label><input id="delete-confirmation" name="confirmation" type="text" autocomplete="off" data-expected="${esc(botUsername(bot))}" required></div><div data-form-error aria-live="polite"></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--danger" type="submit">${icon("trash")}Delete bot</button></footer></form></section></div>`;
       return;
     }
     if (name === "routing") {
@@ -1209,8 +1442,6 @@
       if (state.sessionVersion !== sessionVersion || !state.user || !form.isConnected) return;
       formError(form, errorMessage(error));
       setSubmitting(form, false);
-      token = "";
-      form.elements.token.value = "";
       form.elements.token.focus();
     }
   }

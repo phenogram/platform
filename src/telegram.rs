@@ -25,9 +25,10 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
-    crypto::Ciphertext,
+    crypto::{Ciphertext, Crypto},
     error::{AppError, Result},
     models::BotRecord,
     state::{AppState, StoredUpdate},
@@ -46,6 +47,7 @@ pub const ALL_UPDATE_TYPES: &[&str] = &[
     "business_message",
     "edited_business_message",
     "deleted_business_messages",
+    "guest_message",
     "message_reaction",
     "message_reaction_count",
     "inline_query",
@@ -61,6 +63,8 @@ pub const ALL_UPDATE_TYPES: &[&str] = &[
     "chat_join_request",
     "chat_boost",
     "removed_chat_boost",
+    "managed_bot",
+    "subscription",
 ];
 
 pub async fn proxy_method(
@@ -619,8 +623,8 @@ pub async fn resolve_bot_by_token(state: &AppState, token: &str) -> Result<BotRe
     if token.len() < 8 || token.len() > 256 {
         return Err(AppError::Unauthorized);
     }
-    let public_id = state.crypto.bot_public_id(token);
-    let bot = find_bot_by_public_id(state, &public_id)
+    let token_lookup_hash = state.crypto.bot_public_id(token);
+    let bot = find_bot_by_token_lookup(state, &token_lookup_hash)
         .await?
         .ok_or(AppError::Unauthorized)?;
     let stored = decrypt_token(state, &bot)?;
@@ -628,6 +632,49 @@ pub async fn resolve_bot_by_token(state: &AppState, token: &str) -> Result<BotRe
         return Err(AppError::Unauthorized);
     }
     Ok(bot)
+}
+
+async fn find_bot_by_token_lookup(
+    state: &AppState,
+    token_lookup_hash: &str,
+) -> Result<Option<BotRecord>> {
+    sqlx::query_as::<_, BotRecord>(
+        r#"SELECT bots.id, bots.user_id, bots.telegram_bot_id, bots.username, bots.display_name,
+                  bots.token_ciphertext, bots.token_nonce, bots.token_fingerprint, bots.public_id,
+                  bots.ingress_secret_ciphertext, bots.ingress_secret_nonce, bots.status,
+                  bots.routing_mode, bots.update_mode, bots.last_update_at, bots.last_api_call_at,
+                  bots.created_at
+             FROM bots
+             JOIN memberships ON memberships.user_id = bots.user_id
+            WHERE bots.token_lookup_hash = $1
+              AND (memberships.status IN ('active', 'trialing') OR
+                   (memberships.status IN ('past_due', 'canceled') AND
+                    memberships.current_period_ends_at > now()))"#,
+    )
+    .bind(token_lookup_hash)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(Into::into)
+}
+
+async fn find_active_bot_by_id(state: &AppState, bot_id: Uuid) -> Result<Option<BotRecord>> {
+    sqlx::query_as::<_, BotRecord>(
+        r#"SELECT bots.id, bots.user_id, bots.telegram_bot_id, bots.username, bots.display_name,
+                  bots.token_ciphertext, bots.token_nonce, bots.token_fingerprint, bots.public_id,
+                  bots.ingress_secret_ciphertext, bots.ingress_secret_nonce, bots.status,
+                  bots.routing_mode, bots.update_mode, bots.last_update_at, bots.last_api_call_at,
+                  bots.created_at
+             FROM bots
+             JOIN memberships ON memberships.user_id = bots.user_id
+            WHERE bots.id = $1
+              AND (memberships.status IN ('active', 'trialing') OR
+                   (memberships.status IN ('past_due', 'canceled') AND
+                    memberships.current_period_ends_at > now()))"#,
+    )
+    .bind(bot_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn find_bot_by_public_id(state: &AppState, public_id: &str) -> Result<Option<BotRecord>> {
@@ -660,16 +707,55 @@ pub fn decrypt_token(state: &AppState, bot: &BotRecord) -> Result<zeroize::Zeroi
     )
 }
 
+pub(crate) async fn install_managed_webhook(state: &AppState, bot: &BotRecord) -> Result<bool> {
+    let token = decrypt_token(state, bot)?;
+    let token = std::str::from_utf8(&token).map_err(|_| AppError::Internal)?;
+    let ingress_secret = state.crypto.decrypt(
+        &Ciphertext {
+            data: bot.ingress_secret_ciphertext.clone(),
+            nonce: bot.ingress_secret_nonce.clone(),
+        },
+        format!("bot:{}:ingress-secret", bot.id).as_bytes(),
+    )?;
+    let ingress_secret = std::str::from_utf8(&ingress_secret).map_err(|_| AppError::Internal)?;
+    let webhook_url = format!(
+        "{}/telegram/webhook/{}",
+        state.config.api_base_url, bot.public_id
+    );
+    let (_, response) = raw_telegram_json(
+        &state.telegram,
+        bot_api_base(state, bot)?,
+        token,
+        "setWebhook",
+        &json!({
+            "url": webhook_url,
+            "secret_token": ingress_secret,
+            "allowed_updates": ALL_UPDATE_TYPES,
+            "drop_pending_updates": false
+        }),
+    )
+    .await?;
+    Ok(response.get("ok").and_then(Value::as_bool) == Some(true))
+}
+
 fn bot_api_base<'a>(state: &'a AppState, bot: &BotRecord) -> Result<&'a str> {
-    if bot.routing_mode == "local" {
-        state
+    bot_api_base_for_routing(state, &bot.routing_mode)
+}
+
+fn bot_api_base_for_routing<'a>(state: &'a AppState, routing_mode: &str) -> Result<&'a str> {
+    match routing_mode {
+        "local" => state
             .config
             .telegram_local_api_url
             .as_deref()
-            .ok_or_else(|| AppError::Upstream("Local Bot API routing is not configured".into()))
-    } else {
-        Ok(&state.config.telegram_cloud_api_url)
+            .ok_or_else(|| AppError::Upstream("Local Bot API routing is not configured".into())),
+        "cloud" => Ok(&state.config.telegram_cloud_api_url),
+        _ => Err(AppError::Internal),
     }
+}
+
+fn managed_child_routing<'a>(existing: Option<&'a str>, manager: &'a str) -> &'a str {
+    existing.unwrap_or(manager)
 }
 
 pub async fn raw_telegram_json(
@@ -760,10 +846,8 @@ async fn record_api_call(
                INSERT INTO api_calls
                       (bot_id, method, source, http_status, telegram_ok, latency_ms, error_summary, expires_at)
                SELECT bots.id, $2, $3, $4, $5, $6, $7,
-                      now() + make_interval(days => plans.retention_days)
+                      now() + make_interval(days => bot_effective_retention_days(bots.id))
                  FROM bots
-                 JOIN memberships ON memberships.user_id = bots.user_id
-                 JOIN plan_definitions plans ON plans.id = memberships.plan_id
                 WHERE bots.id = $1
            )
            UPDATE bots SET last_api_call_at = now(), updated_at = now() WHERE id = $1"#,
@@ -805,10 +889,8 @@ pub async fn record_outbound_message(
                (bot_id, user_id, chat_id, telegram_message_id, method, source, text, status,
                 response_status, error_summary, expires_at)
            SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $1"#,
     )
     .bind(message.bot_id)
@@ -829,10 +911,8 @@ pub async fn record_outbound_message(
             r#"INSERT INTO conversations
                    (bot_id, chat_id, display_name, last_message_preview, last_update_at, expires_at)
                SELECT bots.id, $2, $3, $4, now(),
-                      now() + make_interval(days => plans.retention_days)
+                      now() + make_interval(days => bot_effective_retention_days(bots.id))
                  FROM bots
-                 JOIN memberships ON memberships.user_id = bots.user_id
-                 JOIN plan_definitions plans ON plans.id = memberships.plan_id
                 WHERE bots.id = $1
                ON CONFLICT (bot_id, chat_id) DO UPDATE SET
                    last_message_preview = EXCLUDED.last_message_preview,
@@ -1341,6 +1421,98 @@ fn parse_string_array(value: &Value) -> Option<Vec<String>> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ExistingWebhook {
+    pub(crate) url: String,
+    pub(crate) allowed_updates: Value,
+    pub(crate) max_connections: i32,
+}
+
+pub(crate) fn existing_webhook(
+    webhook_info: &Value,
+    api_base_url: &str,
+    allow_insecure_development: bool,
+) -> Result<Option<ExistingWebhook>> {
+    if webhook_info.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(AppError::Upstream(
+            webhook_info
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Telegram did not return webhook information")
+                .to_owned(),
+        ));
+    }
+    let result = webhook_info
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AppError::Upstream("Telegram returned invalid webhook information".into())
+        })?;
+    let Some(url) = result
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(None);
+    };
+    if is_managed_ingress_url(url, api_base_url) {
+        return Ok(None);
+    }
+    if result
+        .get("has_custom_certificate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(AppError::Validation(
+            "The bot's existing webhook uses a custom certificate that Telegram cannot transfer. Switch it to a publicly trusted certificate and try again."
+                .into(),
+        ));
+    }
+    validate_webhook_url(url, allow_insecure_development).map_err(|_| {
+        AppError::Validation(
+            "The bot's existing webhook cannot be transferred safely. Update it in Telegram and try again."
+                .into(),
+        )
+    })?;
+    let allowed_updates = result
+        .get("allowed_updates")
+        .filter(|value| {
+            value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string))
+        })
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let max_connections = result
+        .get("max_connections")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(40);
+    Ok(Some(ExistingWebhook {
+        url: url.to_owned(),
+        allowed_updates,
+        max_connections,
+    }))
+}
+
+fn is_managed_ingress_url(candidate: &str, api_base_url: &str) -> bool {
+    let (Ok(candidate), Ok(api_base)) = (url::Url::parse(candidate), url::Url::parse(api_base_url))
+    else {
+        return false;
+    };
+    candidate.scheme() == api_base.scheme()
+        && candidate
+            .host_str()
+            .zip(api_base.host_str())
+            .is_some_and(|(candidate, api)| candidate.eq_ignore_ascii_case(api))
+        && candidate.port_or_known_default() == api_base.port_or_known_default()
+        && candidate
+            .path()
+            .strip_prefix("/telegram/webhook/")
+            .is_some_and(|public_id| !public_id.is_empty() && !public_id.contains('/'))
+}
+
 pub fn validate_webhook_url(
     value: &str,
     allow_insecure_development: bool,
@@ -1380,6 +1552,92 @@ pub fn validate_webhook_url(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ManagedBotIdentity {
+    telegram_bot_id: i64,
+    owner_telegram_user_id: i64,
+    username: String,
+    display_name: String,
+}
+
+fn managed_bot_identity(
+    payload: &Value,
+) -> std::result::Result<Option<ManagedBotIdentity>, &'static str> {
+    let Some(managed) = payload.get("managed_bot") else {
+        return Ok(None);
+    };
+    let bot = managed.get("bot").ok_or("missing managed bot identity")?;
+    if bot.get("is_bot").and_then(Value::as_bool) != Some(true) {
+        return Err("invalid managed bot identity");
+    }
+    let telegram_bot_id = bot
+        .get("id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or("invalid managed bot identifier")?;
+    let owner_telegram_user_id = managed
+        .pointer("/user/id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or("invalid managed bot owner")?;
+    let username = bot
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|username| !username.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("managed_{telegram_bot_id}_bot"));
+    let display_name = bot
+        .get("first_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&username)
+        .to_owned();
+    Ok(Some(ManagedBotIdentity {
+        telegram_bot_id,
+        owner_telegram_user_id,
+        username,
+        display_name,
+    }))
+}
+
+async fn queue_managed_bot_sync(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    manager: &BotRecord,
+    source_update_id: i64,
+    source_update_row_id: i64,
+    identity: &ManagedBotIdentity,
+) -> Result<()> {
+    if identity.telegram_bot_id == manager.telegram_bot_id {
+        return Err(AppError::Validation("invalid managed bot identity".into()));
+    }
+    sqlx::query(
+        r#"INSERT INTO managed_bot_sync_jobs
+               (manager_bot_id, managed_telegram_bot_id, managed_owner_telegram_user_id,
+                username, display_name, source_update_id, source_update_row_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (manager_bot_id, managed_telegram_bot_id) DO UPDATE SET
+               managed_owner_telegram_user_id = EXCLUDED.managed_owner_telegram_user_id,
+               username = EXCLUDED.username,
+               display_name = EXCLUDED.display_name,
+               source_update_id = EXCLUDED.source_update_id,
+               source_update_row_id = EXCLUDED.source_update_row_id,
+               state = 'pending', attempt = 0, next_attempt_at = now(),
+               locked_at = NULL, error_summary = NULL, completed_at = NULL,
+               updated_at = now()
+           WHERE EXCLUDED.source_update_row_id > managed_bot_sync_jobs.source_update_row_id"#,
+    )
+    .bind(manager.id)
+    .bind(identity.telegram_bot_id)
+    .bind(identity.owner_telegram_user_id)
+    .bind(&identity.username)
+    .bind(&identity.display_name)
+    .bind(source_update_id)
+    .bind(source_update_row_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn webhook_ingress(
     State(state): State<AppState>,
     Path(public_id): Path<String>,
@@ -1415,6 +1673,10 @@ pub async fn webhook_ingress(
         None => return (StatusCode::BAD_REQUEST, "missing update_id").into_response(),
     };
     let event_type = event_type(&payload).to_owned();
+    let managed_identity = match managed_bot_identity(&payload) {
+        Ok(identity) => identity,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     let projection = conversation_projection(&payload);
 
     let mut tx = match state.db.begin().await {
@@ -1424,10 +1686,8 @@ pub async fn webhook_ingress(
     let inserted = sqlx::query_scalar::<_, i64>(
         r#"INSERT INTO updates (bot_id, update_id, event_type, chat_id, telegram_user_id, payload, expires_at)
            SELECT bots.id, $2, $3, $4, $5, $6,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $1
            ON CONFLICT (bot_id, update_id) DO NOTHING
            RETURNING id"#,
@@ -1443,7 +1703,29 @@ pub async fn webhook_ingress(
     let row_id = match inserted {
         Ok(Some(value)) => value,
         Ok(None) => {
-            let _ = tx.rollback().await;
+            if let Some(identity) = &managed_identity {
+                let existing_row_id = match sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM updates WHERE bot_id = $1 AND update_id = $2",
+                )
+                .bind(bot.id)
+                .bind(update_id)
+                .fetch_optional(&mut *tx)
+                .await
+                {
+                    Ok(Some(row_id)) => row_id,
+                    _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                if let Err(error) =
+                    queue_managed_bot_sync(&mut tx, &bot, update_id, existing_row_id, identity)
+                        .await
+                {
+                    tracing::error!(manager_bot_id = %bot.id, error = ?error, "could not queue managed bot sync");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+            if tx.commit().await.is_err() {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             return (StatusCode::OK, Json(json!({"ok": true}))).into_response();
         }
         Err(error) => {
@@ -1451,16 +1733,20 @@ pub async fn webhook_ingress(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    if let Some(identity) = &managed_identity
+        && let Err(error) = queue_managed_bot_sync(&mut tx, &bot, update_id, row_id, identity).await
+    {
+        tracing::error!(manager_bot_id = %bot.id, error = ?error, "could not queue managed bot sync");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     if let Some(projection) = projection {
         let projected = sqlx::query(
             r#"INSERT INTO conversations
                    (bot_id, chat_id, chat_type, title, username, display_name,
                     last_message_preview, last_update_at, expires_at)
                SELECT bots.id, $2, $3, $4, $5, $6, $7, now(),
-                      now() + make_interval(days => plans.retention_days)
+                      now() + make_interval(days => bot_effective_retention_days(bots.id))
                  FROM bots
-                 JOIN memberships ON memberships.user_id = bots.user_id
-                 JOIN plan_definitions plans ON plans.id = memberships.plan_id
                 WHERE bots.id = $1
                ON CONFLICT (bot_id, chat_id) DO UPDATE SET
                    chat_type = COALESCE(EXCLUDED.chat_type, conversations.chat_type),
@@ -1765,6 +2051,480 @@ fn conversation_projection(payload: &Value) -> Option<ConversationProjection> {
         display_name,
         preview,
     })
+}
+
+#[derive(Debug, FromRow)]
+struct ManagedBotSyncJob {
+    id: Uuid,
+    manager_bot_id: Uuid,
+    managed_telegram_bot_id: i64,
+    managed_owner_telegram_user_id: i64,
+    username: String,
+    display_name: String,
+    source_update_id: i64,
+    source_update_row_id: i64,
+    attempt: i32,
+}
+
+#[derive(Debug, FromRow)]
+struct StoredManagedBot {
+    id: Uuid,
+    user_id: Uuid,
+    token_lookup_hash: String,
+    bot_kind: String,
+    manager_bot_id: Option<Uuid>,
+    manager_telegram_bot_id: Option<i64>,
+    managed_owner_telegram_user_id: Option<i64>,
+    routing_mode: String,
+}
+
+pub async fn run_managed_bot_sync_worker(state: AppState) {
+    loop {
+        match claim_managed_bot_sync(&state).await {
+            Ok(Some(job)) => process_managed_bot_sync(&state, job).await,
+            Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
+            Err(_) => {
+                tracing::error!("managed bot sync worker failed");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn claim_managed_bot_sync(state: &AppState) -> Result<Option<ManagedBotSyncJob>> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        r#"UPDATE managed_bot_sync_jobs
+              SET state = 'retry', error_summary = 'worker_lease_expired',
+                  next_attempt_at = now(), locked_at = NULL, updated_at = now()
+            WHERE state = 'processing'
+              AND locked_at < now() - interval '5 minutes'"#,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let job = sqlx::query_as::<_, ManagedBotSyncJob>(
+        r#"WITH candidate AS (
+               SELECT jobs.id
+                 FROM managed_bot_sync_jobs jobs
+                 JOIN bots manager ON manager.id = jobs.manager_bot_id
+                 JOIN memberships ON memberships.user_id = manager.user_id
+                WHERE jobs.state IN ('pending', 'retry')
+                  AND jobs.next_attempt_at <= now()
+                  AND (
+                      memberships.status IN ('active', 'trialing')
+                      OR (
+                          memberships.status IN ('past_due', 'canceled')
+                          AND memberships.current_period_ends_at > now()
+                      )
+                  )
+                ORDER BY jobs.next_attempt_at, jobs.id
+                FOR UPDATE OF jobs SKIP LOCKED
+                LIMIT 1
+           )
+           UPDATE managed_bot_sync_jobs jobs
+              SET state = 'processing', attempt = attempt + 1,
+                  locked_at = now(), updated_at = now()
+             FROM candidate
+            WHERE jobs.id = candidate.id
+        RETURNING jobs.id, jobs.manager_bot_id, jobs.managed_telegram_bot_id,
+                  jobs.managed_owner_telegram_user_id, jobs.username,
+                  jobs.display_name, jobs.source_update_id,
+                  jobs.source_update_row_id, jobs.attempt"#,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(job)
+}
+
+async fn process_managed_bot_sync(state: &AppState, job: ManagedBotSyncJob) {
+    match sync_managed_bot(state, &job).await {
+        Ok(()) => {
+            if let Err(error) = sqlx::query(
+                r#"UPDATE managed_bot_sync_jobs
+                      SET state = 'completed', error_summary = NULL,
+                          locked_at = NULL, completed_at = now(), updated_at = now()
+                    WHERE id = $1 AND source_update_row_id = $2 AND state = 'processing'"#,
+            )
+            .bind(job.id)
+            .bind(job.source_update_row_id)
+            .execute(&state.db)
+            .await
+            {
+                tracing::error!(job_id = %job.id, error = ?error, "could not complete managed bot sync job");
+            }
+        }
+        Err(error) => {
+            let error_code = managed_sync_error_code(&error);
+            let terminal = matches!(&error, AppError::Conflict(_));
+            let update = if terminal {
+                sqlx::query(
+                    r#"UPDATE managed_bot_sync_jobs
+                          SET state = 'conflict', error_summary = $3,
+                              locked_at = NULL, updated_at = now()
+                        WHERE id = $1 AND source_update_row_id = $2 AND state = 'processing'"#,
+                )
+                .bind(job.id)
+                .bind(job.source_update_row_id)
+                .bind(error_code)
+                .execute(&state.db)
+                .await
+            } else {
+                let seconds = 2_i64.pow(job.attempt.clamp(1, 11) as u32).min(3600);
+                sqlx::query(
+                    r#"UPDATE managed_bot_sync_jobs
+                          SET state = 'retry', error_summary = $3,
+                              next_attempt_at = now() + make_interval(secs => $4),
+                              locked_at = NULL, updated_at = now()
+                        WHERE id = $1 AND source_update_row_id = $2 AND state = 'processing'"#,
+                )
+                .bind(job.id)
+                .bind(job.source_update_row_id)
+                .bind(error_code)
+                .bind(seconds as f64)
+                .execute(&state.db)
+                .await
+            };
+            if let Err(database_error) = update {
+                tracing::error!(job_id = %job.id, error = ?database_error, "could not reschedule managed bot sync job");
+            }
+            tracing::warn!(
+                job_id = %job.id,
+                manager_bot_id = %job.manager_bot_id,
+                managed_telegram_bot_id = job.managed_telegram_bot_id,
+                error_code,
+                terminal,
+                "managed bot sync did not complete"
+            );
+        }
+    }
+}
+
+fn managed_sync_error_code(error: &AppError) -> &'static str {
+    match error {
+        AppError::Conflict(_) => "ownership_conflict",
+        AppError::Validation(_) => "invalid_managed_bot",
+        AppError::Crypto(_) => "credential_encryption_failed",
+        AppError::Database(_) => "database_unavailable",
+        AppError::Unauthorized | AppError::Forbidden | AppError::NotFound => "manager_unavailable",
+        AppError::Config(_) | AppError::Internal => "internal_error",
+        AppError::Upstream(_) | AppError::RateLimited | AppError::PlanLimit(_) => {
+            "telegram_unavailable"
+        }
+    }
+}
+
+fn managed_token_is_valid(token: &str) -> bool {
+    token.len() <= 256
+        && token.split_once(':').is_some_and(|(id, secret)| {
+            !id.is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+                && secret.len() >= 20
+                && secret
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+
+fn take_managed_bot_token(response: &mut Value) -> Result<Zeroizing<String>> {
+    let token = match response.get_mut("result").map(Value::take) {
+        Some(Value::String(token)) => Zeroizing::new(token),
+        _ => {
+            return Err(AppError::Upstream(
+                "managed bot credential was unavailable".into(),
+            ));
+        }
+    };
+    if !managed_token_is_valid(&token) {
+        return Err(AppError::Upstream(
+            "managed bot credential was invalid".into(),
+        ));
+    }
+    Ok(token)
+}
+
+async fn sync_managed_bot(state: &AppState, job: &ManagedBotSyncJob) -> Result<()> {
+    let manager = find_active_bot_by_id(state, job.manager_bot_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let mut token_response = telegram_json_for_bot(
+        state,
+        &manager,
+        "getManagedBotToken",
+        &json!({"user_id": job.managed_telegram_bot_id}),
+        "system",
+    )
+    .await?;
+    let child_token = take_managed_bot_token(&mut token_response)?;
+
+    let observed_bot_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM bots WHERE telegram_bot_id = $1")
+            .bind(job.managed_telegram_bot_id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let mut tx = state.db.begin().await?;
+    if let Some(bot_id) = observed_bot_id {
+        // Use the same lock as an explicit cloud/local migration. A token
+        // refresh must never silently move an existing child to its manager's
+        // backend or inspect it while logOut/login is in progress.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(job.managed_telegram_bot_id)
+        .execute(&mut *tx)
+        .await?;
+    let stored = sqlx::query_as::<_, StoredManagedBot>(
+        r#"SELECT id, user_id, token_lookup_hash, bot_kind, manager_bot_id,
+                  manager_telegram_bot_id, managed_owner_telegram_user_id,
+                  routing_mode
+             FROM bots
+            WHERE telegram_bot_id = $1
+            FOR UPDATE"#,
+    )
+    .bind(job.managed_telegram_bot_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if stored.as_ref().map(|bot| bot.id) != observed_bot_id {
+        return Err(AppError::Upstream(
+            "managed bot changed while synchronization started".into(),
+        ));
+    }
+    if let Some(stored) = &stored
+        && stored.user_id != manager.user_id
+    {
+        return Err(AppError::Conflict(
+            "managed bot belongs to another workspace".into(),
+        ));
+    }
+
+    let bot_id = stored.as_ref().map_or_else(Uuid::new_v4, |bot| bot.id);
+    if observed_bot_id.is_none() {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let child_routing_mode = managed_child_routing(
+        stored.as_ref().map(|bot| bot.routing_mode.as_str()),
+        &manager.routing_mode,
+    );
+    let backend = bot_api_base_for_routing(state, child_routing_mode)?.to_owned();
+    let (_, me) =
+        raw_telegram_json(&state.telegram, &backend, &child_token, "getMe", &json!({})).await?;
+    let identity = me
+        .get("result")
+        .filter(|_| me.get("ok").and_then(Value::as_bool) == Some(true))
+        .ok_or_else(|| AppError::Upstream("managed bot identity verification failed".into()))?;
+    if identity.get("id").and_then(Value::as_i64) != Some(job.managed_telegram_bot_id)
+        || identity.get("is_bot").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(AppError::Conflict(
+            "managed bot identity did not match".into(),
+        ));
+    }
+    let username = identity
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|username| !username.is_empty())
+        .unwrap_or(&job.username)
+        .to_owned();
+    let display_name = identity
+        .get("first_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&job.display_name)
+        .to_owned();
+
+    let (_, webhook_info) = raw_telegram_json(
+        &state.telegram,
+        &backend,
+        &child_token,
+        "getWebhookInfo",
+        &json!({}),
+    )
+    .await?;
+    let previous_webhook = existing_webhook(
+        &webhook_info,
+        &state.config.api_base_url,
+        state.config.app_env != "production",
+    )
+    .map_err(|_| AppError::Upstream("managed bot webhook inspection failed".into()))?;
+    let token_lookup_hash = state.crypto.bot_public_id(&child_token);
+    let token_fingerprint = Crypto::token_fingerprint(&child_token);
+    let encrypted_token = state.crypto.encrypt(
+        child_token.as_bytes(),
+        format!("bot:{bot_id}:token").as_bytes(),
+    )?;
+    let changed = stored.as_ref().is_none_or(|bot| {
+        bot.token_lookup_hash != token_lookup_hash
+            || bot.bot_kind != "managed"
+            || bot.manager_bot_id != Some(manager.id)
+            || bot.manager_telegram_bot_id != Some(manager.telegram_bot_id)
+            || bot.managed_owner_telegram_user_id != Some(job.managed_owner_telegram_user_id)
+    });
+
+    if stored.is_some() {
+        sqlx::query(
+            r#"UPDATE bots
+                  SET username = $2, display_name = $3,
+                      token_ciphertext = $4, token_nonce = $5,
+                      token_fingerprint = $6, token_lookup_hash = $7,
+                      bot_kind = 'managed', manager_bot_id = $8,
+                      manager_telegram_bot_id = $9,
+                      managed_owner_telegram_user_id = $10,
+                      update_mode = CASE WHEN $11 THEN 'webhook' ELSE update_mode END,
+                      status = 'provisioning', updated_at = now()
+                WHERE id = $1"#,
+        )
+        .bind(bot_id)
+        .bind(&username)
+        .bind(&display_name)
+        .bind(&encrypted_token.data)
+        .bind(&encrypted_token.nonce)
+        .bind(&token_fingerprint)
+        .bind(&token_lookup_hash)
+        .bind(manager.id)
+        .bind(manager.telegram_bot_id)
+        .bind(job.managed_owner_telegram_user_id)
+        .bind(previous_webhook.is_some())
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        let public_id = format!("phg_{}", Crypto::random_token(18)?);
+        let ingress_secret = Crypto::random_token(32)?;
+        let encrypted_ingress = state.crypto.encrypt(
+            ingress_secret.as_bytes(),
+            format!("bot:{bot_id}:ingress-secret").as_bytes(),
+        )?;
+        sqlx::query(
+            r#"INSERT INTO bots
+                   (id, user_id, telegram_bot_id, username, display_name,
+                    token_ciphertext, token_nonce, token_fingerprint, public_id,
+                    token_lookup_hash, ingress_secret_ciphertext, ingress_secret_nonce,
+                    status, routing_mode, update_mode, bot_kind, manager_bot_id,
+                    manager_telegram_bot_id, managed_owner_telegram_user_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                       'provisioning',$13,$14,'managed',$15,$16,$17)"#,
+        )
+        .bind(bot_id)
+        .bind(manager.user_id)
+        .bind(job.managed_telegram_bot_id)
+        .bind(&username)
+        .bind(&display_name)
+        .bind(&encrypted_token.data)
+        .bind(&encrypted_token.nonce)
+        .bind(&token_fingerprint)
+        .bind(public_id)
+        .bind(&token_lookup_hash)
+        .bind(&encrypted_ingress.data)
+        .bind(&encrypted_ingress.nonce)
+        .bind(&manager.routing_mode)
+        .bind(if previous_webhook.is_some() {
+            "webhook"
+        } else {
+            "polling"
+        })
+        .bind(manager.id)
+        .bind(manager.telegram_bot_id)
+        .bind(job.managed_owner_telegram_user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query(
+        r#"INSERT INTO bot_update_state
+               (bot_id, allowed_updates, downstream_webhook_url, max_connections)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (bot_id) DO UPDATE SET
+               allowed_updates = CASE
+                   WHEN bot_update_state.downstream_webhook_url IS NULL
+                       THEN EXCLUDED.allowed_updates
+                   ELSE bot_update_state.allowed_updates
+               END,
+               downstream_webhook_url = COALESCE(
+                   bot_update_state.downstream_webhook_url,
+                   EXCLUDED.downstream_webhook_url
+               ),
+               max_connections = CASE
+                   WHEN bot_update_state.downstream_webhook_url IS NULL
+                       THEN EXCLUDED.max_connections
+                   ELSE bot_update_state.max_connections
+               END,
+               updated_at = now()"#,
+    )
+    .bind(bot_id)
+    .bind(
+        previous_webhook
+            .as_ref()
+            .map(|webhook| &webhook.allowed_updates),
+    )
+    .bind(
+        previous_webhook
+            .as_ref()
+            .map(|webhook| webhook.url.as_str()),
+    )
+    .bind(
+        previous_webhook
+            .as_ref()
+            .map_or(40, |webhook| webhook.max_connections),
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    if changed {
+        sqlx::query(
+            r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
+               SELECT bots.user_id, bots.id, $2, $3,
+                      now() + make_interval(days => bot_effective_retention_days(bots.id))
+                 FROM bots
+                WHERE bots.id = $1"#,
+        )
+        .bind(bot_id)
+        .bind(if stored.is_some() {
+            "bot.managed_refreshed"
+        } else {
+            "bot.managed_discovered"
+        })
+        .bind(json!({
+            "manager_bot_id": manager.id,
+            "manager_telegram_bot_id": manager.telegram_bot_id,
+            "telegram_bot_id": job.managed_telegram_bot_id,
+            "managed_owner_telegram_user_id": job.managed_owner_telegram_user_id,
+            "source_update_id": job.source_update_id
+        }))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    let mut provision_lock = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(bot_id)
+        .execute(&mut *provision_lock)
+        .await?;
+    let child = find_active_bot_by_id(state, bot_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let provisioning = install_managed_webhook(state, &child).await;
+    let provisioned = provisioning.as_ref().is_ok_and(|accepted| *accepted);
+    sqlx::query("UPDATE bots SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(bot_id)
+        .bind(if provisioned { "healthy" } else { "degraded" })
+        .execute(&mut *provision_lock)
+        .await?;
+    provision_lock.commit().await?;
+    provisioning?;
+    if !provisioned {
+        return Err(AppError::Upstream(
+            "managed bot webhook provisioning failed".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, FromRow)]
@@ -2117,7 +2877,11 @@ fn is_globally_routable_v6(ip: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod destination_tests {
-    use super::{byte_range, is_globally_routable, validate_webhook_url};
+    use super::{
+        ALL_UPDATE_TYPES, byte_range, is_globally_routable, managed_bot_identity,
+        managed_child_routing, take_managed_bot_token, validate_webhook_url,
+    };
+    use serde_json::{Value, json};
     use std::net::IpAddr;
 
     fn ip(value: &str) -> IpAddr {
@@ -2169,5 +2933,68 @@ mod destination_tests {
         assert_eq!(byte_range("bytes=20-", 10), None);
         assert_eq!(byte_range("bytes=1-2,4-5", 10), None);
         assert_eq!(byte_range("items=1-2", 10), None);
+    }
+
+    #[test]
+    fn recognizes_current_control_plane_update_types() {
+        for update_type in ["guest_message", "managed_bot", "subscription"] {
+            assert!(ALL_UPDATE_TYPES.contains(&update_type));
+        }
+    }
+
+    #[test]
+    fn managed_child_keeps_an_existing_independent_route() {
+        assert_eq!(managed_child_routing(Some("local"), "cloud"), "local");
+        assert_eq!(managed_child_routing(Some("cloud"), "local"), "cloud");
+        assert_eq!(managed_child_routing(None, "local"), "local");
+    }
+
+    #[test]
+    fn parses_managed_bot_identity_without_a_token() {
+        let identity = managed_bot_identity(&json!({
+            "update_id": 44,
+            "managed_bot": {
+                "user": {"id": 777, "is_bot": false, "first_name": "Owner"},
+                "bot": {
+                    "id": 987654321,
+                    "is_bot": true,
+                    "first_name": "Nested Agent",
+                    "username": "nested_agent_bot"
+                }
+            }
+        }))
+        .expect("valid managed update")
+        .expect("managed identity");
+
+        assert_eq!(identity.telegram_bot_id, 987654321);
+        assert_eq!(identity.owner_telegram_user_id, 777);
+        assert_eq!(identity.username, "nested_agent_bot");
+        assert_eq!(identity.display_name, "Nested Agent");
+    }
+
+    #[test]
+    fn rejects_malformed_managed_bot_identity() {
+        assert!(
+            managed_bot_identity(&json!({
+                "managed_bot": {
+                    "user": {"id": 777},
+                    "bot": {"id": 987654321, "is_bot": false}
+                }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn takes_the_managed_token_out_of_the_response_before_use() {
+        let mut response = json!({
+            "ok": true,
+            "result": "987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+        });
+        let token = take_managed_bot_token(&mut response).expect("valid managed token");
+
+        assert_eq!(&**token, "987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef");
+        assert!(response.get("result").is_some_and(Value::is_null));
+        assert!(!response.to_string().contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
     }
 }

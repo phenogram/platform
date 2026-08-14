@@ -22,7 +22,10 @@ secrets:
 
 ingress:
   enabled: true
-  className: traefik
+  className: nginx
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    cert-manager.io/issuer-kind: ClusterIssuer
   landing:
     host: phenogram.io
     tls:
@@ -35,6 +38,12 @@ ingress:
       secretName: app-phenogram-io-tls
   api:
     host: api.phenogram.io
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: "2000m"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     tls:
       enabled: true
       secretName: api-phenogram-io-tls
@@ -45,6 +54,7 @@ postgresql:
     repository: postgres
     tag: 17-bookworm
   persistence:
+    storageClass: standard
     size: 10Gi
   backup:
     enabled: true
@@ -57,4 +67,13 @@ telegramBotApi:
     tag: ""
     digest: ""
   persistence:
+    storageClass: standard
     size: 20Gi
+
+networkPolicy:
+  ingressController:
+    namespace: ingress-nginx
+    podLabels:
+      app.kubernetes.io/component: controller
+      app.kubernetes.io/instance: ingress-nginx
+      app.kubernetes.io/name: ingress-nginx

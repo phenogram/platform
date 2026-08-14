@@ -95,7 +95,7 @@ spec:
                   if ! restic snapshots >/dev/null 2>&1; then
                     restic init
                   fi
-                  restic backup /snapshots --tag phenogram-postgresql --host rubase-phenogram
+                  restic backup /snapshots --tag phenogram-postgresql --host contabo-phenogram
                   restic forget \
                     --keep-daily {{ .Values.postgresql.backup.retention.daily }} \
                     --keep-weekly {{ .Values.postgresql.backup.retention.weekly }} \

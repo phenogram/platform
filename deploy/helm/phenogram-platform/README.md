@@ -1,9 +1,9 @@
 # Phenogram production chart
 
 This chart deploys one Phenogram application pod, a persistent PostgreSQL 17
-database, encrypted off-site logical backups, Traefik ingress, and the official
+database, encrypted logical backups, ingress-nginx, and the official
 Telegram Bot API server as an application sidecar. It targets the `phenogram`
-namespace on Rubase and publishes three deliberately separate origins:
+namespace on Contabo and publishes three deliberately separate origins:
 
 - `https://phenogram.io` serves only the public landing experience and the
   crawlable `https://phenogram.io/privacy` policy required for provider
@@ -22,33 +22,36 @@ different shared-file design plus distributed SSE and rate limiting.
 
 - An existing `phenogram` namespace and the namespace-only deployment service
   account defined in `deploy/bootstrap/github-deployer.yaml`.
-- Traefik in `kube-system`, labeled `app.kubernetes.io/name=traefik`.
+- ingress-nginx in `ingress-nginx`, labeled
+  `app.kubernetes.io/name=ingress-nginx`.
 - cert-manager with a `letsencrypt-prod` ClusterIssuer.
-- The default `local-path` StorageClass.
+- The `standard` StorageClass.
+- Flux source-controller and helm-controller with support for OCIRepository and
+  HelmRelease resources. Apply `deploy/flux/phenogram-production.yaml` once as
+  a cluster administrator.
 - DNS-only `A` records for `phenogram.io`, `app.phenogram.io`, and
-  `api.phenogram.io`, each pointing to `185.221.212.224`.
+  `api.phenogram.io`, each pointing to `84.247.177.201`.
 
 Do not enable Cloudflare proxying for these hostnames. Bot API file transfers
-and SSE connections should terminate directly at Traefik, and token-bearing
-machine API paths must not be recorded by URI access logs. Configure Traefik
+and SSE connections should terminate directly at ingress-nginx, and token-bearing
+machine API paths must not be recorded by URI access logs. Configure ingress-nginx
 access-log redaction or keep access logging disabled before production traffic
 arrives.
 
 ## Secret contract
 
-The chart deliberately renders no Kubernetes Secret. The deployment workflow
-reconciles these three external resources before Helm runs:
+The chart deliberately renders no Kubernetes Secret. Provision these three
+external resources in the `phenogram` namespace before enabling the
+HelmRelease:
 
-- `phenogram-ghcr`, from repository secret
-  `PHENOGRAM_GHCR_PULL_CONFIG_JSON`.
-- `phenogram-secrets`, from repository secrets `DATABASE_URL`,
-  `POSTGRES_PASSWORD`, `MASTER_KEY`, `PUBLIC_ID_KEY`, `LINK_SIGNING_KEY`,
-  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
-  `PHENOGRAM_GITHUB_OAUTH_CLIENT_ID`,
-  `PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET`, `TELEGRAM_API_ID`,
-  and `TELEGRAM_API_HASH`.
-- `phenogram-backup-secrets`, from the five
-  `PHENOGRAM_BACKUP_*` repository secrets.
+- `phenogram-ghcr`, a `kubernetes.io/dockerconfigjson` credential that can read
+  the private image and chart packages under `ghcr.io/phenogram`.
+- `phenogram-secrets`, with `DATABASE_URL`, `POSTGRES_PASSWORD`, `MASTER_KEY`,
+  `PUBLIC_ID_KEY`, `LINK_SIGNING_KEY`, `GOOGLE_OAUTH_CLIENT_ID`,
+  `GOOGLE_OAUTH_CLIENT_SECRET`, `GITHUB_OAUTH_CLIENT_ID`,
+  `GITHUB_OAUTH_CLIENT_SECRET`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH`.
+- `phenogram-backup-secrets`, with `access-key`, `secret-key`, `endpoint`,
+  `bucket`, and `restic-password`.
 
 `DATABASE_URL` must address
 `postgresql://phenogram:<encoded-password>@phenogram-postgresql:5432/phenogram`.
@@ -58,23 +61,29 @@ Google's callback is
 `https://app.phenogram.io/api/auth/oauth/google/callback` with only
 `openid profile`, and GitHub's callback is
 `https://app.phenogram.io/api/auth/oauth/github/callback` with no OAuth scope.
-Phenogram stores neither email addresses nor provider tokens.
-The deploy credential itself is stored as `RUBASE_PHENOGRAM_KUBECONFIG` and
-must contain a kubeconfig whose current context is fixed to `phenogram`.
+Phenogram stores neither email addresses nor provider tokens. Secret values are
+never passed as Helm values, so they remain absent from Helm release history.
+Manage them through a restricted cluster secret workflow or SOPS. After a
+manual secret rotation, restart the application Deployment so its processes
+load the new values.
 
-Secrets are sent directly to the Kubernetes API and never passed as Helm values,
-so they are absent from Helm release history. GitHub logs do not deliberately
-print them; keep secret masking enabled and restrict the `production`
-environment to trusted maintainers.
+GitHub Actions needs no Kubernetes, SSH, runtime, database, OAuth, or Telegram
+credential. A push to `master` uses only the ephemeral repository
+`GITHUB_TOKEN` to publish digest-pinned images and a merged production Helm
+chart to `ghcr.io/phenogram/phenogram-platform`. Flux selects the newest chart
+version and helm-controller performs the namespace-scoped upgrade on Contabo.
 
-The workflow passes only the Kubernetes Secret's non-sensitive resource version
-to Helm. A secret change therefore updates the pod-template annotation and
-restarts the consumers even when a manual deployment reuses the same commit.
+The chart renders namespace-scoped NetworkPolicy resources. Contabo's current
+Minikube `bridge` CNI does not enforce NetworkPolicy, so these manifests are
+desired state rather than active isolation until a policy-capable CNI is
+installed.
 
 ## Storage and backups
 
 Production requests 10 GiB for PostgreSQL and 20 GiB for Telegram local files;
-both PVCs carry Helm's `keep` policy. Every six hours the backup CronJob creates
+both PVCs carry Helm's `keep` policy. Contabo's `standard` StorageClass cannot
+expand an existing claim, so increasing either size requires a controlled data
+move to a new PVC. Every six hours the backup CronJob creates
 a compressed custom-format `pg_dump`, validates it with `pg_restore --list`,
 uploads it into a dedicated encrypted Restic repository on Contabo MinIO,
 applies 14 daily/8 weekly/12 monthly retention, and checks 5% of repository data.
@@ -97,7 +106,7 @@ helm template phenogram deploy/helm/phenogram-platform \
 ```
 
 Migrations run during application startup. The workflow uses immutable image
-digests, an atomic Helm upgrade, rollout checks, a database-backed health check
-on the app origin, and negative checks that the landing and machine origins do
-not expose management health. Take a restorable backup before merging a
-migration into `master`.
+digests, publishes an immutable OCI chart, waits for Flux to expose the exact
+commit revision on the Contabo origin, and runs positive and negative checks
+across all three hosts. Take a restorable backup before merging a migration
+into `master` when production contains data worth preserving.

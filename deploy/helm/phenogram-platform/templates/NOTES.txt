@@ -6,9 +6,9 @@ Management health: {{ .Values.config.appBaseUrl }}/api/health
 Telegram-compatible API: {{ .Values.config.apiBaseUrl }}
 
 The chart expects the existing Secrets {{ .Values.secrets.existingSecret }} and
-{{ .Values.postgresql.backup.existingSecret }}. GitHub Actions creates them
-directly so their values never enter Helm values or release history.
+{{ .Values.postgresql.backup.existingSecret }}. Provision them outside Helm so
+their values never enter Helm values or release history.
 
 Telegram-compatible request paths on the machine API host contain bot tokens.
-Disable or redact URI access logs at the Traefik installation level before
+Disable or redact URI access logs at the ingress-nginx installation level before
 routing production traffic.

@@ -12,13 +12,13 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, active_membership, membership},
-    crypto::{Ciphertext, Crypto},
+    crypto::Crypto,
     error::{AppError, Result},
     models::{ActivitySummary, BotRecord, BotSummary, ConversationSummary, UpdateSummary},
     state::AppState,
     telegram::{
-        ALL_UPDATE_TYPES, OutboundMessageRecord, decrypt_token, raw_telegram_json,
-        record_outbound_message, telegram_json_for_bot, validate_webhook_url,
+        ALL_UPDATE_TYPES, OutboundMessageRecord, decrypt_token, existing_webhook,
+        install_managed_webhook, raw_telegram_json, record_outbound_message, telegram_json_for_bot,
     },
 };
 
@@ -34,13 +34,21 @@ pub async fn health(State(state): State<AppState>) -> Response {
     };
     (
         status,
-        Json(json!({
-            "status": if database { "ok" } else { "degraded" },
-            "database": database,
-            "version": env!("CARGO_PKG_VERSION")
-        })),
+        Json(health_payload(
+            database,
+            state.config.deployment_revision.as_str(),
+        )),
     )
         .into_response()
+}
+
+fn health_payload(database: bool, deployment_revision: &str) -> Value {
+    json!({
+        "status": if database { "ok" } else { "degraded" },
+        "database": database,
+        "version": env!("CARGO_PKG_VERSION"),
+        "deployment_revision": deployment_revision,
+    })
 }
 
 pub async fn plans(State(state): State<AppState>) -> Result<Json<Value>> {
@@ -67,13 +75,6 @@ pub struct ConnectBotRequest {
     token: String,
 }
 
-#[derive(Debug)]
-struct ExistingWebhook {
-    url: String,
-    allowed_updates: Value,
-    max_connections: i32,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ConnectBotResponse {
     bot: BotSummary,
@@ -88,10 +89,12 @@ pub async fn connect_bot(
     let token = input.token.trim().to_owned();
     validate_bot_token(&token)?;
     let membership = active_membership(&state, user.id).await?;
-    let bot_count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM bots WHERE user_id = $1")
-        .bind(user.id)
-        .fetch_one(&state.db)
-        .await?;
+    let bot_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM bots WHERE user_id = $1 AND bot_kind = 'connected'",
+    )
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await?;
     if bot_count >= membership.bot_limit as i64 {
         return Err(AppError::PlanLimit(format!(
             "The {} plan supports {} bot{}",
@@ -178,8 +181,9 @@ pub async fn connect_bot(
     let insert = sqlx::query(
         r#"INSERT INTO bots
                (id, user_id, telegram_bot_id, username, display_name, token_ciphertext, token_nonce,
-                token_fingerprint, public_id, ingress_secret_ciphertext, ingress_secret_nonce)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"#,
+                token_fingerprint, public_id, token_lookup_hash,
+                ingress_secret_ciphertext, ingress_secret_nonce)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11)"#,
     )
     .bind(bot_id)
     .bind(user.id)
@@ -232,10 +236,8 @@ pub async fn connect_bot(
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
            SELECT $1, bots.id, 'bot.connected', $3,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $2"#,
     )
     .bind(user.id)
@@ -243,7 +245,33 @@ pub async fn connect_bot(
     .bind(json!({"telegram_bot_id": telegram_bot_id, "username": username, "migrated_webhook": previous_webhook.is_some()}))
     .execute(&mut *tx)
     .await?;
+
+    // A manager can be removed and later reconnected. Keep the stable Telegram
+    // manager ID on children so the hierarchy heals without user action.
+    let reattached = sqlx::query(
+        r#"UPDATE bots
+              SET manager_bot_id = $1, updated_at = now()
+            WHERE user_id = $2
+              AND bot_kind = 'managed'
+              AND manager_bot_id IS NULL
+              AND manager_telegram_bot_id = $3"#,
+    )
+    .bind(bot_id)
+    .bind(user.id)
+    .bind(telegram_bot_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     tx.commit().await?;
+
+    // Reattachment itself invokes the hierarchy trigger. Without orphans, the
+    // new direct bot can still consume a paid coverage slot from a managed bot.
+    if reattached == 0 {
+        sqlx::query("SELECT refresh_user_bot_retention($1)")
+            .bind(user.id)
+            .execute(&state.db)
+            .await?;
+    }
 
     let webhook_url = format!(
         "{}/telegram/webhook/{}",
@@ -290,91 +318,6 @@ pub async fn connect_bot(
     ))
 }
 
-fn existing_webhook(
-    webhook_info: &Value,
-    api_base_url: &str,
-    allow_insecure_development: bool,
-) -> Result<Option<ExistingWebhook>> {
-    if webhook_info.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(AppError::Upstream(
-            webhook_info
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Telegram did not return webhook information")
-                .to_owned(),
-        ));
-    }
-    let result = webhook_info
-        .get("result")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            AppError::Upstream("Telegram returned invalid webhook information".into())
-        })?;
-    let Some(url) = result
-        .get("url")
-        .and_then(Value::as_str)
-        .filter(|url| !url.is_empty())
-    else {
-        return Ok(None);
-    };
-    if is_managed_ingress_url(url, api_base_url) {
-        return Ok(None);
-    }
-    if result
-        .get("has_custom_certificate")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(AppError::Validation(
-            "The bot's existing webhook uses a custom certificate that Telegram cannot transfer. Switch it to a publicly trusted certificate and try again."
-                .into(),
-        ));
-    }
-    validate_webhook_url(url, allow_insecure_development).map_err(|_| {
-        AppError::Validation(
-            "The bot's existing webhook cannot be transferred safely. Update it in Telegram and try again."
-                .into(),
-        )
-    })?;
-    let allowed_updates = result
-        .get("allowed_updates")
-        .filter(|value| {
-            value
-                .as_array()
-                .is_some_and(|items| items.iter().all(Value::is_string))
-        })
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let max_connections = result
-        .get("max_connections")
-        .and_then(Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
-        .filter(|value| (1..=100).contains(value))
-        .unwrap_or(40);
-    Ok(Some(ExistingWebhook {
-        url: url.to_owned(),
-        allowed_updates,
-        max_connections,
-    }))
-}
-
-fn is_managed_ingress_url(candidate: &str, api_base_url: &str) -> bool {
-    let (Ok(candidate), Ok(api_base)) = (url::Url::parse(candidate), url::Url::parse(api_base_url))
-    else {
-        return false;
-    };
-    candidate.scheme() == api_base.scheme()
-        && candidate
-            .host_str()
-            .zip(api_base.host_str())
-            .is_some_and(|(candidate, api)| candidate.eq_ignore_ascii_case(api))
-        && candidate.port_or_known_default() == api_base.port_or_known_default()
-        && candidate
-            .path()
-            .strip_prefix("/telegram/webhook/")
-            .is_some_and(|public_id| !public_id.is_empty() && !public_id.contains('/'))
-}
-
 pub async fn provision_bot(
     State(state): State<AppState>,
     user: AuthUser,
@@ -392,10 +335,8 @@ pub async fn provision_bot(
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
            SELECT $1, bots.id, 'bot.provision_retried', $3,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $2"#,
     )
     .bind(user.id)
@@ -416,14 +357,53 @@ pub async fn provision_bot(
 
 pub async fn list_bots(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>> {
     let bots = sqlx::query_as::<_, BotSummary>(
-        r#"SELECT id, telegram_bot_id, username, display_name, public_id,
-                  status, routing_mode, update_mode, last_update_at, last_api_call_at, created_at
-             FROM bots WHERE user_id = $1 ORDER BY created_at DESC"#,
+        r#"SELECT bots.id, bots.telegram_bot_id, bots.username, bots.display_name,
+                  bots.public_id, bots.status, bots.routing_mode, bots.update_mode,
+                  bots.last_update_at, bots.last_api_call_at, bots.created_at,
+                  bots.bot_kind, bots.bot_kind = 'managed' AS is_managed,
+                  bots.manager_bot_id, bots.manager_telegram_bot_id,
+                  manager.username AS manager_username,
+                  manager.display_name AS manager_display_name,
+                  bots.managed_owner_telegram_user_id,
+                  bot_plan_covered(bots.id) AS plan_covered,
+                  bot_effective_retention_days(bots.id) AS effective_retention_days,
+                  bot_retention_warning(bots.id) AS retention_warning
+             FROM bots
+             LEFT JOIN bots manager
+               ON manager.id = bots.manager_bot_id AND manager.user_id = bots.user_id
+            WHERE bots.user_id = $1
+            ORDER BY bots.created_at DESC, bots.id DESC"#,
     )
     .bind(user.id)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(json!({"bots": bots})))
+    let coverage = sqlx::query_as::<_, BotCoverageSummary>(
+        r#"SELECT memberships.plan_id, plans.bot_limit,
+                  count(bots.id) FILTER (
+                      WHERE bots.id IS NOT NULL AND bot_plan_covered(bots.id)
+                  ) AS covered_bot_count,
+                  count(bots.id) FILTER (
+                      WHERE bots.bot_kind = 'managed'
+                        AND NOT bot_plan_covered(bots.id)
+                  ) AS uncovered_bot_count
+             FROM memberships
+             JOIN plan_definitions plans ON plans.id = memberships.plan_id
+             LEFT JOIN bots ON bots.user_id = memberships.user_id
+            WHERE memberships.user_id = $1
+            GROUP BY memberships.plan_id, plans.bot_limit"#,
+    )
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(json!({"bots": bots, "coverage": coverage})))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct BotCoverageSummary {
+    plan_id: String,
+    bot_limit: i32,
+    covered_bot_count: i64,
+    uncovered_bot_count: i64,
 }
 
 pub async fn get_bot(
@@ -450,7 +430,7 @@ pub async fn get_bot(
         "integration": {
             "api_base": format!("{}/bot${{BOT_TOKEN}}", state.config.api_base_url),
             "public_id": bot.public_id,
-            "retention_days": membership.retention_days
+            "retention_days": bot.effective_retention_days
         }
     })))
 }
@@ -656,10 +636,8 @@ pub async fn send_message(
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
            SELECT $1, bots.id, 'bot_view.message_sent', $3,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $2"#,
     )
     .bind(user.id)
@@ -728,10 +706,8 @@ pub async fn create_stream_key(
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
            SELECT $1, bots.id, 'stream_key.created', $3,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $2"#,
     )
     .bind(user.id)
@@ -936,10 +912,8 @@ pub async fn change_routing(
     sqlx::query(
         r#"INSERT INTO audit_log (user_id, bot_id, action, metadata, expires_at)
            SELECT $1, bots.id, 'bot.routing_changed', $3,
-                  now() + make_interval(days => plans.retention_days)
+                  now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-             JOIN memberships ON memberships.user_id = bots.user_id
-             JOIN plan_definitions plans ON plans.id = memberships.plan_id
             WHERE bots.id = $2"#,
     )
     .bind(user.id)
@@ -953,52 +927,24 @@ pub async fn change_routing(
     ))
 }
 
-async fn install_managed_webhook(state: &AppState, bot: &BotRecord) -> Result<bool> {
-    let token = decrypt_token(state, bot)?;
-    let token = std::str::from_utf8(&token).map_err(|_| AppError::Internal)?;
-    let ingress_secret = state.crypto.decrypt(
-        &Ciphertext {
-            data: bot.ingress_secret_ciphertext.clone(),
-            nonce: bot.ingress_secret_nonce.clone(),
-        },
-        format!("bot:{}:ingress-secret", bot.id).as_bytes(),
-    )?;
-    let ingress_secret = std::str::from_utf8(&ingress_secret).map_err(|_| AppError::Internal)?;
-    let base = if bot.routing_mode == "local" {
-        state
-            .config
-            .telegram_local_api_url
-            .as_deref()
-            .ok_or_else(|| AppError::Conflict("Local Bot API routing is not configured".into()))?
-    } else {
-        &state.config.telegram_cloud_api_url
-    };
-    let webhook_url = format!(
-        "{}/telegram/webhook/{}",
-        state.config.api_base_url, bot.public_id
-    );
-    let (_, response) = raw_telegram_json(
-        &state.telegram,
-        base,
-        token,
-        "setWebhook",
-        &json!({
-            "url": webhook_url,
-            "secret_token": ingress_secret,
-            "allowed_updates": ALL_UPDATE_TYPES,
-            "drop_pending_updates": false
-        }),
-    )
-    .await?;
-    Ok(response.get("ok").and_then(Value::as_bool) == Some(true))
-}
-
 pub async fn delete_bot(
     State(state): State<AppState>,
     user: AuthUser,
     Path(bot_id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let bot = get_bot_record(&state, user.id, bot_id).await?;
+    let hierarchy = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "SELECT bot_kind, manager_bot_id FROM bots WHERE id = $1 AND user_id = $2",
+    )
+    .bind(bot_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await?;
+    if hierarchy.0 == "managed" && hierarchy.1.is_some() {
+        return Err(AppError::Conflict(
+            "This bot is managed automatically. Disconnect its manager before deleting it.".into(),
+        ));
+    }
     let token = decrypt_token(&state, &bot)?;
     let base = if bot.routing_mode == "local" {
         state
@@ -1040,9 +986,21 @@ pub async fn delete_bot(
 
 async fn get_bot_summary(state: &AppState, user_id: Uuid, bot_id: Uuid) -> Result<BotSummary> {
     sqlx::query_as::<_, BotSummary>(
-        r#"SELECT id, telegram_bot_id, username, display_name, public_id,
-                  status, routing_mode, update_mode, last_update_at, last_api_call_at, created_at
-             FROM bots WHERE id = $1 AND user_id = $2"#,
+        r#"SELECT bots.id, bots.telegram_bot_id, bots.username, bots.display_name,
+                  bots.public_id, bots.status, bots.routing_mode, bots.update_mode,
+                  bots.last_update_at, bots.last_api_call_at, bots.created_at,
+                  bots.bot_kind, bots.bot_kind = 'managed' AS is_managed,
+                  bots.manager_bot_id, bots.manager_telegram_bot_id,
+                  manager.username AS manager_username,
+                  manager.display_name AS manager_display_name,
+                  bots.managed_owner_telegram_user_id,
+                  bot_plan_covered(bots.id) AS plan_covered,
+                  bot_effective_retention_days(bots.id) AS effective_retention_days,
+                  bot_retention_warning(bots.id) AS retention_warning
+             FROM bots
+             LEFT JOIN bots manager
+               ON manager.id = bots.manager_bot_id AND manager.user_id = bots.user_id
+            WHERE bots.id = $1 AND bots.user_id = $2"#,
     )
     .bind(bot_id)
     .bind(user_id)
@@ -1104,9 +1062,19 @@ fn validate_bot_token(token: &str) -> Result<()> {
 mod tests {
     use serde_json::json;
 
-    use super::{ConnectBotRequest, existing_webhook};
+    use super::{ConnectBotRequest, existing_webhook, health_payload};
 
     const API_BASE_URL: &str = "https://api.phenogram.io";
+
+    #[test]
+    fn health_payload_exposes_the_running_deployment_revision() {
+        let payload = health_payload(true, "sha-abc123");
+
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["database"], true);
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(payload["deployment_revision"], "sha-abc123");
+    }
 
     #[test]
     fn connect_request_needs_only_the_bot_token() {

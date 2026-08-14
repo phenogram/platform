@@ -43,7 +43,7 @@ Application startup is fail-fast: configuration is validated, PostgreSQL is conn
 | `PHENOGRAM_HTTP_PORT`, `PHENOGRAM_HTTPS_PORT` | `80`, `443` | Published Caddy ports. |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Premium overlay only | Operator-owned Telegram application credentials for the official local server. |
 
-Generate the three application keys independently. Store them, database credentials, and OAuth client secrets in the deployment secret manager, not in the image, repository, Compose manifest, shell history, or centralized logs. Production validation rejects short application secrets and values containing `development`, but it cannot assess entropy. OAuth client IDs are not confidential by protocol, but the production workflow keeps each complete provider credential pair together in repository secrets.
+Generate the three application keys independently. Store them, database credentials, and OAuth client secrets in the deployment secret manager, not in the image, repository, Compose manifest, shell history, or centralized logs. Production validation rejects short application secrets and values containing `development`, but it cannot assess entropy. OAuth client IDs are not confidential by protocol, but keep each complete provider credential pair together in the restricted runtime Secret.
 
 ## Social OAuth provider setup
 
@@ -55,14 +55,14 @@ Configure a dedicated production Google Cloud project and Web application OAuth 
 2. Configure the public app homepage as `https://phenogram.io`, register `phenogram.io` as an authorized domain, verify ownership through Google Search Console, and use `https://phenogram.io/privacy` as the public privacy-policy URL on both the landing page and OAuth branding screen. Google requires operator support/developer contact details in its console; Phenogram does not ingest those addresses.
 3. Create a **Web application** OAuth client. Set the only production authorized redirect URI used by Phenogram to exactly `https://app.phenogram.io/api/auth/oauth/google/callback`, including scheme, host, path, case, and lack of trailing slash. No authorized JavaScript origin is required because this is a server-side authorization-code flow.
 4. Request only `openid profile`. The OIDC `email` scope is optional and is deliberately omitted. Do not enable unrelated Google API scopes.
-5. Save the client ID and secret as GitHub repository secrets `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`.
+5. Store the client ID and secret as `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in the restricted `phenogram-secrets` Kubernetes Secret.
 
 Create a dedicated OAuth App under a maintained GitHub account, following GitHub's [OAuth App registration](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) and [web authorization flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps). GitHub permits either personal- or organization-owned OAuth Apps; prefer organization ownership when it is available, but do not block production on ownership transfer:
 
 1. Use **Phenogram Platform** as the application name and `https://phenogram.io` as the Homepage URL.
 2. Set the Authorization callback URL to exactly `https://app.phenogram.io/api/auth/oauth/github/callback`. A GitHub OAuth App has one configured callback URL, so use a separate app for development. Leave Device Flow disabled.
 3. Keep this app dedicated to sign-in and request no OAuth scope. In particular, never request `user` or `user:email`; GitHub documents that an empty scope grants read-only access to public identity. If these credentials were previously used to request broader scopes, replace the OAuth App rather than relying on a later empty-scope request, because GitHub can reuse grants previously authorized for the same app.
-4. Save the client ID and secret as GitHub repository secrets `PHENOGRAM_GITHUB_OAUTH_CLIENT_ID` and `PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET`. GitHub reserves repository-secret names beginning with `GITHUB_`; the workflow maps these names to the application's `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` environment variables.
+4. Store the client ID and secret as `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` in the restricted `phenogram-secrets` Kubernetes Secret. They are runtime credentials and are not needed by GitHub Actions.
 
 For local development, create separate provider clients and use callbacks derived exactly from the local `APP_BASE_URL`. The default split-host callbacks are `http://app.localhost/api/auth/oauth/google/callback` and `http://app.localhost/api/auth/oauth/github/callback`. If a provider console refuses the `app.localhost` form, use the documented one-origin mode with all three base URLs set to `http://localhost:8080`, register `http://localhost:8080/api/auth/oauth/{provider}/callback`, and start only `postgres` and `app`. Do not reuse the production GitHub OAuth App because it supports only one callback.
 
@@ -108,6 +108,16 @@ When a bot already has a Telegram webhook, connection automatically imports its 
 
 Telegram's `getWebhookInfo` response does not include the existing `secret_token` or uploaded certificate. If the downstream endpoint validates `X-Telegram-Bot-Api-Secret-Token`, call `setWebhook` through Phenogram after connecting to store that secret. A webhook using a custom certificate cannot be transferred automatically and must first move to a publicly trusted HTTPS certificate. Treat downstream webhook URLs as sensitive operational data in database access, exports, and backups.
 
+### Managed bot discovery
+
+Phenogram subscribes every upstream manager webhook to Telegram's `managed_bot` lifecycle update. In the same transaction that journals that update, it enqueues an idempotent synchronization job; downstream `allowed_updates` never suppresses this internal control-plane action. The worker uses the manager credential to call `getManagedBotToken`, validates the returned child token with `getMe`, encrypts it, imports a transferable child webhook, and installs the child's own Phenogram webhook. Ordinary child updates do not arrive through the manager, so the separate child webhook is required.
+
+The job table never contains the child token. The plaintext returned by Telegram exists only while it is validated and encrypted, and errors exposed to logs or clients must remain generic. A token-change update refreshes the encrypted credential and its keyed lookup digest while preserving the child's stable public ID and ingress URL. Never use `replaceManagedBotToken` for synchronization because that method revokes the current token.
+
+Discovery is not subject to the hard direct-connection limit. The hierarchy is keyed by both the Phenogram manager record and its stable Telegram bot ID so deleting a manager leaves its children intact and reconnecting the same manager repairs the relationship. A child claimed by a manager in another Phenogram account must be treated as an ownership conflict; do not move its history or credential automatically.
+
+An actively managed child cannot be deleted independently through the management API: it is part of Telegram's manager relationship and would otherwise vanish from Phenogram until another lifecycle update happened to recreate it. Disconnecting the manager leaves its children as manager-missing bots; those orphans can then be deleted explicitly.
+
 ## Monitoring and readiness
 
 Minimum alerts:
@@ -119,6 +129,7 @@ Minimum alerts:
 - PostgreSQL disk, volume inode, connection, or transaction pressure;
 - failed retention sweeps;
 - growing or old `pending`/`failed` webhook deliveries;
+- growing or repeatedly retried `managed_bot_sync_jobs`;
 - bots with stale `last_update_at`, `degraded`, or `token_invalid` status;
 - expired-row backlog or unusual growth in `updates`, `outbound_messages`, `api_calls`, `conversations`, or `audit_log`;
 - SSE 429s: each process allows 256 total streams and four per stream key;
@@ -131,6 +142,8 @@ docker compose ps
 docker compose logs --tail=200 app
 docker compose exec -T postgres psql -U phenogram -d phenogram -c \
   "SELECT state, count(*), min(next_attempt_at) AS oldest FROM webhook_deliveries GROUP BY state ORDER BY state"
+docker compose exec -T postgres psql -U phenogram -d phenogram -c \
+  "SELECT state, count(*), min(next_attempt_at) AS oldest FROM managed_bot_sync_jobs GROUP BY state ORDER BY state"
 docker compose exec -T postgres psql -U phenogram -d phenogram -c \
   "SELECT status, routing_mode, update_mode, count(*) FROM bots GROUP BY 1,2,3 ORDER BY 1,2,3"
 docker compose exec -T postgres psql -U phenogram -d phenogram -c \
@@ -166,8 +179,8 @@ Test restores into an isolated PostgreSQL instance with no production traffic. V
 
 For the optional local Telegram service, stop or quiesce it while taking a filesystem snapshot of `telegram-bot-api-data`, or use a storage system that provides consistent volume snapshots. Regularly test both service recovery and Telegram re-login; PostgreSQL alone does not contain its local files or runtime state.
 
-The production Helm profile configures six-hourly encrypted off-site Restic
-backups with daily/weekly/monthly retention and repository sampling. It does not
+The production Helm profile configures six-hourly encrypted Restic backups in
+Contabo MinIO with daily/weekly/monthly retention and repository sampling. It does not
 provide point-in-time recovery, replication, or cross-region failover. Define
 and test RPO/RTO, alert on missed jobs, and repeat isolated restore drills.
 
@@ -189,11 +202,11 @@ Rotating `LINK_SIGNING_KEY` immediately invalidates every outstanding signed fil
 
 Existing Phenogram sessions do not contain or depend on provider access tokens, so rotating a provider client secret affects only new sign-ins and callbacks currently in flight.
 
-For GitHub, generate a new client secret on the dedicated OAuth App, update repository secret `PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET`, deploy, verify a fresh sign-in, and then delete the old secret. GitHub recommends exactly that order after a secret compromise. Do not change the app's no-scope policy during rotation.
+For GitHub, generate a new client secret on the dedicated OAuth App, update `GITHUB_OAUTH_CLIENT_SECRET` in the restricted Kubernetes Secret, restart the application, verify a fresh sign-in, and then delete the old secret. GitHub recommends exactly that order after a secret compromise. Do not change the app's no-scope policy during rotation.
 
-For Google, create a replacement Web application client with the same production callback, update both `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`, deploy, verify a fresh sign-in, and then delete the old client. This permits controlled rollback, unlike resetting the existing client's secret. An authorization flow started immediately before the deployment may need to be restarted. Keep `openid profile` as the complete scope set.
+For Google, create a replacement Web application client with the same production callback, update both `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in the restricted Kubernetes Secret, restart the application, verify a fresh sign-in, and then delete the old client. This permits controlled rollback, unlike resetting the existing client's secret. An authorization flow started immediately before the deployment may need to be restarted. Keep `openid profile` as the complete scope set.
 
-In both cases, use GitHub repository secrets and trigger the `master` production workflow. It reconciles the values directly into `phenogram-secrets`; the values are never Helm parameters or Helm release history. Review callback failure rates and remove superseded credentials after verification.
+In both cases, keep the values out of Helm parameters and release history. Review callback failure rates and remove superseded credentials after verification.
 
 ### Master encryption key
 
@@ -205,7 +218,9 @@ Do not rotate `PUBLIC_ID_KEY` in place. Proxy authentication derives a public ID
 
 ### Bot tokens
 
-Revoke a suspected token with @BotFather immediately. This MVP has no in-place token replacement endpoint. Deleting and reconnecting the bot removes its Phenogram history through cascading deletes, so preserve required evidence under the applicable policy before that destructive step.
+For a directly connected bot, revoke a suspected token with @BotFather immediately. This MVP has no in-place replacement endpoint for that credential; deleting and reconnecting the bot removes its Phenogram history through cascading deletes, so preserve required evidence under the applicable policy before that destructive step.
+
+For a Telegram managed bot, do not copy or rotate its token through Phenogram. Telegram sends its manager a `managed_bot` update when the token changes; the synchronization worker fetches and encrypts the current token automatically while preserving the child record, history, public ID, and ingress URL.
 
 ### Database and local-server credentials
 
@@ -241,9 +256,11 @@ VALUES ('<user-uuid>', 'membership.admin_changed', '{"plan_id":"pro"}'::jsonb);
 COMMIT;
 ```
 
-A downgrade does not disable excess existing bots; it only blocks additional bot inserts. Resolve the intended active set before applying a lower limit.
+A downgrade does not remove excess bots. It continues to block additional directly connected bots, while managed bots beyond the new covered capacity remain active with one-day retention and a visible warning in the console.
 
-Plan retention is calculated when `updates`, `outbound_messages`, `api_calls`, bot-scoped `audit_log` rows, and conversation projections are created or refreshed. Plan changes are not retroactive for already stamped rows. Account-scoped audit rows use a one-year expiry, sessions use `SESSION_TTL_HOURS`, and delivery rows cascade with their parent updates. Every retention run drains each expired table completely in repeated 5,000-row batches, yielding between full batches.
+Plan coverage is deterministic. Directly connected bots consume the hard connection allowance first. On Free, every managed child uses one-day retention. On paid plans, managed children fill the remaining covered capacity in creation order; overflow children and children without a connected manager use one-day retention. Discovery itself is never rejected at the plan boundary.
+
+Effective retention is calculated when `updates`, `outbound_messages`, `api_calls`, bot-scoped `audit_log` rows, and conversation projections are created or refreshed. A plan or hierarchy change also recalculates retained bot-scoped rows, so a newly uncovered bot is reduced to its most recent day and an upgraded bot immediately reflects its longer window for data that has not already been swept. Account-scoped audit rows use a one-year expiry, sessions use `SESSION_TTL_HOURS`, and delivery rows cascade with their parent updates. Every retention run drains each expired table completely in repeated 5,000-row batches, yielding between full batches.
 
 Monitor expired backlog:
 

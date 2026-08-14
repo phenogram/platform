@@ -9,6 +9,9 @@ identity_subject="e2e-$(date +%s)-$$"
 session_token="$(openssl rand -hex 32)"
 auth_cookie="phg_session=$session_token"
 bot_token="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+child_bot_token="987654321:abcdefghijklmnopqrstuvwxyzABCDEF"
+child_telegram_bot_id=987654321
+child_owner_telegram_user_id=555000111
 
 cleanup() {
   psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null || true
@@ -74,6 +77,152 @@ jq -e --arg public_id "$public_id" '.webhook.url | endswith("/telegram/webhook/"
 # Phenogram before replacing Telegram's upstream destination.
 migrated_webhook="$(curl -fsS "$base_url/bot$bot_token/getWebhookInfo")"
 jq -e --arg url "$mock_url/__downstream" '.ok == true and .result.url == $url and .result.allowed_updates == ["message"] and .result.max_connections == 73' <<<"$migrated_webhook" >/dev/null
+
+# Telegram sends this canonical lifecycle update to the manager. Phenogram must
+# durably discover the child, fetch its credential from the manager context,
+# and provision the child's own upstream webhook without user opt-in.
+managed_update="$(jq -cn \
+  --argjson child_bot_id "$child_telegram_bot_id" \
+  --argjson owner_id "$child_owner_telegram_user_id" \
+  '{
+    update_id: 7100,
+    managed_bot: {
+      user: {id: $owner_id, is_bot: false, first_name: "Managed Owner"},
+      bot: {
+        id: $child_bot_id,
+        is_bot: true,
+        first_name: "Managed E2E Child",
+        username: "managed_e2e_child_bot"
+      }
+    }
+  }')"
+curl -fsS \
+  -H 'content-type: application/json' \
+  -H "x-telegram-bot-api-secret-token: $ingress_secret" \
+  -d "$managed_update" \
+  "$base_url/telegram/webhook/$public_id" | jq -e '.ok == true' >/dev/null
+
+bots=""
+for _ in $(seq 1 100); do
+  bots="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots")"
+  if jq -e --argjson child_bot_id "$child_telegram_bot_id" \
+    '.bots | any(.telegram_bot_id == $child_bot_id and .status == "healthy")' \
+    <<<"$bots" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+
+child_bot_id="$(jq -er --argjson child_bot_id "$child_telegram_bot_id" \
+  '.bots[] | select(.telegram_bot_id == $child_bot_id) | .id' <<<"$bots")"
+child_public_id="$(jq -er --argjson child_bot_id "$child_telegram_bot_id" \
+  '.bots[] | select(.telegram_bot_id == $child_bot_id) | .public_id' <<<"$bots")"
+jq -e \
+  --arg manager_bot_id "$bot_id" \
+  --argjson manager_telegram_bot_id 123456789 \
+  --argjson child_bot_id "$child_telegram_bot_id" \
+  --argjson owner_id "$child_owner_telegram_user_id" \
+  '.coverage == {
+      plan_id: "free",
+      bot_limit: 1,
+      covered_bot_count: 1,
+      uncovered_bot_count: 1
+    }
+    and (.bots | any(
+      .telegram_bot_id == $child_bot_id
+      and .username == "managed_e2e_child_bot"
+      and .bot_kind == "managed"
+      and .is_managed == true
+      and .manager_bot_id == $manager_bot_id
+      and .manager_telegram_bot_id == $manager_telegram_bot_id
+      and .manager_username == "phenogram_test_bot"
+      and .manager_display_name == "Phenogram Test"
+      and .managed_owner_telegram_user_id == $owner_id
+      and .plan_covered == false
+      and .effective_retention_days == 1
+      and .retention_warning == "free_plan"
+      and .status == "healthy"
+    ))' <<<"$bots" >/dev/null
+
+all_update_types='["message","edited_message","channel_post","edited_channel_post","business_connection","business_message","edited_business_message","deleted_business_messages","guest_message","message_reaction","message_reaction_count","inline_query","chosen_inline_result","callback_query","shipping_query","pre_checkout_query","purchased_paid_media","poll","poll_answer","my_chat_member","chat_member","chat_join_request","chat_boost","removed_chat_boost","managed_bot","subscription"]'
+managed_state="$(curl -fsS "$mock_url/__state")"
+child_ingress_secret="$(jq -er '.child_webhook.secret_token' <<<"$managed_state")"
+jq -e \
+  --arg public_id "$child_public_id" \
+  '.child_webhook.url | endswith("/telegram/webhook/" + $public_id)' \
+  <<<"$managed_state" >/dev/null
+jq -e \
+  --argjson all_update_types "$all_update_types" \
+  --argjson child_bot_id "$child_telegram_bot_id" \
+  '.child_webhook.allowed_updates == $all_update_types
+    and .child_webhook.drop_pending_updates == false
+    and (.calls | any(
+      .bot == "manager"
+      and (.method | ascii_downcase) == "getmanagedbottoken"
+      and (.params.user_id | tonumber) == $child_bot_id
+    ))
+    and (.calls | any(.bot == "child" and (.method | ascii_downcase) == "getme"))
+    and (.calls | any(.bot == "child" and (.method | ascii_downcase) == "getwebhookinfo"))
+    and (.calls | any(.bot == "child" and (.method | ascii_downcase) == "setwebhook"))' \
+  <<<"$managed_state" >/dev/null
+
+# The mock's diagnostics are safe to inspect: neither manager nor child bot
+# credentials may be copied into state or call history.
+case "$managed_state" in
+  *"$bot_token"*|*"$child_bot_token"*)
+    printf 'Telegram mock diagnostics exposed a bot token.\n' >&2
+    exit 1
+    ;;
+esac
+
+credential_encrypted="$(psql "$database_url" -At -v ON_ERROR_STOP=1 \
+  -v child_bot_id="$child_bot_id" -v child_token="$child_bot_token" <<'SQL'
+SELECT token_ciphertext <> convert_to(:'child_token', 'UTF8')
+       AND position(convert_to(:'child_token', 'UTF8') IN token_ciphertext) = 0
+       AND octet_length(token_ciphertext) > octet_length(convert_to(:'child_token', 'UTF8'))
+       AND octet_length(token_nonce) >= 24
+       AND public_id <> :'child_token'
+       AND token_lookup_hash <> :'child_token'
+  FROM bots
+ WHERE id = :'child_bot_id'::uuid;
+SQL
+)"
+test "$credential_encrypted" = "t"
+
+child_update='{"update_id":8100,"message":{"message_id":51,"date":1786620100,"from":{"id":707,"is_bot":false,"first_name":"Grace","username":"grace"},"chat":{"id":707,"type":"private","first_name":"Grace","username":"grace"},"text":"hello managed child"}}'
+curl -fsS \
+  -H 'content-type: application/json' \
+  -H "x-telegram-bot-api-secret-token: $child_ingress_secret" \
+  -d "$child_update" \
+  "$base_url/telegram/webhook/$child_public_id" | jq -e '.ok == true' >/dev/null
+
+child_updates="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/updates?limit=10")"
+jq -e '.updates | any(.update_id == 8100 and .event_type == "message" and .chat_id == 707)' <<<"$child_updates" >/dev/null
+
+child_operator_reply="$(curl -fsS -b "$auth_cookie" \
+  -H 'content-type: application/json' \
+  -H "x-phenogram-csrf: $csrf" \
+  -d '{"chat_id":707,"text":"managed child operator response"}' \
+  "$base_url/api/bots/$child_bot_id/messages")"
+jq -e '.ok == true and .result.text == "managed child operator response"' <<<"$child_operator_reply" >/dev/null
+
+child_conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations")"
+jq -e '.conversations[0].chat_id == 707 and .conversations[0].last_message_preview == "You: managed child operator response"' <<<"$child_conversations" >/dev/null
+child_timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations/707/messages")"
+jq -e '[.messages[].direction] | contains(["incoming"]) and contains(["outgoing"])' <<<"$child_timeline" >/dev/null
+jq -e '[.messages[].text] | contains(["hello managed child"]) and contains(["managed child operator response"])' <<<"$child_timeline" >/dev/null
+curl -fsS "$mock_url/__state" \
+  | jq -e '.calls | any(.bot == "child" and (.method | ascii_downcase) == "sendmessage")' >/dev/null
+
+managed_delete="$(curl -sS -X DELETE -b "$auth_cookie" \
+  -H "x-phenogram-csrf: $csrf" \
+  -w $'\n%{http_code}' \
+  "$base_url/api/bots/$child_bot_id")"
+managed_delete_status="${managed_delete##*$'\n'}"
+managed_delete_body="${managed_delete%$'\n'*}"
+test "$managed_delete_status" = "409"
+jq -e '.error.code == "conflict"' <<<"$managed_delete_body" >/dev/null
+
 migrated_update='{"update_id":7000,"message":{"message_id":40,"date":1786619999,"from":{"id":99,"is_bot":false,"first_name":"Ada"},"chat":{"id":99,"type":"private","first_name":"Ada"},"text":"delivered through migrated webhook"}}'
 curl -fsS \
   -H 'content-type: application/json' \
@@ -204,8 +353,26 @@ curl -fsS -X DELETE -b "$auth_cookie" \
   -H "x-phenogram-csrf: $csrf" \
   "$base_url/api/bots/$bot_id" | jq -e '.ok == true' >/dev/null
 curl -fsS "$mock_url/__state" \
-  | jq -e '.calls | any(.method == "deleteWebhook")' >/dev/null
-curl -fsS -b "$auth_cookie" "$base_url/api/bots" \
-  | jq -e --arg bot_id "$bot_id" '.bots | map(.id) | index($bot_id) | not' >/dev/null
+  | jq -e '.calls | any(.bot == "manager" and (.method | ascii_downcase) == "deletewebhook")' >/dev/null
 
-printf 'Phenogram E2E passed: auth, bot ownership, proxy, update journal, polling, SSE, Bot View, and signed file access.\n'
+# Removing the manager orphans the managed bot. It remains visible with the
+# one-day managerless policy and can then be explicitly deleted.
+orphaned_bots="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots")"
+jq -e --arg bot_id "$bot_id" --arg child_bot_id "$child_bot_id" \
+  '(.bots | map(.id) | index($bot_id) | not)
+    and (.bots | any(
+      .id == $child_bot_id
+      and .manager_bot_id == null
+      and .plan_covered == false
+      and .effective_retention_days == 1
+      and .retention_warning == "manager_missing"
+    ))' <<<"$orphaned_bots" >/dev/null
+curl -fsS -X DELETE -b "$auth_cookie" \
+  -H "x-phenogram-csrf: $csrf" \
+  "$base_url/api/bots/$child_bot_id" | jq -e '.ok == true' >/dev/null
+curl -fsS "$mock_url/__state" \
+  | jq -e '.calls | any(.bot == "child" and (.method | ascii_downcase) == "deletewebhook")' >/dev/null
+curl -fsS -b "$auth_cookie" "$base_url/api/bots" \
+  | jq -e '.bots == []' >/dev/null
+
+printf 'Phenogram E2E passed: auth, managed hierarchy, encrypted child credentials, proxy, update journal, polling, SSE, Bot View, and signed file access.\n'

@@ -10,6 +10,7 @@ This repository is a production-oriented MVP, not a claim of complete Telegram B
 - Ownership verification with the bot token via Telegram `getMe`.
 - Google and GitHub sign-in using stable provider IDs, without requesting or storing email addresses.
 - Encrypted bot, ingress, and downstream webhook secrets in PostgreSQL.
+- Automatic discovery and provisioning of Telegram managed bots, grouped beneath their manager.
 - Durable, deduplicated update capture with plan-based expiry.
 - Virtual `getUpdates`, `setWebhook`, `deleteWebhook`, and `getWebhookInfo` methods backed by Phenogram's update journal.
 - Revocable SSE stream URLs whose secret is stored only as a hash.
@@ -35,7 +36,7 @@ flowchart LR
     I -->|"live, same process"| S
 ```
 
-At startup the application runs SQL migrations, starts one retention task and four downstream webhook workers, then serves the API and embedded web UI. PostgreSQL is the system of record. The live SSE broadcast is in-process; PostgreSQL supplies reconnect replay.
+At startup the application runs SQL migrations, starts retention, managed-bot synchronization, and four downstream webhook workers, then serves the API and embedded web UI. PostgreSQL is the system of record. The live SSE broadcast is in-process; PostgreSQL supplies reconnect replay.
 
 ## Quick start
 
@@ -176,15 +177,25 @@ The console provides:
 
 Outgoing timeline capture is limited to `sendMessage` requests that Phenogram can safely inspect, plus replies sent from Bot View. It is not a complete audit of every media or multipart call.
 
+## Managed bot families
+
+When a connected Telegram manager bot receives a `managed_bot` lifecycle update, Phenogram automatically records a synchronization job. A worker fetches the child token through Telegram's `getManagedBotToken`, verifies that the token belongs to the announced child, encrypts it, imports any existing child webhook as a downstream destination, and installs a separate Phenogram ingress webhook for that child. No opt-in switch is required. The same path handles child token changes without rotating Phenogram's stable ingress or public identifier.
+
+Managed bots are displayed beneath the bot that created them. The hierarchy supports managed bots that manage further bots; if the manager is removed, its children remain visible in a manager-missing group and keep receiving updates through their own webhooks. A later reconnect of the same Telegram manager restores the relationship automatically.
+
+The lifecycle update reaches only the manager; ordinary child updates do not. Installing the child webhook is therefore required for its journal, delivery subscriptions, and Bot View to work. See Telegram's [ManagedBotUpdated](https://core.telegram.org/bots/api#managedbotupdated) and [getManagedBotToken](https://core.telegram.org/bots/api#getmanagedbottoken) contracts.
+
 ## Plans and retention
 
-| Plan | Bots | Bot data retention | Local Bot API routing | Seeded monthly price |
+| Plan | Covered bots | Covered bot data retention | Local Bot API routing | Seeded monthly price |
 | --- | ---: | ---: | --- | ---: |
 | Free | 1 | 30 days | No | $0 |
 | Pro | 5 | 90 days | Yes | $29 |
 | Scale | 25 | 365 days | Yes | $99 |
 
-New social identities receive Free membership. Limits are enforced in the API and again by a database trigger. Plan retention is stamped onto updates, outbound messages, API calls, conversation projections, and bot-scoped audit records when they are created or refreshed; a later plan change does not recalculate existing expiry timestamps. Account-scoped audit records expire after one year, sessions use their own TTL, and webhook delivery rows disappear with their parent updates. Each sweep repeatedly drains every expired table in 5,000-row batches.
+New social identities receive Free membership. The hard connection limit applies to directly connected bots; automatic discovery is never rejected because it would exceed the plan. Managed bots on Free, managed bots beyond a paid plan's covered capacity, and managed bots whose manager is no longer connected use one-day retention. The console shows the covered count, the total discovered count, and a 24-hour warning on every uncovered bot.
+
+Effective retention is stamped onto updates, outbound messages, API calls, conversation projections, and bot-scoped audit records when they are created or refreshed. Changes that alter coverage also recalculate the retained rows for the affected account, so an uncovered managed bot keeps only its most recent day instead of silently retaining the former plan window. Account-scoped audit records expire after one year, sessions use their own TTL, and webhook delivery rows disappear with their parent updates. Each sweep repeatedly drains every expired table in 5,000-row batches.
 
 Checkout, invoicing, provider webhooks, self-service upgrades, and automated downgrade handling are not implemented; plans are assigned administratively. The plan-selection UI is informational and never changes membership by itself.
 
@@ -202,7 +213,7 @@ Routing migration is explicitly confirmed, serialized per bot, and invokes Teleg
 
 - OAuth access tokens are used only to resolve the provider identity during the callback and are not persisted; session secrets and SSE secrets are stored as SHA-256 digests.
 - Bot tokens and webhook secrets use XChaCha20-Poly1305 with per-record associated data.
-- Bot public IDs are keyed, stable pseudonyms; they are identifiers, not authorization.
+- Bot public IDs are stable opaque identifiers, not authorization. A separate keyed token digest is used only for compatible API authentication, allowing managed-token rotation without changing webhook and public URLs.
 - Session cookies are `HttpOnly` and `SameSite=Strict`, with `Secure` enabled for production/HTTPS.
 - Mutating management requests require an exact-origin check plus `X-Phenogram-CSRF`.
 - Production separates the public landing page on `phenogram.io`, authenticated console and management traffic on `app.phenogram.io`, and token-bearing or public machine routes on `api.phenogram.io`; both the edge and application reject routes on the wrong host.
@@ -220,7 +231,9 @@ Read [docs/operations.md](docs/operations.md) before exposing the service. It co
 
 The production Helm chart and `master` deployment workflow live under
 [`deploy/helm/phenogram-platform`](deploy/helm/phenogram-platform) and
-[`deploy-production.yaml`](.github/workflows/deploy-production.yaml).
+[`deploy-production.yaml`](.github/workflows/deploy-production.yaml). The
+one-time Contabo Flux resources are in
+[`deploy/flux/phenogram-production.yaml`](deploy/flux/phenogram-production.yaml).
 
 ## License
 

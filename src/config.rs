@@ -5,6 +5,7 @@ use crate::error::{AppError, Result};
 #[derive(Clone)]
 pub struct Config {
     pub app_env: String,
+    pub deployment_revision: String,
     pub listen_addr: SocketAddr,
     /// Public marketing and capability overview origin.
     pub landing_base_url: String,
@@ -65,6 +66,7 @@ impl Config {
             .to_owned();
         let config = Self {
             app_env: app_env.clone(),
+            deployment_revision: deployment_revision(optional("DEPLOYMENT_REVISION")),
             listen_addr: SocketAddr::from_str(&value("LISTEN_ADDR", "127.0.0.1:8080"))
                 .map_err(|e| AppError::Config(format!("invalid LISTEN_ADDR: {e}")))?,
             landing_base_url,
@@ -265,6 +267,13 @@ fn value(name: &str, fallback: &str) -> String {
     env::var(name).unwrap_or_else(|_| fallback.to_owned())
 }
 
+fn deployment_revision(revision: Option<String>) -> String {
+    revision
+        .map(|revision| revision.trim().to_owned())
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| "local".to_owned())
+}
+
 fn parse_u64(name: &str, fallback: u64) -> Result<u64> {
     optional(name)
         .map(|value| {
@@ -384,11 +393,12 @@ fn is_landing_path(path: &str) -> bool {
 mod tests {
     use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-    use super::{Config, PublicRequestAccess, PublicSurface};
+    use super::{Config, PublicRequestAccess, PublicSurface, deployment_revision};
 
     fn config(app_env: &str, landing: &str, app: &str, api: &str) -> Config {
         Config {
             app_env: app_env.into(),
+            deployment_revision: "local".into(),
             listen_addr: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
             landing_base_url: landing.into(),
             app_base_url: app.into(),
@@ -407,6 +417,13 @@ mod tests {
             session_ttl: Duration::from_secs(3600),
             retention_sweep: Duration::from_secs(3600),
         }
+    }
+
+    #[test]
+    fn deployment_revision_defaults_to_local_and_trims_configured_values() {
+        assert_eq!(deployment_revision(None), "local");
+        assert_eq!(deployment_revision(Some("  ".into())), "local");
+        assert_eq!(deployment_revision(Some("  abc123  ".into())), "abc123");
     }
 
     #[test]

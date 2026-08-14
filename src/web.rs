@@ -192,6 +192,7 @@ mod tests {
     fn test_app() -> axum::Router {
         let config = Config {
             app_env: "production".into(),
+            deployment_revision: "test-revision".into(),
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             landing_base_url: "https://phenogram.io".into(),
             app_base_url: "https://app.phenogram.io".into(),
@@ -211,6 +212,7 @@ mod tests {
             retention_sweep: Duration::from_secs(3600),
         };
         let db = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(50))
             .connect_lazy(&config.database_url)
             .unwrap();
         crate::app(AppState::new(config, db).unwrap())
@@ -288,5 +290,16 @@ mod tests {
                 .unwrap()
                 .contains(r#""surface":"app""#)
         );
+    }
+
+    #[tokio::test]
+    async fn health_exposes_the_configured_deployment_revision() {
+        use http_body_util::BodyExt;
+
+        let health = response(&test_app(), "app.phenogram.io", "/api/health").await;
+        let body = health.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["deployment_revision"], "test-revision");
     }
 }

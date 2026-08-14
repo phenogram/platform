@@ -1,0 +1,47 @@
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: OCIRepository
+metadata:
+  name: phenogram-platform
+  namespace: phenogram
+  labels:
+    app.kubernetes.io/name: phenogram-platform
+    app.kubernetes.io/part-of: phenogram-platform
+spec:
+  interval: 1m
+  provider: generic
+  url: oci://ghcr.io/phenogram/phenogram-platform
+  ref:
+    semver: ">=0.0.0"
+  secretRef:
+    name: phenogram-ghcr
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: phenogram
+  namespace: phenogram
+  labels:
+    app.kubernetes.io/name: phenogram-platform
+    app.kubernetes.io/part-of: phenogram-platform
+spec:
+  interval: 1m
+  timeout: 20m
+  releaseName: phenogram
+  targetNamespace: phenogram
+  storageNamespace: phenogram
+  serviceAccountName: github-deployer
+  chartRef:
+    kind: OCIRepository
+    name: phenogram-platform
+  install:
+    createNamespace: false
+    remediation:
+      retries: 3
+  upgrade:
+    cleanupOnFail: true
+    remediation:
+      retries: 3
+      remediateLastFailure: true
+  rollback:
+    cleanupOnFail: true
+  maxHistory: 10

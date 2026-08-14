@@ -57,6 +57,8 @@ spec:
           env:
             - name: APP_ENV
               value: {{ .Values.config.appEnv | quote }}
+            - name: DEPLOYMENT_REVISION
+              value: {{ .Values.deploymentRevision | quote }}
             - name: LISTEN_ADDR
               value: {{ .Values.config.listenAddr | quote }}
             - name: LANDING_BASE_URL

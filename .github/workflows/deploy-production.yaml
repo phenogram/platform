@@ -14,8 +14,8 @@ env:
   REGISTRY: ghcr.io
   APP_IMAGE: ghcr.io/phenogram/platform
   TELEGRAM_IMAGE: ghcr.io/phenogram/telegram-bot-api
-  RELEASE_NAME: phenogram
-  KUBE_NAMESPACE: phenogram
+  HELM_REGISTRY: oci://ghcr.io/phenogram
+  CONTABO_INGRESS_IP: 84.247.177.201
   LANDING_URL: https://phenogram.io
   APP_URL: https://app.phenogram.io
   MACHINE_API_URL: https://api.phenogram.io
@@ -61,6 +61,7 @@ jobs:
             --values deploy/helm/phenogram-platform/values-production.yaml \
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set-string telegramBotApi.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string deploymentRevision=validation \
             > /tmp/phenogram-manifests.yaml
           test -s /tmp/phenogram-manifests.yaml
 
@@ -123,14 +124,16 @@ jobs:
           cache-to: type=gha,mode=max,scope=telegram-bot-api
 
   deploy:
-    name: Deploy to rubase
+    name: Publish Helm release for Contabo
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     environment:
       name: production
       url: https://app.phenogram.io
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -140,224 +143,136 @@ jobs:
         with:
           version: v3.17.3
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede
-        with:
-          version: v1.33.5
-
-      - name: Configure Kubernetes access
+      - name: Authenticate Helm to GHCR
         env:
-          RUBASE_PHENOGRAM_KUBECONFIG: ${{ secrets.RUBASE_PHENOGRAM_KUBECONFIG }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "$RUBASE_PHENOGRAM_KUBECONFIG"
-          install -d -m 0700 "$HOME/.kube"
-          printf '%s' "$RUBASE_PHENOGRAM_KUBECONFIG" > "$HOME/.kube/config"
-          chmod 0600 "$HOME/.kube/config"
-          context_namespace="$(kubectl config view --minify --output 'jsonpath={..namespace}')"
-          test "$context_namespace" = "$KUBE_NAMESPACE"
-          kubectl auth can-i get deployments --namespace "$KUBE_NAMESPACE"
-          if kubectl auth can-i create namespaces >/dev/null 2>&1; then
-            printf '%s\n' 'The deployment kubeconfig is unexpectedly cluster-scoped.' >&2
-            exit 1
-          fi
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io \
+            --username "$GITHUB_ACTOR" \
+            --password-stdin
 
-      - name: Reconcile deployment secrets
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          MASTER_KEY: ${{ secrets.MASTER_KEY }}
-          PUBLIC_ID_KEY: ${{ secrets.PUBLIC_ID_KEY }}
-          LINK_SIGNING_KEY: ${{ secrets.LINK_SIGNING_KEY }}
-          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
-          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
-          GITHUB_OAUTH_CLIENT_ID: ${{ secrets.PHENOGRAM_GITHUB_OAUTH_CLIENT_ID }}
-          GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.PHENOGRAM_GITHUB_OAUTH_CLIENT_SECRET }}
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          PHENOGRAM_GHCR_PULL_CONFIG_JSON: ${{ secrets.PHENOGRAM_GHCR_PULL_CONFIG_JSON }}
-          BACKUP_ACCESS_KEY: ${{ secrets.PHENOGRAM_BACKUP_ACCESS_KEY }}
-          BACKUP_SECRET_KEY: ${{ secrets.PHENOGRAM_BACKUP_SECRET_KEY }}
-          BACKUP_ENDPOINT: ${{ secrets.PHENOGRAM_BACKUP_ENDPOINT }}
-          BACKUP_BUCKET: ${{ secrets.PHENOGRAM_BACKUP_BUCKET }}
-          RESTIC_PASSWORD: ${{ secrets.PHENOGRAM_BACKUP_RESTIC_PASSWORD }}
-        run: |
-          set -euo pipefail
-          for name in DATABASE_URL POSTGRES_PASSWORD MASTER_KEY PUBLIC_ID_KEY LINK_SIGNING_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET GITHUB_OAUTH_CLIENT_ID GITHUB_OAUTH_CLIENT_SECRET TELEGRAM_API_ID TELEGRAM_API_HASH PHENOGRAM_GHCR_PULL_CONFIG_JSON BACKUP_ACCESS_KEY BACKUP_SECRET_KEY BACKUP_ENDPOINT BACKUP_BUCKET RESTIC_PASSWORD; do
-            test -n "${!name}"
-          done
-          install -d -m 0700 "$RUNNER_TEMP/phenogram-secrets/backup"
-          umask 077
-          printf '%s' "$PHENOGRAM_GHCR_PULL_CONFIG_JSON" > "$RUNNER_TEMP/phenogram-secrets/ghcr.json"
-          {
-            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
-            printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
-            printf 'MASTER_KEY=%s\n' "$MASTER_KEY"
-            printf 'PUBLIC_ID_KEY=%s\n' "$PUBLIC_ID_KEY"
-            printf 'LINK_SIGNING_KEY=%s\n' "$LINK_SIGNING_KEY"
-            printf 'GOOGLE_OAUTH_CLIENT_ID=%s\n' "$GOOGLE_OAUTH_CLIENT_ID"
-            printf 'GOOGLE_OAUTH_CLIENT_SECRET=%s\n' "$GOOGLE_OAUTH_CLIENT_SECRET"
-            printf 'GITHUB_OAUTH_CLIENT_ID=%s\n' "$GITHUB_OAUTH_CLIENT_ID"
-            printf 'GITHUB_OAUTH_CLIENT_SECRET=%s\n' "$GITHUB_OAUTH_CLIENT_SECRET"
-            printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
-            printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
-          } > "$RUNNER_TEMP/phenogram-secrets/app.env"
-          printf '%s' "$BACKUP_ACCESS_KEY" > "$RUNNER_TEMP/phenogram-secrets/backup/access-key"
-          printf '%s' "$BACKUP_SECRET_KEY" > "$RUNNER_TEMP/phenogram-secrets/backup/secret-key"
-          printf '%s' "$BACKUP_ENDPOINT" > "$RUNNER_TEMP/phenogram-secrets/backup/endpoint"
-          printf '%s' "$BACKUP_BUCKET" > "$RUNNER_TEMP/phenogram-secrets/backup/bucket"
-          printf '%s' "$RESTIC_PASSWORD" > "$RUNNER_TEMP/phenogram-secrets/backup/restic-password"
-          kubectl --namespace "$KUBE_NAMESPACE" create secret generic phenogram-ghcr \
-            --type=kubernetes.io/dockerconfigjson \
-            --from-file=.dockerconfigjson="$RUNNER_TEMP/phenogram-secrets/ghcr.json" \
-            --dry-run=client -o yaml | kubectl apply --server-side --field-manager=phenogram-deploy -f -
-          kubectl --namespace "$KUBE_NAMESPACE" create secret generic phenogram-secrets \
-            --from-env-file="$RUNNER_TEMP/phenogram-secrets/app.env" \
-            --dry-run=client -o yaml | kubectl apply --server-side --field-manager=phenogram-deploy -f -
-          kubectl --namespace "$KUBE_NAMESPACE" create secret generic phenogram-backup-secrets \
-            --from-file=access-key="$RUNNER_TEMP/phenogram-secrets/backup/access-key" \
-            --from-file=secret-key="$RUNNER_TEMP/phenogram-secrets/backup/secret-key" \
-            --from-file=endpoint="$RUNNER_TEMP/phenogram-secrets/backup/endpoint" \
-            --from-file=bucket="$RUNNER_TEMP/phenogram-secrets/backup/bucket" \
-            --from-file=restic-password="$RUNNER_TEMP/phenogram-secrets/backup/restic-password" \
-            --dry-run=client -o yaml | kubectl apply --server-side --field-manager=phenogram-deploy -f -
-
-      - name: Deploy the immutable release with Helm
+      - name: Package and publish the immutable production chart
         env:
           APP_DIGEST: ${{ needs.build.outputs.app_digest }}
           TELEGRAM_DIGEST: ${{ needs.build.outputs.telegram_digest }}
         run: |
           set -euo pipefail
-          test -n "$APP_DIGEST"
-          test -n "$TELEGRAM_DIGEST"
-          secret_revision="$(kubectl --namespace "$KUBE_NAMESPACE" get secret phenogram-secrets --output 'jsonpath={.metadata.resourceVersion}')"
-          test -n "$secret_revision"
-          # Existing certificate Secret names may only be referenced by their
-          # established Ingress identities. This prevents ingress-shim from
-          # racing a replacement Certificate owner during topology changes.
-          for binding in \
-            'phenogram-web:phenogram.io:phenogram-io-tls' \
-            'phenogram-app:app.phenogram.io:app-phenogram-io-tls' \
-            'phenogram-api:api.phenogram.io:api-phenogram-io-tls'; do
-            ingress_name="${binding%%:*}"
-            remainder="${binding#*:}"
-            expected_host="${remainder%%:*}"
-            expected_secret="${remainder#*:}"
-            secret_owners="$(kubectl --namespace "$KUBE_NAMESPACE" get ingress --output json \
-              | jq --raw-output --arg secret "$expected_secret" \
-                '.items[] | select(any(.spec.tls[]?; .secretName == $secret)) | .metadata.name')"
-            unexpected_owners="$(printf '%s\n' "$secret_owners" | grep -v -x -e '' -e "$ingress_name" || true)"
-            if test -n "$unexpected_owners"; then
-              printf 'TLS Secret %s is referenced by unexpected Ingress(es): %s\n' "$expected_secret" "$unexpected_owners" >&2
-              exit 1
+          case "$APP_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
+          case "$TELEGRAM_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
+
+          release_chart="$RUNNER_TEMP/phenogram-platform"
+          cp -R deploy/helm/phenogram-platform "$release_chart"
+
+          ruby -ryaml -e '
+            def deep_merge(left, right)
+              return right unless left.is_a?(Hash) && right.is_a?(Hash)
+              left.merge(right) { |_key, old_value, new_value| deep_merge(old_value, new_value) }
+            end
+            base_path, production_path = ARGV
+            base = YAML.safe_load(File.read(base_path), aliases: true)
+            production = YAML.safe_load(File.read(production_path), aliases: true)
+            values = deep_merge(base, production)
+            values.fetch("image")["digest"] = ENV.fetch("APP_DIGEST")
+            values.fetch("telegramBotApi").fetch("image")["digest"] = ENV.fetch("TELEGRAM_DIGEST")
+            values["deploymentRevision"] = ENV.fetch("GITHUB_SHA")
+            values["secretRevision"] = ENV.fetch("GITHUB_SHA")
+            File.write(base_path, YAML.dump(values))
+          ' "$release_chart/values.yaml" "$release_chart/values-production.yaml"
+          rm -f "$release_chart/values-production.yaml"
+
+          chart_version="0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          helm lint "$release_chart" --strict
+          helm template phenogram "$release_chart" --namespace phenogram > "$RUNNER_TEMP/phenogram-release.yaml"
+          grep -Fq "ghcr.io/phenogram/platform@$APP_DIGEST" "$RUNNER_TEMP/phenogram-release.yaml"
+          grep -Fq "ghcr.io/phenogram/telegram-bot-api@$TELEGRAM_DIGEST" "$RUNNER_TEMP/phenogram-release.yaml"
+          grep -Fq "DEPLOYMENT_REVISION" "$RUNNER_TEMP/phenogram-release.yaml"
+
+          helm package "$release_chart" \
+            --destination "$RUNNER_TEMP" \
+            --version "$chart_version" \
+            --app-version "$GITHUB_SHA"
+          helm push "$RUNNER_TEMP/phenogram-platform-$chart_version.tgz" "$HELM_REGISTRY"
+
+      - name: Wait for Flux and verify the Contabo origin
+        run: |
+          set -euo pipefail
+          landing_resolve=(--resolve "phenogram.io:443:$CONTABO_INGRESS_IP")
+          app_resolve=(--resolve "app.phenogram.io:443:$CONTABO_INGRESS_IP")
+          api_resolve=(--resolve "api.phenogram.io:443:$CONTABO_INGRESS_IP")
+
+          deployed=false
+          for _ in $(seq 1 120); do
+            if response="$(curl --fail --silent --show-error \
+              "${app_resolve[@]}" \
+              --connect-timeout 10 --max-time 20 \
+              "$APP_URL/api/health" 2>/dev/null)" \
+              && jq -e --arg revision "$GITHUB_SHA" \
+                '.status == "ok" and .database == true and .deployment_revision == $revision' \
+                <<<"$response" >/dev/null; then
+              deployed=true
+              break
             fi
-            if kubectl --namespace "$KUBE_NAMESPACE" get ingress "$ingress_name" >/dev/null 2>&1; then
-              actual_host="$(kubectl --namespace "$KUBE_NAMESPACE" get ingress "$ingress_name" --output 'jsonpath={.spec.rules[0].host}')"
-              actual_secret="$(kubectl --namespace "$KUBE_NAMESPACE" get ingress "$ingress_name" --output 'jsonpath={.spec.tls[0].secretName}')"
-              test "$actual_host" = "$expected_host"
-              test "$actual_secret" = "$expected_secret"
-            elif kubectl --namespace "$KUBE_NAMESPACE" get secret "$expected_secret" >/dev/null 2>&1; then
-              printf 'TLS Secret %s exists without its expected Ingress %s; certificate ownership must be inspected manually.\n' "$expected_secret" "$ingress_name" >&2
-              exit 1
-            fi
+            sleep 10
           done
-          helm upgrade --install "$RELEASE_NAME" deploy/helm/phenogram-platform \
-            --namespace "$KUBE_NAMESPACE" \
-            --values deploy/helm/phenogram-platform/values-production.yaml \
-            --set-string image.digest="$APP_DIGEST" \
-            --set-string telegramBotApi.image.digest="$TELEGRAM_DIGEST" \
-            --set-string deploymentRevision="${GITHUB_SHA}" \
-            --set-string secretRevision="$secret_revision" \
-            --atomic \
-            --wait \
-            --timeout 20m \
-            --history-max 10
+          test "$deployed" = true
 
-      - name: Verify Kubernetes rollout
-        run: |
-          set -euo pipefail
-          kubectl --namespace "$KUBE_NAMESPACE" rollout status deployment/phenogram --timeout=5m
-          kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-postgresql --timeout=5m
-          kubectl --namespace "$KUBE_NAMESPACE" get pods,service,ingress,pvc
-
-      - name: Verify public three-host separation and health
-        run: |
-          set -euo pipefail
-          response="$(curl --fail --silent --show-error \
-            --retry 18 --retry-all-errors --retry-delay 10 \
-            --connect-timeout 10 --max-time 20 \
-            "$APP_URL/api/health")"
-          printf '%s' "$response" | grep -q '"status":"ok"'
-          curl --fail --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null \
-            "$LANDING_URL/"
-          curl --fail --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null \
-            "$LANDING_URL/privacy"
-          test "$(curl --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null --write-out '%{http_code}' \
+          curl --fail --silent --show-error "${landing_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null "$LANDING_URL/"
+          curl --fail --silent --show-error "${landing_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null "$LANDING_URL/privacy"
+          test "$(curl --silent --show-error "${landing_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null --write-out '%{http_code}' \
             "$LANDING_URL/api/health")" = "404"
-          curl --fail --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null \
-            "$APP_URL/"
-          test "$(curl --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null --write-out '%{http_code}' \
+          curl --fail --silent --show-error "${app_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null "$APP_URL/"
+          test "$(curl --silent --show-error "${api_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null --write-out '%{http_code}' \
             "$MACHINE_API_URL/")" = "404"
-          test "$(curl --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null --write-out '%{http_code}' \
+          test "$(curl --silent --show-error "${api_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null --write-out '%{http_code}' \
             "$MACHINE_API_URL/api/health")" = "404"
-          test "$(curl --silent --show-error \
-            --connect-timeout 10 --max-time 20 \
-            --output /dev/null --write-out '%{http_code}' \
+          test "$(curl --silent --show-error "${api_resolve[@]}" \
+            --connect-timeout 10 --max-time 20 --output /dev/null --write-out '%{http_code}' \
             "$MACHINE_API_URL/bot0:invalid/getMe")" = "401"
+
           google_headers="$RUNNER_TEMP/google-oauth-headers"
           github_headers="$RUNNER_TEMP/github-oauth-headers"
-          google_redirect="$(curl --silent --show-error \
+          google_redirect="$(curl --silent --show-error "${app_resolve[@]}" \
             --connect-timeout 10 --max-time 20 \
             --dump-header "$google_headers" \
             --output /dev/null --write-out '%{redirect_url}' \
             "$APP_URL/api/auth/oauth/google/start")"
           case "$google_redirect" in
             https://accounts.google.com/*) ;;
-            *) printf '%s\n' 'Google OAuth start did not redirect to accounts.google.com.' >&2; exit 1 ;;
+            *) exit 1 ;;
           esac
           case "$google_redirect" in
             *scope=openid%20profile*|*scope=openid+profile*) ;;
-            *) printf '%s\n' 'Google OAuth start did not request exactly the identity profile scopes.' >&2; exit 1 ;;
+            *) exit 1 ;;
           esac
-          case "$google_redirect" in
-            *email*) printf '%s\n' 'Google OAuth start unexpectedly requested email.' >&2; exit 1 ;;
-          esac
+          case "$google_redirect" in *email*) exit 1 ;; esac
           case "$google_redirect" in
             *redirect_uri=https%3A%2F%2Fapp.phenogram.io%2Fapi%2Fauth%2Foauth%2Fgoogle%2Fcallback*state=*code_challenge=*code_challenge_method=S256*) ;;
-            *) printf '%s\n' 'Google OAuth start is missing its exact callback, state, or S256 PKCE.' >&2; exit 1 ;;
+            *) exit 1 ;;
           esac
           grep -Eiq '^set-cookie: phg_oauth=.*HttpOnly.*SameSite=Lax.*Max-Age=600.*Secure' "$google_headers"
           grep -Eiq '^cache-control: no-store' "$google_headers"
-          github_redirect="$(curl --silent --show-error \
+
+          github_redirect="$(curl --silent --show-error "${app_resolve[@]}" \
             --connect-timeout 10 --max-time 20 \
             --dump-header "$github_headers" \
             --output /dev/null --write-out '%{redirect_url}' \
             "$APP_URL/api/auth/oauth/github/start")"
           case "$github_redirect" in
             https://github.com/login/oauth/authorize*) ;;
-            *) printf '%s\n' 'GitHub OAuth start did not redirect to github.com.' >&2; exit 1 ;;
+            *) exit 1 ;;
           esac
-          case "$github_redirect" in
-            *scope=*) printf '%s\n' 'GitHub OAuth start unexpectedly requested a scope.' >&2; exit 1 ;;
-          esac
+          case "$github_redirect" in *scope=*) exit 1 ;; esac
           case "$github_redirect" in
             *redirect_uri=https%3A%2F%2Fapp.phenogram.io%2Fapi%2Fauth%2Foauth%2Fgithub%2Fcallback*state=*code_challenge=*code_challenge_method=S256*) ;;
-            *) printf '%s\n' 'GitHub OAuth start is missing its exact callback, state, or S256 PKCE.' >&2; exit 1 ;;
+            *) exit 1 ;;
           esac
           grep -Eiq '^set-cookie: phg_oauth=.*HttpOnly.*SameSite=Lax.*Max-Age=600.*Secure' "$github_headers"
           grep -Eiq '^cache-control: no-store' "$github_headers"
-          rm -f "$google_headers" "$github_headers"
-          unset google_redirect github_redirect
-          printf '%s\n' 'Landing, app, and machine API host separation passed.'
+          printf '%s\n' 'Contabo deployment revision and three-host contract verified.'

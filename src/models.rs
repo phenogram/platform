@@ -37,6 +37,16 @@ pub struct BotSummary {
     pub last_update_at: Option<DateTime<Utc>>,
     pub last_api_call_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub bot_kind: String,
+    pub is_managed: bool,
+    pub manager_bot_id: Option<Uuid>,
+    pub manager_telegram_bot_id: Option<i64>,
+    pub manager_username: Option<String>,
+    pub manager_display_name: Option<String>,
+    pub managed_owner_telegram_user_id: Option<i64>,
+    pub plan_covered: bool,
+    pub effective_retention_days: i32,
+    pub retention_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
