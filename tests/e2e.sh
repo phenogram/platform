@@ -17,6 +17,7 @@ live_stream_dir=""
 tap_collector_pid=""
 tap_collector_dir=""
 tap_ack_listener_pid=""
+telemetry_outbound_seeded=false
 
 cleanup_live_stream() {
   if [[ -n "$live_stream_pid" ]]; then
@@ -181,13 +182,14 @@ SQL
   case "$route_snapshot" in *"$bot_token"*) exit 1 ;; esac
 
   observed_at_unix_ms="$(($(date +%s) * 1000))"
+  observed_at_unix_us="${observed_at_unix_ms}000"
   telemetry_response="$(curl -fsS -X POST \
     -H 'host: phenogram' \
     -H 'content-type: application/json' \
     -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
-    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"getMe\",\"upstream_status\":200,\"latency_ms\":5,\"observed_at_unix_ms\":$observed_at_unix_ms},{\"schema_version\":1,\"token_lookup_hash\":\"phg_AAAAAAAAAAAAAAAAAAAAAAAA\",\"pool\":\"standard\",\"method\":\"getMe\",\"upstream_status\":200,\"latency_ms\":5,\"observed_at_unix_ms\":$observed_at_unix_ms}]}" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"getMe\",\"upstream_status\":200,\"latency_ms\":5,\"observed_at_unix_ms\":$observed_at_unix_ms},{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"gateway copy of operator response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}},{\"schema_version\":1,\"token_lookup_hash\":\"phg_AAAAAAAAAAAAAAAAAAAAAAAA\",\"pool\":\"standard\",\"method\":\"getMe\",\"upstream_status\":200,\"latency_ms\":5,\"observed_at_unix_ms\":$observed_at_unix_ms}]}" \
     "$base_url/api/internal/data-plane/telemetry")"
-  jq -e '.ok == true and .accepted == 1 and .unknown == 1' \
+  jq -e '.ok == true and .accepted == 2 and .unknown == 1' \
     <<<"$telemetry_response" >/dev/null
   test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
 SELECT count(*) FROM api_calls
@@ -197,6 +199,42 @@ SELECT count(*) FROM api_calls
    AND method = 'getMe';
 SQL
 )" = "1"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM outbound_messages
+ WHERE bot_id = :'bot_id'::uuid
+   AND chat_id = 99
+   AND telegram_message_id = 9001
+   AND source = 'proxy'
+   AND text = 'gateway copy of operator response';
+SQL
+)" = "1"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM conversations
+ WHERE bot_id = :'bot_id'::uuid
+   AND chat_id = 99
+   AND last_message_preview = 'Bot: gateway copy of operator response';
+SQL
+)" = "1"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates WHERE bot_id = :'bot_id'::uuid;
+SQL
+)" = "0"
+  duplicate_outbound_response="$(curl -fsS -X POST \
+    -H 'host: phenogram' \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"gateway copy of operator response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    "$base_url/api/internal/data-plane/telemetry")"
+  jq -e '.ok == true and .accepted == 1 and .unknown == 0' \
+    <<<"$duplicate_outbound_response" >/dev/null
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM outbound_messages
+ WHERE bot_id = :'bot_id'::uuid
+   AND chat_id = 99
+   AND telegram_message_id = 9001;
+SQL
+)" = "1"
+  telemetry_outbound_seeded=true
 fi
 
 tap_collector_bin="${PHENOGRAM_TAP_COLLECTOR_BIN:-target/debug/phenogram-tap-collector}"
@@ -756,6 +794,25 @@ operator_reply="$(curl -fsS -b "$auth_cookie" \
   -d '{"chat_id":99,"text":"operator response"}' \
   "$base_url/api/bots/$bot_id/messages")"
 jq -e '.ok == true and .result.text == "operator response"' <<<"$operator_reply" >/dev/null
+if [[ "$telemetry_outbound_seeded" = true ]]; then
+  curl -fsS -X POST \
+    -H 'host: phenogram' \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"late gateway duplicate\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    "$base_url/api/internal/data-plane/telemetry" \
+    | jq -e '.ok == true and .accepted == 1 and .unknown == 0' >/dev/null
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM outbound_messages
+ WHERE bot_id = :'bot_id'::uuid
+   AND chat_id = 99
+   AND telegram_message_id = 9001
+   AND source = 'bot_view'
+   AND user_id IS NOT NULL
+   AND text = 'operator response';
+SQL
+)" = "1"
+fi
 
 updates="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/updates?limit=10")"
 jq -e '.updates | any(.update_id == 7001 and .event_type == "message" and .chat_id == 99)' <<<"$updates" >/dev/null
@@ -793,6 +850,51 @@ jq -e '.conversations[0].chat_id == 99 and .conversations[0].last_message_previe
 timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/99/messages")"
 jq -e '[.messages[].direction] | contains(["incoming"]) and contains(["outgoing"])' <<<"$timeline" >/dev/null
 jq -e '[.messages[].text] | contains(["hello from the e2e test"]) and contains(["operator response"]) and contains(["proxied response"])' <<<"$timeline" >/dev/null
+
+if [[ "$telemetry_outbound_seeded" = true ]]; then
+  updates_before_outbound_edit="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates WHERE bot_id = :'bot_id'::uuid;
+SQL
+)"
+  edit_observed_at_unix_us="$(($(date +%s) * 1000000 + 2000000))"
+  curl -fsS -X POST \
+    -H 'host: phenogram' \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"editMessageText\",\"upstream_status\":200,\"observed_at_unix_us\":$edit_observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"edited external response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    "$base_url/api/internal/data-plane/telemetry" \
+    | jq -e '.ok == true and .accepted == 1 and .unknown == 0' >/dev/null
+  # Replaying the older send observation after the edit must not restore stale text.
+  curl -fsS -X POST \
+    -H 'host: phenogram' \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"stale original response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    "$base_url/api/internal/data-plane/telemetry" \
+    | jq -e '.ok == true and .accepted == 1 and .unknown == 0' >/dev/null
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM outbound_messages
+ WHERE bot_id = :'bot_id'::uuid
+   AND chat_id = 99
+   AND telegram_message_id = 9001
+   AND source = 'bot_view'
+   AND user_id IS NOT NULL
+   AND method = 'editMessageText'
+   AND text = 'edited external response';
+SQL
+)" = "1"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM conversations
+ WHERE bot_id = :'bot_id'::uuid
+   AND chat_id = 99
+   AND last_message_preview = 'You: edited external response';
+SQL
+)" = "1"
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates WHERE bot_id = :'bot_id'::uuid;
+SQL
+)" = "$updates_before_outbound_edit"
+fi
 
 # Prove that an already-connected authenticated stream receives a newly
 # committed journal row, not only replayed history.

@@ -61,6 +61,14 @@
     requestTickets: {},
     modalReturnFocus: null,
     authError: null,
+    recentlyConnectedBotId: null,
+    botSetupRefreshTimer: null,
+    botSetupRefreshAttempt: 0,
+    botViewRefreshTimer: null,
+    botViewRefreshPromise: null,
+    botViewRefreshGeneration: 0,
+    botViewSendsInFlight: new Map(),
+    botViewConversationListPinned: false,
   };
 
   const icon = (name, className = "") =>
@@ -169,9 +177,16 @@
     const raw = bot?.username || bot?.bot_username || bot?.telegram_username || "";
     return raw ? `@${String(raw).replace(/^@/, "")}` : "Telegram bot";
   };
-  const botStatus = (bot) => {
+  const reportedBotStatus = (bot) => {
     if (bot?.token_valid === false) return "token_invalid";
     return String(bot?.status || bot?.health || "unknown").toLowerCase();
+  };
+
+  const botStatus = (bot) => {
+    const status = reportedBotStatus(bot);
+    const justConnected = state.recentlyConnectedBotId
+      && botId(bot) === String(state.recentlyConnectedBotId);
+    return justConnected && ["degraded", "warning"].includes(status) ? "provisioning" : status;
   };
 
   const botStatusView = (bot) => {
@@ -429,6 +444,8 @@
 
   function clearBotState({ clearSelection = false } = {}) {
     stopUpdatesStream({ status: "idle" });
+    stopBotViewRefresh();
+    stopBotSetupRefresh();
     state.botContextVersion += 1;
     state.requestTickets = {};
     state.bot = null;
@@ -436,6 +453,8 @@
     state.updates = [];
     state.conversations = [];
     state.selectedConversationId = null;
+    state.botViewConversationListPinned = false;
+    state.botViewSendsInFlight.clear();
     state.streamKey = null;
     state.streamKeyId = null;
     state.streamKeys = [];
@@ -573,6 +592,66 @@
     }
   }
 
+  const BOT_SETUP_REFRESH_DELAYS = [1000, 1500, 2500, 4000, 6000, 8000, 10000, 12000];
+
+  function botSetupIsPending(bot) {
+    return ["provisioning", "setup", "pending", "degraded", "warning"].includes(reportedBotStatus(bot));
+  }
+
+  function connectResponseWillRetry(payload, bot) {
+    if (["provisioning", "setup", "pending"].includes(reportedBotStatus(bot))) return true;
+    if (!["degraded", "warning"].includes(reportedBotStatus(bot))) return false;
+    const warnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
+    return warnings.some((warning) => /still running|finish it automatically|not complete yet|retry automatically/i.test(String(warning)));
+  }
+
+  function stopBotSetupRefresh() {
+    if (state.botSetupRefreshTimer) window.clearTimeout(state.botSetupRefreshTimer);
+    state.botSetupRefreshTimer = null;
+    state.botSetupRefreshAttempt = 0;
+    state.recentlyConnectedBotId = null;
+  }
+
+  function scheduleBotSetupRefresh() {
+    const id = String(state.recentlyConnectedBotId || "");
+    if (!id || state.botSetupRefreshTimer) return;
+    if (state.botSetupRefreshAttempt >= BOT_SETUP_REFRESH_DELAYS.length) {
+      stopBotSetupRefresh();
+      render();
+      return;
+    }
+    const sessionVersion = state.sessionVersion;
+    const contextVersion = state.botContextVersion;
+    const delay = BOT_SETUP_REFRESH_DELAYS[state.botSetupRefreshAttempt];
+    state.botSetupRefreshTimer = window.setTimeout(async () => {
+      state.botSetupRefreshTimer = null;
+      if (state.sessionVersion !== sessionVersion
+        || state.botContextVersion !== contextVersion
+        || String(state.selectedBotId || "") !== id) {
+        stopBotSetupRefresh();
+        return;
+      }
+      await loadBot(id, { silent: true });
+      if (state.sessionVersion !== sessionVersion
+        || state.botContextVersion !== contextVersion
+        || String(state.selectedBotId || "") !== id) return;
+      if (!botSetupIsPending(currentBot())) {
+        stopBotSetupRefresh();
+        render();
+        return;
+      }
+      state.botSetupRefreshAttempt += 1;
+      render();
+      scheduleBotSetupRefresh();
+    }, delay);
+  }
+
+  function trackConnectedBotSetup(id) {
+    stopBotSetupRefresh();
+    state.recentlyConnectedBotId = String(id);
+    scheduleBotSetupRefresh();
+  }
+
   async function loadActivity({ silent = false } = {}) {
     const id = state.selectedBotId;
     if (!id) return;
@@ -650,26 +729,42 @@
     }
   }
 
-  async function loadConversations({ silent = false } = {}) {
+  const MOBILE_BOT_VIEW_MEDIA = "(max-width: 640px)";
+
+  function mobileBotViewIsSinglePane() {
+    return typeof window.matchMedia === "function" && window.matchMedia(MOBILE_BOT_VIEW_MEDIA).matches;
+  }
+
+  async function loadConversations({ silent = false, renderResult = true, refreshContext = null } = {}) {
     const id = state.selectedBotId;
-    if (!id) return;
+    if (!id) return false;
     const contextVersion = state.botContextVersion;
     const ticket = startRequest("conversations");
     if (!silent) { setLoading("conversations", true); setError("conversations", null); render(); }
     try {
       const payload = await api(`/bots/${encodeURIComponent(id)}/conversations`);
-      if (!botRequestIsCurrent("conversations", ticket, id, contextVersion)) return;
+      if (!botRequestIsCurrent("conversations", ticket, id, contextVersion)
+        || (refreshContext && !botViewRefreshContextIsCurrent(refreshContext))) return false;
       state.conversations = listFrom(payload, "conversations");
-      if (!state.selectedConversationId || !state.conversations.some((item) => conversationId(item) === String(state.selectedConversationId))) {
+      const selectedConversationExists = state.selectedConversationId
+        && state.conversations.some((item) => conversationId(item) === String(state.selectedConversationId));
+      if (state.selectedConversationId && !selectedConversationExists) state.selectedConversationId = null;
+      if (!state.selectedConversationId
+        && (!state.botViewConversationListPinned || !mobileBotViewIsSinglePane())) {
         state.selectedConversationId = state.conversations[0] ? conversationId(state.conversations[0]) : null;
+        state.botViewConversationListPinned = false;
       }
       if (state.selectedConversationId) await loadConversationMessages(state.selectedConversationId);
+      if (!botRequestIsCurrent("conversations", ticket, id, contextVersion)) return false;
+      setError("conversations", null);
+      return true;
     } catch (error) {
       if (botRequestIsCurrent("conversations", ticket, id, contextVersion)) setError("conversations", errorMessage(error));
+      return false;
     } finally {
       if (botRequestIsCurrent("conversations", ticket, id, contextVersion)) {
         setLoading("conversations", false);
-        render();
+        if (renderResult) render();
       }
     }
   }
@@ -688,6 +783,57 @@
     } catch (_) {
       // Conversation summaries remain useful even when historical payload loading fails.
     }
+  }
+
+  const BOT_VIEW_REFRESH_INTERVAL = 2500;
+
+  function botViewRefreshContextIsCurrent(context) {
+    return state.route.name === "bot-view"
+      && Boolean(state.user)
+      && document.visibilityState === "visible"
+      && state.sessionVersion === context.sessionVersion
+      && state.botContextVersion === context.contextVersion
+      && state.botViewRefreshGeneration === context.generation
+      && String(state.selectedBotId || "") === context.botId;
+  }
+
+  function stopBotViewRefresh() {
+    state.botViewRefreshGeneration += 1;
+    if (state.botViewRefreshTimer) window.clearTimeout(state.botViewRefreshTimer);
+    state.botViewRefreshTimer = null;
+  }
+
+  function scheduleBotViewRefresh(context) {
+    if (!botViewRefreshContextIsCurrent(context) || state.botViewRefreshTimer) return;
+    state.botViewRefreshTimer = window.setTimeout(async () => {
+      state.botViewRefreshTimer = null;
+      if (!botViewRefreshContextIsCurrent(context)) return;
+      if (state.botViewRefreshPromise) {
+        scheduleBotViewRefresh(context);
+        return;
+      }
+      const refresh = loadConversations({ silent: true, renderResult: false, refreshContext: context });
+      state.botViewRefreshPromise = refresh;
+      try {
+        await refresh;
+        if (botViewRefreshContextIsCurrent(context)) renderBotViewLive();
+      } finally {
+        if (state.botViewRefreshPromise === refresh) state.botViewRefreshPromise = null;
+        if (botViewRefreshContextIsCurrent(context)) scheduleBotViewRefresh(context);
+      }
+    }, BOT_VIEW_REFRESH_INTERVAL);
+  }
+
+  function startBotViewRefresh() {
+    if (state.route.name !== "bot-view" || !state.user || !state.selectedBotId || document.visibilityState !== "visible") return;
+    stopBotViewRefresh();
+    const context = {
+      botId: String(state.selectedBotId),
+      sessionVersion: state.sessionVersion,
+      contextVersion: state.botContextVersion,
+      generation: state.botViewRefreshGeneration,
+    };
+    scheduleBotViewRefresh(context);
   }
 
   async function handleExpiredSession() {
@@ -1083,7 +1229,12 @@
 
   async function routeChanged() {
     stopUpdatesStream({ status: "idle" });
+    stopBotViewRefresh();
+    const previousRouteName = state.route.name;
     state.route = parseRoute();
+    if (previousRouteName !== "bot-view" || state.route.name !== "bot-view") {
+      state.botViewConversationListPinned = false;
+    }
     state.mobileMenu = false;
     state.drawer = null;
     if (state.route.name !== "bot-integration") {
@@ -1120,11 +1271,12 @@
     }
     if (["overview", "bot-overview", "bot-integration"].includes(state.route.name) && state.selectedBotId) tasks.push(loadActivity({ silent: true }));
     if (state.route.name === "bot-updates") tasks.push(loadUpdates({ silent: true }));
-    if (state.route.name === "bot-view") tasks.push(loadConversations({ silent: true }));
+    if (state.route.name === "bot-view") tasks.push(loadConversations({ silent: true, renderResult: false }));
     if (state.route.name === "bot-integration") tasks.push(loadStreamKeys({ silent: true }));
     await Promise.allSettled(tasks);
     render();
     if (state.route.name === "bot-updates" && !state.updatesPaused) startUpdatesStream();
+    if (state.route.name === "bot-view") startBotViewRefresh();
     document.querySelector("#main-content")?.focus({ preventScroll: true });
   }
 
@@ -1474,14 +1626,17 @@
 
   function renderHealthHero(bot) {
     const webhookRecoveryRequired = bot?.webhook_secret_required === true;
+    const finishingConnection = state.recentlyConnectedBotId
+      && botId(bot) === String(state.recentlyConnectedBotId)
+      && botSetupIsPending(bot);
     const status = botStatus(bot);
     const bad = ["invalid", "token_invalid", "error", "disabled", "failed"].includes(status);
     const provisioning = ["provisioning", "setup", "pending"].includes(status);
     const degraded = ["degraded", "warning"].includes(status);
     const unknown = !bad && !provisioning && !degraded && !["active", "healthy", "ready", "ok"].includes(status);
     const warning = provisioning || degraded || unknown;
-    const title = webhookRecoveryRequired ? "Webhook details are needed to continue this managed bot" : bad ? "This bot needs attention" : degraded ? "This bot is degraded" : provisioning ? "Webhook provisioning is in progress" : unknown ? "Bot status is unavailable" : "Bot is healthy";
-    const copy = webhookRecoveryRequired ? "The native webhook remains active and unchanged. Phenogram API routing is paused until you confirm its authentication and IP behavior." : bad ? "Verify the bot token and review recent API activity." : degraded ? "The bot is connected, but an upstream setup step failed. Review its recent activity." : provisioning ? "Phenogram is registering its upstream webhook. Activity will appear when Telegram starts delivering updates." : unknown ? "Refresh this workspace before assuming the bot is ready." : "Phenogram is receiving and processing activity normally.";
+    const title = webhookRecoveryRequired ? "Webhook details are needed to continue this managed bot" : bad ? "This bot needs attention" : finishingConnection ? "Bot setup is finishing" : degraded ? "This bot is degraded" : provisioning ? "Webhook provisioning is in progress" : unknown ? "Bot status is unavailable" : "Bot is healthy";
+    const copy = webhookRecoveryRequired ? "The native webhook remains active and unchanged. Phenogram API routing is paused until you confirm its authentication and IP behavior." : bad ? "Verify the bot token and review recent API activity." : finishingConnection ? "Phenogram is completing Telegram setup. This page will update automatically." : degraded ? "The bot is connected, but an upstream setup step failed. Review its recent activity." : provisioning ? "Phenogram is registering its upstream webhook. Activity will appear when Telegram starts delivering updates." : unknown ? "Refresh this workspace before assuming the bot is ready." : "Phenogram is receiving and processing activity normally.";
     const lastUpdate = bot.last_update_at || bot.last_update || bot.latest_update_at;
     const lastApi = bot.last_api_call_at || bot.last_api_request_at || bot.last_request_at || bot.latest_activity_at;
     return `<section class="health-hero ${bad ? "is-error" : warning || webhookRecoveryRequired ? "is-warning" : ""}"><span class="health-hero__icon">${icon(bad || webhookRecoveryRequired ? "alert" : warning ? "clock" : "check")}</span><div class="health-hero__copy"><h2>${title}</h2><p>${copy}</p>${webhookRecoveryRequired ? `<button class="btn btn--secondary btn--sm btn--top-gap" type="button" data-action="open-managed-webhook-recovery">Resolve webhook transfer</button>` : ""}</div><div class="health-hero__meta"><div><span>Last update</span><strong>${esc(relativeTime(lastUpdate))}</strong></div><div><span>Last API call</span><strong>${esc(relativeTime(lastApi))}</strong></div><div><span>Retention</span><strong>${esc(retentionValue(bot))}</strong></div></div></section>`;
@@ -1628,10 +1783,77 @@
     const bot = currentBot();
     if (!bot) return `<div class="page">${renderNoBots()}</div>`;
     return `<div class="page page--wide">
-      ${pageHeader("Bot View", `See conversations exactly as ${botName(bot)} does, then reply with clear operator intent.`, `<span class="badge badge--success">Access audited</span>`)}
-      ${state.errors.conversations ? `<div class="status-banner status-banner--danger">${icon("alert")}<div class="status-banner__copy"><strong>Conversations unavailable</strong>${esc(state.errors.conversations)}</div><button class="btn btn--sm btn--secondary" data-action="retry-conversations">Retry</button></div>` : ""}
+      ${pageHeader("Bot View", `See conversations exactly as ${botName(bot)} does, then reply with clear operator intent.`, `<a class="btn btn--secondary btn--sm" href="${botPath(botId(bot), "updates")}">${icon("pulse")}Raw updates</a><span class="badge badge--success">Access audited</span>`)}
+      <div id="bot-view-error" aria-live="polite">${renderBotViewError()}</div>
       <section class="bot-view ${state.selectedConversationId ? "has-chat" : ""}">${renderConversationList()}${renderChatPane(bot)}</section>
     </div>`;
+  }
+
+  function renderBotViewError() {
+    return state.errors.conversations ? `<div class="status-banner status-banner--danger">${icon("alert")}<div class="status-banner__copy"><strong>Conversations unavailable</strong>${esc(state.errors.conversations)}</div><button class="btn btn--sm btn--secondary" data-action="retry-conversations">Retry</button></div>` : "";
+  }
+
+  function applyConversationFilter(value) {
+    const query = String(value || "").trim().toLowerCase();
+    document.querySelectorAll("#conversation-items .conversation").forEach((item) => {
+      item.hidden = Boolean(query && !item.textContent.toLowerCase().includes(query));
+    });
+  }
+
+  function captureBotViewUiState() {
+    const search = document.querySelector("#conversation-search");
+    const composer = document.querySelector("#message-form textarea");
+    const timeline = document.querySelector("#chat-timeline");
+    return {
+      conversationId: String(state.selectedConversationId || ""),
+      searchValue: search?.value || "",
+      searchFocused: document.activeElement === search,
+      composerValue: composer?.value || "",
+      composerFocused: document.activeElement === composer,
+      composerSelectionStart: composer?.selectionStart,
+      composerSelectionEnd: composer?.selectionEnd,
+      timelineScrollTop: timeline?.scrollTop || 0,
+      timelineWasNearBottom: timeline ? timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight <= 72 : true,
+    };
+  }
+
+  function restoreBotViewUiState(snapshot) {
+    const search = document.querySelector("#conversation-search");
+    if (search) {
+      search.value = snapshot.searchValue;
+      applyConversationFilter(snapshot.searchValue);
+      if (snapshot.searchFocused) search.focus({ preventScroll: true });
+    }
+    if (snapshot.conversationId !== String(state.selectedConversationId || "")) return;
+    const composer = document.querySelector("#message-form textarea");
+    if (composer) {
+      composer.value = snapshot.composerValue;
+      if (snapshot.composerFocused) {
+        composer.focus({ preventScroll: true });
+        if (Number.isInteger(snapshot.composerSelectionStart) && Number.isInteger(snapshot.composerSelectionEnd)) {
+          composer.setSelectionRange(snapshot.composerSelectionStart, snapshot.composerSelectionEnd);
+        }
+      }
+    }
+    const timeline = document.querySelector("#chat-timeline");
+    if (timeline) {
+      timeline.scrollTop = snapshot.timelineWasNearBottom
+        ? timeline.scrollHeight
+        : Math.min(snapshot.timelineScrollTop, Math.max(0, timeline.scrollHeight - timeline.clientHeight));
+    }
+  }
+
+  function renderBotViewLive() {
+    if (state.route.name !== "bot-view") return;
+    const bot = currentBot();
+    const view = document.querySelector(".bot-view");
+    if (!bot || !view) return;
+    const snapshot = captureBotViewUiState();
+    const error = document.querySelector("#bot-view-error");
+    if (error) error.innerHTML = renderBotViewError();
+    view.className = `bot-view ${state.selectedConversationId ? "has-chat" : ""}`;
+    view.innerHTML = `${renderConversationList()}${renderChatPane(bot)}`;
+    restoreBotViewUiState(snapshot);
   }
 
   function renderConversationList() {
@@ -1652,9 +1874,10 @@
     const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
     if (!conversation) return `<section class="chat-pane"><div class="empty-state empty-state--fill"><span class="empty-state__icon">${icon("message")}</span><h2>Select a conversation</h2><p>Choose a chat to inspect the timeline and reply as ${esc(botUsername(bot))}.</p></div></section>`;
     const messages = conversationMessages(conversation);
+    const sending = botViewSendIsInFlight(botId(bot), conversationId(conversation));
     return `<section class="chat-pane"><header class="chat-pane__head"><button class="btn btn--ghost btn--icon chat-back" type="button" data-action="chat-back" aria-label="Back to conversations">${icon("arrow", "" )}</button><span class="chat-avatar">${initials(conversationTitle(conversation))}</span><span class="chat-pane__head-copy"><strong>${esc(conversationTitle(conversation))}</strong><span>chat_id: ${esc(conversationId(conversation))}</span></span><span class="badge badge--success">Bot can reply</span></header>
       <div class="timeline" id="chat-timeline">${messages.length ? `<div class="timeline-day"><span>Conversation history</span></div>${messages.map(renderMessage).join("")}` : `<div class="empty-state"><span class="empty-state__icon">${icon("message")}</span><h3>No message history</h3><p>This conversation exists, but no message payloads were returned.</p></div>`}</div>
-      <footer class="composer"><div class="composer__label"><span>Reply as <strong>${esc(botUsername(bot))}</strong></span><span>Operator sends are audited</span></div><form class="composer__form" id="message-form"><textarea name="text" rows="1" maxlength="4096" placeholder="Write a reply…" aria-label="Reply text" required></textarea><button class="btn btn--primary btn--icon" type="submit" aria-label="Send reply">${icon("send")}</button></form><div data-form-error aria-live="polite"></div></footer>
+      <footer class="composer"><div class="composer__label"><span>Reply as <strong>${esc(botUsername(bot))}</strong></span><span>Operator sends are audited</span></div><form class="composer__form" id="message-form"${sending ? ' aria-busy="true"' : ""}><textarea name="text" rows="1" maxlength="4096" placeholder="Write a reply…" aria-label="Reply text" required${sending ? " disabled" : ""}></textarea><button class="btn btn--primary btn--icon" type="submit" aria-label="${sending ? "Sending reply" : "Send reply"}"${sending ? " disabled" : ""}>${icon(sending ? "refresh" : "send")}</button></form><div data-form-error aria-live="polite"></div></footer>
     </section>`;
   }
 
@@ -1789,7 +2012,7 @@
       const poolField = state.membership?.local_bot_api === true
         ? `<div class="field"><label for="bot-pool">Telegram API backend</label><select id="bot-pool" name="pool"><option value="standard" selected>Phenogram Standard</option><option value="local">Phenogram Local — extended file support</option></select><p class="field__hint">This is the bot’s initial placement. Moving between pools is not available yet.</p></div>`
         : "";
-      const environmentField = `<div class="field"><label for="bot-environment">Telegram environment</label><select id="bot-environment" name="test_dc"><option value="false" selected>Production</option><option value="true">Test environment</option></select><p class="field__hint">Choose Test only for a bot created in Telegram’s separate test environment.</p></div>`;
+      const environmentField = `<details class="advanced-options"><summary>Advanced options</summary><label class="advanced-option" for="bot-test-environment"><input id="bot-test-environment" name="test_dc" type="checkbox" value="true"><span><strong>Use Telegram Test environment</strong><small>Only for a bot created in Telegram’s separate test environment.</small></span></label></details>`;
       modalRoot.innerHTML = `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-modal-panel><header class="modal__head"><div><h2 id="connect-title">${atLimit ? "Your bot limit is full" : "Connect a Telegram bot"}</h2><p>${atLimit ? `The ${membershipPlan()} plan includes ${membershipLimit()} bot${membershipLimit() === 1 ? "" : "s"}.` : "Paste the token from @BotFather."}</p></div><button class="btn btn--ghost btn--icon" type="button" data-action="close-modal" aria-label="Close">${icon("close")}</button></header>${atLimit ? `<div class="modal__body"><div class="form-note">${icon("info")}Your existing bots stay active. Upgrade the workspace before connecting another bot.</div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Not now</button><button class="btn btn--primary" type="button" data-action="go-billing">See plans</button></footer>` : `<form id="connect-bot-form" autocomplete="off"><div class="modal__body"><div class="form-stack"><div class="field"><div class="field__row"><label for="bot-token">Telegram bot token</label><span class="field__hint">From @BotFather</span></div><div class="input-wrap">${icon("lock")}<input id="bot-token" name="token" type="password" inputmode="text" autocomplete="new-password" spellcheck="false" placeholder="123456789:AA…" required></div><p class="field__hint">Phenogram encrypts this credential in its application database and will not display it again.</p></div>${environmentField}${poolField}<div class="form-note">${icon("info")}Connecting transfers this bot’s webhook to Phenogram. If a webhook is already set, Phenogram will keep delivering updates to the same destination.</div><div data-webhook-secret-resolution></div><div data-form-error aria-live="polite"></div></div></div><footer class="modal__actions"><button class="btn btn--secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn--primary" type="submit">Verify and connect ${icon("arrow")}</button></footer></form>`}</section></div>`;
       return;
     }
@@ -1854,6 +2077,28 @@
     button.innerHTML = submitting ? `${icon("refresh")} ${esc(label || "Working…")}` : button.dataset.originalLabel;
   }
 
+  function botViewSendKey(botIdValue, chatId) {
+    return `${String(botIdValue || "")}:${String(chatId || "")}`;
+  }
+
+  function botViewSendIsInFlight(botIdValue, chatId) {
+    return state.botViewSendsInFlight.has(botViewSendKey(botIdValue, chatId));
+  }
+
+  function finishBotViewSend(context) {
+    if (state.botViewSendsInFlight.get(context.key) === context) {
+      state.botViewSendsInFlight.delete(context.key);
+    }
+  }
+
+  function setBotViewComposerSubmitting(form, submitting) {
+    setSubmitting(form, submitting, "Sending…");
+    const composer = form?.elements?.text;
+    if (composer) composer.disabled = submitting;
+    if (submitting) form?.setAttribute?.("aria-busy", "true");
+    else form?.removeAttribute?.("aria-busy");
+  }
+
   function surfaceWarnings(payload) {
     const warnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
     warnings.forEach((warning) => toast(String(warning), "warning"));
@@ -1895,7 +2140,12 @@
       const created = unwrap(payload, "bot") || payload;
       await loadBots({ silent: true });
       if (state.sessionVersion !== sessionVersion || !state.user) return;
-      if (created && botId(created)) selectBot(botId(created));
+      const connectedId = created && botId(created);
+      if (connectedId) selectBot(connectedId);
+      const connectedBot = state.bots.find((bot) => botId(bot) === String(connectedId)) || created;
+      if (connectedId && connectResponseWillRetry(payload, created) && botSetupIsPending(connectedBot)) {
+        trackConnectedBotSetup(connectedId);
+      }
       closeModal();
       toast(`Connected ${created && typeof created === "object" ? botName(created) : "Telegram bot"}.`);
       surfaceWarnings(payload);
@@ -1977,26 +2227,46 @@
     const chatId = conversationId(conversation);
     const id = state.selectedBotId;
     const contextVersion = state.botContextVersion;
-    const ticket = startRequest("sendMessage");
+    const sessionVersion = state.sessionVersion;
     const text = String(new FormData(form).get("text") || "").trim();
     if (!chatId || !text) return;
-    setSubmitting(form, true, "Sending…");
+    const key = botViewSendKey(id, chatId);
+    if (state.botViewSendsInFlight.has(key)) return;
+    const requestKey = `sendMessage:${chatId}`;
+    const ticket = startRequest(requestKey);
+    const sendContext = { key, requestKey, botId: String(id), chatId: String(chatId), contextVersion, sessionVersion, ticket };
+    state.botViewSendsInFlight.set(key, sendContext);
+    stopBotViewRefresh();
+    setBotViewComposerSubmitting(form, true);
     try {
-      const payload = await api(`/bots/${encodeURIComponent(id)}/messages`, { method: "POST", body: { chat_id: Number(chatId), text } });
-      if (!botRequestIsCurrent("sendMessage", ticket, id, contextVersion) || String(state.selectedConversationId) !== String(chatId)) return;
-      const result = payload?.result || unwrap(payload, "message") || {};
-      const sent = { ...result, text: result.text || text, direction: "outgoing", status: "sent", created_at: new Date().toISOString() };
-      if (!Array.isArray(conversation.messages)) conversation.messages = [];
-      conversation.messages.push(sent);
-      conversation.last_message = sent;
+      await api(`/bots/${encodeURIComponent(id)}/messages`, { method: "POST", body: { chat_id: Number(chatId), text } });
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      const currentConversation = state.conversations.find((item) => conversationId(item) === String(chatId));
+      if (currentConversation) await loadConversationMessages(chatId);
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      finishBotViewSend(sendContext);
       form.reset();
-      render();
+      if (String(state.selectedConversationId) === String(chatId)) {
+        const currentForm = document.querySelector("#message-form");
+        if (currentForm && currentForm !== form) currentForm.reset();
+      }
+      renderBotViewLive();
       window.setTimeout(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; }, 10);
       toast("Reply sent as the bot.");
     } catch (error) {
-      if (!botRequestIsCurrent("sendMessage", ticket, id, contextVersion)) return;
-      formError(form, errorMessage(error));
-      setSubmitting(form, false);
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      finishBotViewSend(sendContext);
+      const currentForm = document.querySelector("#message-form");
+      if (currentForm && String(state.selectedConversationId) === String(chatId)) {
+        formError(currentForm, errorMessage(error));
+        setBotViewComposerSubmitting(currentForm, false);
+      }
+    } finally {
+      finishBotViewSend(sendContext);
+      if (state.sessionVersion === sessionVersion
+        && state.botContextVersion === contextVersion
+        && String(state.selectedBotId || "") === String(id)
+        && state.route.name === "bot-view") startBotViewRefresh();
     }
   }
 
@@ -2201,7 +2471,10 @@
     else if (action === "go-billing") { closeModal(); navigate("/billing"); }
     else if (action === "retry-route") routeChanged();
     else if (action === "refresh-updates") loadUpdates();
-    else if (action === "retry-conversations") loadConversations();
+    else if (action === "retry-conversations") {
+      stopBotViewRefresh();
+      Promise.resolve(state.botViewRefreshPromise).catch(() => {}).then(() => loadConversations()).finally(startBotViewRefresh);
+    }
     else if (action === "clear-update-filters") { resetFilteredUpdatesReload(); state.filters = { ...state.filters, type: "", query: "" }; loadUpdates(); }
     else if (action === "toggle-updates") toggleUpdatesStream();
     else if (action === "view-update") { const itemId = normalizeJournalId(trigger.dataset.updateId); const item = state.updates.find((candidate) => updateJournalId(candidate) === itemId) || state.updates[Number(trigger.dataset.updateIndex)]; if (item) { state.drawer = { type: "update", itemId: updateJournalId(item), item }; render(); } }
@@ -2209,6 +2482,7 @@
     else if (action === "copy-json") { const itemId = normalizeJournalId(state.drawer?.itemId || updateJournalId(state.drawer?.item)); const item = state.updates.find((candidate) => updateJournalId(candidate) === itemId) || state.drawer?.item; if (item) copyText(JSON.stringify(updatePayload(item), null, 2)); }
     else if (action === "copy-value") copyText(trigger.dataset.copyValue || "");
     else if (action === "select-conversation") {
+      state.botViewConversationListPinned = false;
       state.selectedConversationId = trigger.dataset.conversationId;
       render();
       loadConversationMessages(state.selectedConversationId).finally(() => {
@@ -2216,7 +2490,11 @@
         window.setTimeout(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; }, 10);
       });
     }
-    else if (action === "chat-back") { state.selectedConversationId = null; render(); }
+    else if (action === "chat-back") {
+      state.selectedConversationId = null;
+      state.botViewConversationListPinned = mobileBotViewIsSinglePane();
+      render();
+    }
     else if (action === "retry-stream-keys") loadStreamKeys();
     else if (action === "revoke-stream-key") revokeStreamKey(trigger);
     else if (action === "dismiss-stream-secret") { state.streamKey = null; state.streamKeyId = null; render(); }
@@ -2227,10 +2505,7 @@
 
   document.addEventListener("input", (event) => {
     if (event.target.matches("#conversation-search")) {
-      const query = event.target.value.trim().toLowerCase();
-      document.querySelectorAll("#conversation-items .conversation").forEach((item) => {
-        item.hidden = query && !item.textContent.toLowerCase().includes(query);
-      });
+      applyConversationFilter(event.target.value);
     }
     if (event.target.matches("input[aria-invalid='true']")) event.target.removeAttribute("aria-invalid");
   });
@@ -2256,11 +2531,19 @@
   });
 
   window.addEventListener("hashchange", routeChanged);
-  window.addEventListener("beforeunload", () => stopUpdatesStream({ status: "idle" }));
+  window.addEventListener("beforeunload", () => {
+    stopUpdatesStream({ status: "idle" });
+    stopBotViewRefresh();
+  });
   document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") {
+      stopBotViewRefresh();
+      return;
+    }
     if (document.visibilityState === "visible" && state.route.name === "bot-updates" && !state.updatesPaused && !state.updatesStream && !state.updatesStreamRetryTimer) {
       startUpdatesStream({ reconnecting: state.updatesStreamStatus === "reconnecting" });
     }
+    if (state.route.name === "bot-view") startBotViewRefresh();
   });
 
   bootstrap();

@@ -374,9 +374,10 @@ async fn run_locked(
             Ok(None) => continue,
             Err(error) => {
                 if matches!(error, AppError::GatewayDrainPending) {
-                    // Long polling and uploads can remain admitted for much
-                    // longer than one control-plane request. Keep the route
-                    // withdrawn, mutate no Telegram state, and retry with the
+                    // Route snapshots can still be propagating, while long
+                    // polling and uploads can remain admitted for much longer
+                    // than one control-plane request. Keep the operation
+                    // fenced, mutate no Telegram state, and retry with the
                     // normal durable worker backoff.
                     record_failure(connection, &operation, &error).await;
                     return Err(error);
@@ -1527,6 +1528,9 @@ pub(crate) async fn gateway_acknowledged(state: &AppState, generation: i64) -> R
         .send()
         .await
         .map_err(|error| AppError::Upstream(error.without_url().to_string()))?;
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(AppError::GatewayDrainPending);
+    }
     if !response.status().is_success() {
         return Err(AppError::Upstream(
             "The data-plane gateway has not acknowledged route withdrawal".into(),
@@ -1536,6 +1540,10 @@ pub(crate) async fn gateway_acknowledged(state: &AppState, generation: i64) -> R
         .json::<Value>()
         .await
         .map_err(|error| AppError::Upstream(error.without_url().to_string()))?;
+    require_gateway_generation(&body, generation)
+}
+
+fn require_gateway_generation(body: &Value, generation: i64) -> Result<()> {
     let observed = body
         .get("snapshot_generation")
         .and_then(|value| {
@@ -1543,11 +1551,13 @@ pub(crate) async fn gateway_acknowledged(state: &AppState, generation: i64) -> R
                 .as_i64()
                 .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         })
-        .unwrap_or(0);
+        .ok_or_else(|| {
+            AppError::Upstream(
+                "The data-plane gateway returned an invalid route snapshot generation".into(),
+            )
+        })?;
     if observed < generation {
-        return Err(AppError::Upstream(
-            "The data-plane gateway has not acknowledged route withdrawal".into(),
-        ));
+        return Err(AppError::GatewayDrainPending);
     }
     Ok(())
 }
@@ -1991,10 +2001,24 @@ async fn record_failure(
     {
         tracing::error!(bot_id = %operation.bot_id, error = ?database_error, "could not checkpoint lifecycle failure");
     }
-    let _ = sqlx::query("UPDATE bots SET status = 'degraded', updated_at = now() WHERE id = $1")
-        .bind(operation.bot_id)
-        .execute(&mut **connection)
-        .await;
+    // A durable operation with a scheduled retry is still provisioning. Keep
+    // `degraded` for phases that explicitly require human/terminal recovery;
+    // in particular, do not overwrite a concurrently checkpointed manual
+    // recovery phase with a transient status.
+    let _ = sqlx::query(
+        r#"UPDATE bots
+              SET status = 'provisioning', updated_at = now()
+            WHERE id = $1
+              AND EXISTS (
+                    SELECT 1
+                      FROM bot_data_plane_operations
+                     WHERE bot_id = $1
+                       AND phase NOT IN ('manual_recovery', 'webhook_resolution_required')
+              )"#,
+    )
+    .bind(operation.bot_id)
+    .execute(&mut **connection)
+    .await;
 }
 
 fn lifecycle_error_code(error: &AppError) -> &'static str {
@@ -2052,7 +2076,7 @@ mod tests {
 
     use super::{
         CloseDisposition, DataPlanePool, LifecycleOperation, SourcePool, classify_close_response,
-        parse_gateway_drain_proof, resolve_connect_webhook_ip_address,
+        parse_gateway_drain_proof, require_gateway_generation, resolve_connect_webhook_ip_address,
         resolve_connect_webhook_secret, validate_migration_path,
     };
     use crate::{error::AppError, telegram::ExistingWebhook};
@@ -2136,6 +2160,22 @@ mod tests {
             )),
             CloseDisposition::Ambiguous
         );
+    }
+
+    #[test]
+    fn stale_gateway_generation_is_pending_not_degraded_failure() {
+        let error = require_gateway_generation(&json!({"snapshot_generation": "41"}), 42)
+            .expect_err("route publication must wait for the gateway snapshot");
+        assert!(matches!(error, AppError::GatewayDrainPending));
+        assert!(require_gateway_generation(&json!({"snapshot_generation": "42"}), 42).is_ok());
+        assert!(require_gateway_generation(&json!({"snapshot_generation": 43}), 42).is_ok());
+    }
+
+    #[test]
+    fn malformed_gateway_generation_is_an_upstream_contract_error() {
+        let error = require_gateway_generation(&json!({"snapshot_generation": "not-a-number"}), 42)
+            .expect_err("malformed gateway state must not be treated as propagation lag");
+        assert!(matches!(error, AppError::Upstream(_)));
     }
 
     #[test]

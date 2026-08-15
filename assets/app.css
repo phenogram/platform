@@ -587,6 +587,16 @@ svg { display: block; }
 .webhook-consent { display: grid; grid-template-columns: 18px 1fr; gap: 11px; align-items: start; color: var(--ink-soft); font-size: 12px; line-height: 1.55; cursor: pointer; }
 .webhook-consent input { width: 17px; height: 17px; margin: 2px 0 0; accent-color: var(--primary); }
 .webhook-consent strong { display: block; color: var(--ink); font-size: 13px; }
+.advanced-options { border-top: 1px solid var(--line); }
+.advanced-options summary { padding: 2px 0 0; color: var(--ink-faint); font-size: 11px; font-weight: 650; cursor: pointer; list-style: none; }
+.advanced-options summary::-webkit-details-marker { display: none; }
+.advanced-options summary::after { content: "\203A"; display: inline-block; margin-left: 6px; color: var(--ink-faint); transform: rotate(90deg); transition: transform 150ms var(--ease); }
+.advanced-options[open] summary::after { transform: rotate(-90deg); }
+.advanced-option { margin-top: 11px; padding: 12px; display: grid; grid-template-columns: 17px 1fr; gap: 10px; align-items: start; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-muted); cursor: pointer; }
+.advanced-option input { width: 17px; height: 17px; margin: 1px 0 0; accent-color: var(--primary); }
+.advanced-option strong, .advanced-option small { display: block; }
+.advanced-option strong { color: var(--ink); font-size: 12px; }
+.advanced-option small { margin-top: 4px; color: var(--ink-faint); font-size: 10px; line-height: 1.5; }
 
 /* Application shell */
 .app-shell { min-height: 100vh; background: var(--paper); }

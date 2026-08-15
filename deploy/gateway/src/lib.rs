@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     ffi::CString,
-    io,
+    io, mem,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -42,6 +42,10 @@ const MAX_BYTE_RANGES: usize = 16;
 const OFFICIAL_MAX_REQUEST_HEAD_BYTES: usize = 1 << 18;
 const MAX_DRAIN_REQUEST_BYTES: usize = 1024;
 const MAX_OFFICIAL_DRAIN_RESPONSE_BYTES: usize = 1024;
+const MAX_OUTBOUND_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_CONCURRENT_OUTBOUND_OBSERVATIONS: usize = 8;
+const MAX_TELEMETRY_BATCH_BYTES: usize = 60 * 1024;
+const MAX_TELEMETRY_QUEUE_EVENTS: usize = 1024;
 const ROUTE_GENERATION_HEADER: &str = "x-phenogram-route-generation";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -188,6 +192,8 @@ pub struct GatewayState {
     ready: Arc<AtomicBool>,
     telemetry: tokio::sync::mpsc::Sender<TelemetryEvent>,
     telemetry_metrics: Arc<TelemetryMetrics>,
+    outbound_observation_slots: Arc<tokio::sync::Semaphore>,
+    outbound_observation_clock_us: Arc<AtomicU64>,
 }
 
 impl GatewayState {
@@ -201,7 +207,11 @@ impl GatewayState {
             .build()
             .map_err(|error| format!("failed to initialize HTTP client: {error}"))?;
 
-        let (telemetry, receiver) = tokio::sync::mpsc::channel(config.telemetry_queue_capacity);
+        let (telemetry, receiver) = tokio::sync::mpsc::channel(
+            config
+                .telemetry_queue_capacity
+                .min(MAX_TELEMETRY_QUEUE_EVENTS),
+        );
         let state = Self {
             client,
             public_id_key: derive_public_id_key(&config.public_id_key),
@@ -218,6 +228,10 @@ impl GatewayState {
             ready: Arc::new(AtomicBool::new(false)),
             telemetry,
             telemetry_metrics: Arc::new(TelemetryMetrics::default()),
+            outbound_observation_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_OUTBOUND_OBSERVATIONS,
+            )),
+            outbound_observation_clock_us: Arc::new(AtomicU64::new(0)),
         };
         Ok((state, receiver))
     }
@@ -348,6 +362,54 @@ impl GatewayState {
             }
         }
     }
+
+    fn next_outbound_observed_at_unix_us(&self) -> u64 {
+        let wall_clock_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let mut previous = self.outbound_observation_clock_us.load(Ordering::Relaxed);
+        loop {
+            let next = wall_clock_us.max(previous.saturating_add(1));
+            match self.outbound_observation_clock_us.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(current) => previous = current,
+            }
+        }
+    }
+
+    fn admit_outbound_observation(
+        &self,
+        token_lookup_hash: String,
+        pool: Pool,
+        method: String,
+        upstream_status: StatusCode,
+    ) -> Option<OutboundObservation> {
+        if !upstream_status.is_success() || !outbound_response_candidate(&method) {
+            return None;
+        }
+        match self.outbound_observation_slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(OutboundObservation {
+                token_lookup_hash,
+                pool,
+                method,
+                upstream_status: upstream_status.as_u16(),
+                _capture_permit: permit,
+            }),
+            Err(_) => {
+                self.telemetry_metrics
+                    .dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
 }
 
 struct RouteAdmission {
@@ -376,6 +438,105 @@ impl Drop for RouteAdmission {
 struct AdmissionGuardedStream<S> {
     inner: Pin<Box<S>>,
     _admission: RouteAdmission,
+}
+
+struct OutboundObservationStream<S> {
+    inner: Pin<Box<S>>,
+    state: GatewayState,
+    observation: Option<OutboundObservation>,
+    expected_body_bytes: Option<usize>,
+    captured: Vec<u8>,
+    overflowed: bool,
+}
+
+impl<S> OutboundObservationStream<S> {
+    fn new(
+        inner: S,
+        state: GatewayState,
+        observation: OutboundObservation,
+        expected_body_bytes: Option<usize>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            state,
+            observation: Some(observation),
+            expected_body_bytes,
+            captured: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        let Some(observation) = self.observation.take() else {
+            return;
+        };
+        if self.overflowed || !(200..300).contains(&observation.upstream_status) {
+            return;
+        }
+        let body = mem::take(&mut self.captured);
+        let state = self.state.clone();
+        // Assign ordering at the clean response boundary, before detached JSON
+        // parsing can reorder differently-sized responses. The per-process
+        // logical microsecond clock also makes same-tick observations distinct.
+        let observed_at_unix_us = state.next_outbound_observed_at_unix_us();
+        // Parsing is deliberately detached from response delivery. There is no
+        // await, retry, or storage operation on the Telegram response path.
+        tokio::spawn(async move {
+            for message in outbound_messages_from_response(&body) {
+                state.record_telemetry(outbound_telemetry_event(
+                    &observation,
+                    observed_at_unix_us,
+                    message,
+                ));
+            }
+        });
+    }
+
+    fn fail(&mut self) {
+        self.observation = None;
+        self.captured.clear();
+    }
+}
+
+impl<S> Stream for OutboundObservationStream<S>
+where
+    S: Stream<Item = Result<axum::body::Bytes, io::Error>>,
+{
+    type Item = Result<axum::body::Bytes, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if this.observation.is_some() && !this.overflowed {
+                    let remaining = MAX_OUTBOUND_RESPONSE_BYTES.saturating_sub(this.captured.len());
+                    if chunk.len() <= remaining {
+                        this.captured.extend_from_slice(&chunk);
+                    } else {
+                        this.overflowed = true;
+                        this.captured.clear();
+                    }
+                    // Hyper can stop polling a response stream once the declared
+                    // Content-Length has been yielded, without polling it once
+                    // more for EOF. Finalize on that exact boundary as well as
+                    // on an explicit clean EOF so observation remains reliable.
+                    if !this.overflowed && this.expected_body_bytes == Some(this.captured.len()) {
+                        this.finish();
+                    }
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.fail();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.finish();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl<S> AdmissionGuardedStream<S> {
@@ -503,7 +664,14 @@ struct TelemetryMetrics {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct TelemetryEvent {
+#[serde(untagged)]
+pub enum TelemetryEvent {
+    ApiCall(ApiCallTelemetryEvent),
+    OutboundMessage(OutboundMessageTelemetryEvent),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiCallTelemetryEvent {
     schema_version: u32,
     token_lookup_hash: String,
     pool: Pool,
@@ -511,6 +679,37 @@ pub struct TelemetryEvent {
     upstream_status: u16,
     latency_ms: u64,
     observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OutboundMessageTelemetryEvent {
+    schema_version: u32,
+    kind: &'static str,
+    token_lookup_hash: String,
+    pool: Pool,
+    method: String,
+    upstream_status: u16,
+    observed_at_unix_us: u64,
+    message: ObservedOutboundMessage,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ObservedOutboundMessage {
+    chat_id: i64,
+    telegram_message_id: i64,
+    text: Option<String>,
+    chat_type: Option<String>,
+    title: Option<String>,
+    username: Option<String>,
+    display_name: Option<String>,
+}
+
+struct OutboundObservation {
+    token_lookup_hash: String,
+    pool: Pool,
+    method: String,
+    upstream_status: u16,
+    _capture_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Serialize)]
@@ -676,14 +875,32 @@ pub async fn telemetry_delivery_loop(
 ) {
     const MAX_BATCH: usize = 100;
     const MAX_BATCH_WAIT: Duration = Duration::from_millis(250);
+    const BATCH_WRAPPER_BYTES: usize = 40;
 
-    while let Some(first) = receiver.recv().await {
+    let mut pending = None;
+    loop {
+        let first = match pending.take() {
+            Some(event) => event,
+            None => match receiver.recv().await {
+                Some(event) => event,
+                None => break,
+            },
+        };
         let mut events = Vec::with_capacity(MAX_BATCH);
+        let mut serialized_bytes = BATCH_WRAPPER_BYTES + telemetry_event_json_len(&first);
         events.push(first);
         let deadline = tokio::time::Instant::now() + MAX_BATCH_WAIT;
         while events.len() < MAX_BATCH {
             match tokio::time::timeout_at(deadline, receiver.recv()).await {
-                Ok(Some(event)) => events.push(event),
+                Ok(Some(event)) => {
+                    let event_bytes = telemetry_event_json_len(&event) + 1;
+                    if serialized_bytes + event_bytes > MAX_TELEMETRY_BATCH_BYTES {
+                        pending = Some(event);
+                        break;
+                    }
+                    serialized_bytes += event_bytes;
+                    events.push(event);
+                }
                 Ok(None) | Err(_) => break,
             }
         }
@@ -714,6 +931,10 @@ pub async fn telemetry_delivery_loop(
             }
         }
     }
+}
+
+fn telemetry_event_json_len(event: &TelemetryEvent) -> usize {
+    serde_json::to_vec(event).map_or(MAX_TELEMETRY_BATCH_BYTES, |body| body.len())
 }
 
 async fn sync_snapshot(state: &GatewayState, config: &Config) -> Result<(), String> {
@@ -859,23 +1080,33 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
 
     let status = response.status();
     state.record_telemetry(telemetry_event(
-        token_lookup_hash,
+        token_lookup_hash.clone(),
         pool,
-        method,
+        method.clone(),
         status,
         started.elapsed(),
     ));
+    let observation = state.admit_outbound_observation(token_lookup_hash, pool, method, status);
+    let expected_body_bytes = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok());
     let headers = response.headers().clone();
     let stream = response
         .bytes_stream()
         .map(|chunk| chunk.map_err(|_| std::io::Error::other("upstream body stream failed")));
-    let stream = AdmissionGuardedStream::new(stream, admission);
+    let body = match observation {
+        Some(observation) => Body::from_stream(AdmissionGuardedStream::new(
+            OutboundObservationStream::new(stream, state.clone(), observation, expected_body_bytes),
+            admission,
+        )),
+        None => Body::from_stream(AdmissionGuardedStream::new(stream, admission)),
+    };
     let mut downstream = Response::builder().status(status);
     if let Some(target) = downstream.headers_mut() {
         copy_end_to_end_headers(&headers, target);
     }
     downstream
-        .body(Body::from_stream(stream))
+        .body(body)
         .unwrap_or_else(|_| telegram_error(StatusCode::BAD_GATEWAY, "Bad Gateway"))
 }
 
@@ -1791,7 +2022,7 @@ fn telemetry_event(
     upstream_status: StatusCode,
     latency: Duration,
 ) -> TelemetryEvent {
-    TelemetryEvent {
+    TelemetryEvent::ApiCall(ApiCallTelemetryEvent {
         schema_version: 1,
         token_lookup_hash,
         pool,
@@ -1803,6 +2034,101 @@ fn telemetry_event(
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64,
+    })
+}
+
+fn outbound_telemetry_event(
+    observation: &OutboundObservation,
+    observed_at_unix_us: u64,
+    message: ObservedOutboundMessage,
+) -> TelemetryEvent {
+    TelemetryEvent::OutboundMessage(OutboundMessageTelemetryEvent {
+        schema_version: 1,
+        kind: "outbound_message",
+        token_lookup_hash: observation.token_lookup_hash.clone(),
+        pool: observation.pool,
+        method: observation.method.clone(),
+        upstream_status: observation.upstream_status,
+        observed_at_unix_us,
+        message,
+    })
+}
+
+fn outbound_messages_from_response(body: &[u8]) -> Vec<ObservedOutboundMessage> {
+    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    if envelope.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    let Some(result) = envelope.get("result") else {
+        return Vec::new();
+    };
+    match result {
+        serde_json::Value::Object(_) => observed_outbound_message(result).into_iter().collect(),
+        serde_json::Value::Array(messages) => messages
+            .iter()
+            .take(100)
+            .filter_map(observed_outbound_message)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn observed_outbound_message(value: &serde_json::Value) -> Option<ObservedOutboundMessage> {
+    let telegram_message_id = value.get("message_id")?.as_i64()?;
+    let chat = value.get("chat")?.as_object()?;
+    let chat_id = chat.get("id")?.as_i64()?;
+    if telegram_message_id <= 0 || chat_id == 0 {
+        return None;
+    }
+    let first_name = chat.get("first_name").and_then(serde_json::Value::as_str);
+    let last_name = chat.get("last_name").and_then(serde_json::Value::as_str);
+    let display_name = match (first_name, last_name) {
+        (Some(first), Some(last)) => Some(format!("{first} {last}")),
+        (Some(first), None) => Some(first.to_owned()),
+        (None, Some(last)) => Some(last.to_owned()),
+        (None, None) => None,
+    };
+    Some(ObservedOutboundMessage {
+        chat_id,
+        telegram_message_id,
+        text: value
+            .get("text")
+            .or_else(|| value.get("caption"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| bounded_telemetry_string(value, 4_096, 16 * 1024)),
+        chat_type: chat
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| bounded_telemetry_string(value, 64, 256)),
+        title: chat
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| bounded_telemetry_string(value, 512, 2 * 1024)),
+        username: chat
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| bounded_telemetry_string(value, 128, 512)),
+        display_name: display_name
+            .as_deref()
+            .and_then(|value| bounded_telemetry_string(value, 512, 2 * 1024)),
+    })
+}
+
+fn bounded_telemetry_string(value: &str, max_chars: usize, max_bytes: usize) -> Option<String> {
+    if value.contains('\0') {
+        return None;
+    }
+    let bounded = value.chars().take(max_chars).collect::<String>();
+    if bounded.len() <= max_bytes {
+        Some(bounded)
+    } else {
+        let mut end = max_bytes;
+        while !bounded.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(bounded[..end].to_owned())
     }
 }
 
@@ -1820,6 +2146,14 @@ fn telegram_method(path: ParsedPublicPath<'_>) -> String {
     } else {
         "invalid".into()
     }
+}
+
+fn outbound_response_candidate(method: &str) -> bool {
+    let method = method.to_ascii_lowercase();
+    method.starts_with("send")
+        || method.starts_with("forward")
+        || method.starts_with("editmessage")
+        || method == "setgamescore"
 }
 
 fn parse_public_request_path(path: &[u8]) -> Option<ParsedPublicPath<'_>> {
@@ -2008,6 +2342,313 @@ mod tests {
         assert_eq!(
             bot_public_id(&key, b"123:secret", true),
             "phg_kD1sFex4hdK1HJcOC4JG4E5k"
+        );
+    }
+
+    #[test]
+    fn extracts_successful_text_and_media_messages_from_telegram_results() {
+        let text = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 41,
+                "date": 1_786_620_000,
+                "chat": {
+                    "id": 99,
+                    "type": "private",
+                    "username": "ada",
+                    "first_name": "Ada",
+                    "last_name": "Lovelace"
+                },
+                "text": "hello"
+            }
+        });
+        let messages = outbound_messages_from_response(text.to_string().as_bytes());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].chat_id, 99);
+        assert_eq!(messages[0].telegram_message_id, 41);
+        assert_eq!(messages[0].text.as_deref(), Some("hello"));
+        assert_eq!(messages[0].username.as_deref(), Some("ada"));
+        assert_eq!(messages[0].display_name.as_deref(), Some("Ada Lovelace"));
+
+        let media_group = serde_json::json!({
+            "ok": true,
+            "result": [{
+                "message_id": 42,
+                "date": 1_786_620_001,
+                "chat": {"id": -1007, "type": "supergroup", "title": "Launch"},
+                "photo": [{"file_id": "photo", "file_unique_id": "unique", "width": 10, "height": 10}],
+                "caption": "first photo"
+            }, {
+                "message_id": 43,
+                "date": 1_786_620_001,
+                "chat": {"id": -1007, "type": "supergroup", "title": "Launch"},
+                "video": {"file_id": "video", "file_unique_id": "unique-video", "width": 10, "height": 10, "duration": 1}
+            }]
+        });
+        let messages = outbound_messages_from_response(media_group.to_string().as_bytes());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text.as_deref(), Some("first photo"));
+        assert_eq!(messages[1].text, None);
+        assert_eq!(messages[1].title.as_deref(), Some("Launch"));
+
+        assert!(
+            outbound_messages_from_response(
+                br#"{"ok":false,"result":{"message_id":1,"chat":{"id":1}}}"#
+            )
+            .is_empty()
+        );
+        assert!(
+            outbound_messages_from_response(br#"{"ok":true,"result":{"message_id":1}}"#).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_observation_is_fail_open_and_requires_a_clean_bounded_eof() {
+        let config = test_config(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1/api/internal/data-plane/telemetry",
+        );
+        let (state, mut receiver) = GatewayState::new(&config).expect("gateway state");
+        let response = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 9001,
+                "date": 1_786_620_000,
+                "chat": {"id": 99, "type": "private"},
+                "text": "observed"
+            }
+        })
+        .to_string();
+        let mut stream = OutboundObservationStream::new(
+            futures_util::stream::iter([Ok(Bytes::from(response.clone()))]),
+            state.clone(),
+            test_outbound_observation(&state),
+            None,
+        );
+        let mut delivered = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            delivered.extend_from_slice(&chunk.expect("unchanged response chunk"));
+        }
+        assert_eq!(delivered, response.as_bytes());
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("outbound observation timeout")
+            .expect("outbound observation");
+        let TelemetryEvent::OutboundMessage(event) = event else {
+            panic!("expected outbound telemetry");
+        };
+        assert_eq!(event.method, "sendMessage");
+        assert_eq!(event.message.chat_id, 99);
+        assert_eq!(event.message.telegram_message_id, 9001);
+        let first_observed_at_unix_us = event.observed_at_unix_us;
+
+        let later_response = response.replace("9001", "9002");
+        let mut later = OutboundObservationStream::new(
+            futures_util::stream::iter([Ok::<_, io::Error>(Bytes::from(later_response.clone()))]),
+            state.clone(),
+            test_outbound_observation(&state),
+            Some(later_response.len()),
+        );
+        assert_eq!(
+            later
+                .next()
+                .await
+                .expect("declared response chunk")
+                .unwrap(),
+            later_response.as_bytes()
+        );
+        // A declared Content-Length can end downstream consumption here; the
+        // timestamp and detached observation must already be committed.
+        drop(later);
+        let later_event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("later outbound observation timeout")
+            .expect("later outbound observation");
+        let TelemetryEvent::OutboundMessage(later_event) = later_event else {
+            panic!("expected later outbound telemetry");
+        };
+        assert_eq!(later_event.message.telegram_message_id, 9002);
+        assert!(later_event.observed_at_unix_us > first_observed_at_unix_us);
+
+        let mut oversized = OutboundObservationStream::new(
+            futures_util::stream::iter([Ok(Bytes::from(vec![
+                b'x';
+                MAX_OUTBOUND_RESPONSE_BYTES + 1
+            ]))]),
+            state.clone(),
+            test_outbound_observation(&state),
+            None,
+        );
+        while oversized.next().await.is_some() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        let mut failed = OutboundObservationStream::new(
+            futures_util::stream::iter([
+                Ok(Bytes::from(response.clone())),
+                Err(io::Error::other("simulated stream failure")),
+            ]),
+            state.clone(),
+            test_outbound_observation(&state),
+            None,
+        );
+        assert!(failed.next().await.expect("first chunk").is_ok());
+        assert!(failed.next().await.expect("stream error").is_err());
+        drop(failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        let mut disconnected = OutboundObservationStream::new(
+            futures_util::stream::iter([
+                Ok::<_, io::Error>(Bytes::from(response.clone())),
+                Ok(Bytes::from_static(b"not consumed")),
+            ]),
+            state.clone(),
+            test_outbound_observation(&state),
+            None,
+        );
+        assert!(disconnected.next().await.expect("first chunk").is_ok());
+        drop(disconnected);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        let mut full_config = config;
+        full_config.telemetry_queue_capacity = 1;
+        let (full_state, mut full_receiver) =
+            GatewayState::new(&full_config).expect("full gateway state");
+        full_state.record_telemetry(telemetry_event(
+            "phg_012345678901234567890123".into(),
+            Pool::Standard,
+            "getMe".into(),
+            StatusCode::OK,
+            Duration::ZERO,
+        ));
+        let mut queue_full = OutboundObservationStream::new(
+            futures_util::stream::iter([Ok::<_, io::Error>(Bytes::from(response.clone()))]),
+            full_state.clone(),
+            test_outbound_observation(&full_state),
+            None,
+        );
+        let mut queue_full_response = Vec::new();
+        while let Some(chunk) = queue_full.next().await {
+            queue_full_response.extend_from_slice(&chunk.expect("queue-full response chunk"));
+        }
+        assert_eq!(queue_full_response, response.as_bytes());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while full_state.telemetry_metrics.dropped.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue-full observation drop");
+        assert!(matches!(
+            full_receiver.recv().await,
+            Some(TelemetryEvent::ApiCall(_))
+        ));
+        assert!(full_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn saturated_outbound_budget_streams_unchanged_and_releases_after_enqueue() {
+        let telegram_body = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 9100,
+                "date": 1_786_620_000,
+                "chat": {"id": 99, "type": "private"},
+                "text": "budgeted"
+            }
+        })
+        .to_string();
+        let upstream_body = telegram_body.clone();
+        let upstream = Router::new().fallback(any(move || {
+            let upstream_body = upstream_body.clone();
+            async move { (StatusCode::OK, upstream_body) }
+        }));
+        let upstream_url = spawn(upstream).await;
+        let config = test_config(
+            &upstream_url,
+            "http://127.0.0.1/api/internal/data-plane/telemetry",
+        );
+        let (state, mut receiver) = GatewayState::new(&config).expect("gateway state");
+        let token_lookup_hash = bot_public_id(&state.public_id_key, b"123:secret", false);
+        state
+            .install(RouteSnapshot {
+                schema_version: 1,
+                generation: 1,
+                routes: vec![RouteRecord {
+                    token_lookup_hash,
+                    pool: Pool::Standard,
+                }],
+            })
+            .expect("install route");
+        let gateway_url = spawn_public_http1(public_router(state.clone())).await;
+        let mut held = (0..MAX_CONCURRENT_OUTBOUND_OBSERVATIONS)
+            .map(|_| test_outbound_observation(&state))
+            .collect::<Vec<_>>();
+        assert_eq!(state.outbound_observation_slots.available_permits(), 0);
+
+        let response = Client::new()
+            .post(format!("{gateway_url}/bot123:secret/sendMessage"))
+            .send()
+            .await
+            .expect("saturated response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("saturated response body"),
+            telegram_body
+        );
+        assert!(matches!(
+            receiver.recv().await,
+            Some(TelemetryEvent::ApiCall(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(state.telemetry_metrics.dropped.load(Ordering::Relaxed), 1);
+
+        drop(held.pop());
+        let response = Client::new()
+            .post(format!("{gateway_url}/bot123:secret/sendMessage"))
+            .send()
+            .await
+            .expect("released-budget response");
+        assert_eq!(
+            response.text().await.expect("released-budget body"),
+            telegram_body
+        );
+        assert!(matches!(
+            receiver.recv().await,
+            Some(TelemetryEvent::ApiCall(_))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("captured outbound timeout"),
+            Some(TelemetryEvent::OutboundMessage(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.outbound_observation_slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observation budget release");
+        drop(held);
+        assert_eq!(
+            state.outbound_observation_slots.available_permits(),
+            MAX_CONCURRENT_OUTBOUND_OBSERVATIONS
         );
     }
 
@@ -3355,6 +3996,26 @@ mod tests {
                 Duration::from_millis(7),
             ));
         }
+        state.record_telemetry(TelemetryEvent::OutboundMessage(
+            OutboundMessageTelemetryEvent {
+                schema_version: 1,
+                kind: "outbound_message",
+                token_lookup_hash: "phg_012345678901234567890123".into(),
+                pool: Pool::Standard,
+                method: "sendPhoto".into(),
+                upstream_status: 200,
+                observed_at_unix_us: 1_786_620_000_000_000,
+                message: ObservedOutboundMessage {
+                    chat_id: 99,
+                    telegram_message_id: 9002,
+                    text: Some("caption".into()),
+                    chat_type: Some("private".into()),
+                    title: None,
+                    username: Some("ada".into()),
+                    display_name: Some("Ada".into()),
+                },
+            },
+        ));
 
         let captured = tokio::time::timeout(Duration::from_secs(2), capture_rx.recv())
             .await
@@ -3370,10 +4031,12 @@ mod tests {
                 .as_array()
                 .expect("events array")
                 .len(),
-            3
+            4
         );
+        assert_eq!(captured.body["events"][3]["kind"], "outbound_message");
+        assert_eq!(captured.body["events"][3]["message"]["chat_id"], 99);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while state.telemetry_metrics.delivered.load(Ordering::Relaxed) != 3 {
+            while state.telemetry_metrics.delivered.load(Ordering::Relaxed) != 4 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3555,6 +4218,17 @@ mod tests {
             public_id_key: "b".repeat(32),
             sync_token: "s".repeat(32),
         }
+    }
+
+    fn test_outbound_observation(state: &GatewayState) -> OutboundObservation {
+        state
+            .admit_outbound_observation(
+                "phg_012345678901234567890123".into(),
+                Pool::Standard,
+                "sendMessage".into(),
+                StatusCode::OK,
+            )
+            .expect("outbound observation slot")
     }
 
     fn header_string(headers: &HeaderMap, name: HeaderName) -> Option<String> {

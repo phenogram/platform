@@ -1185,14 +1185,48 @@ pub async fn record_outbound_message(
     message: OutboundMessageRecord<'_>,
 ) -> Result<()> {
     let mut tx = state.db.begin().await?;
-    sqlx::query(
+    let stored = sqlx::query_as::<_, (String, Option<String>, DateTime<Utc>)>(
         r#"INSERT INTO outbound_messages
                (bot_id, user_id, chat_id, telegram_message_id, method, source, text, status,
                 response_status, error_summary, expires_at)
            SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                   now() + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
-            WHERE bots.id = $1"#,
+            WHERE bots.id = $1
+           ON CONFLICT (bot_id, chat_id, telegram_message_id)
+               WHERE telegram_message_id IS NOT NULL
+           DO UPDATE SET
+               user_id = COALESCE(EXCLUDED.user_id, outbound_messages.user_id),
+               source = CASE
+                   WHEN outbound_messages.source = 'bot_view' OR EXCLUDED.source <> 'bot_view'
+                   THEN outbound_messages.source
+                   ELSE EXCLUDED.source
+               END,
+               method = CASE
+                   WHEN EXCLUDED.created_at > outbound_messages.created_at
+                   THEN EXCLUDED.method ELSE outbound_messages.method
+               END,
+               text = CASE
+                   WHEN EXCLUDED.created_at > outbound_messages.created_at
+                   THEN COALESCE(EXCLUDED.text, outbound_messages.text)
+                   ELSE outbound_messages.text
+               END,
+               status = CASE
+                   WHEN EXCLUDED.created_at > outbound_messages.created_at
+                   THEN EXCLUDED.status ELSE outbound_messages.status
+               END,
+               response_status = CASE
+                   WHEN EXCLUDED.created_at > outbound_messages.created_at
+                   THEN COALESCE(EXCLUDED.response_status, outbound_messages.response_status)
+                   ELSE outbound_messages.response_status
+               END,
+               error_summary = CASE
+                   WHEN EXCLUDED.created_at > outbound_messages.created_at
+                   THEN EXCLUDED.error_summary ELSE outbound_messages.error_summary
+               END,
+               created_at = GREATEST(outbound_messages.created_at, EXCLUDED.created_at),
+               expires_at = GREATEST(outbound_messages.expires_at, EXCLUDED.expires_at)
+           RETURNING source, text, created_at"#,
     )
     .bind(message.bot_id)
     .bind(message.user_id)
@@ -1204,26 +1238,32 @@ pub async fn record_outbound_message(
     .bind(message.status)
     .bind(message.response_status)
     .bind(message.error_summary.map(truncate_error))
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if let Some(text) = message.text {
-        let preview = format!("You: {}", text.chars().take(170).collect::<String>());
+    if let Some((source, Some(text), created_at)) = stored {
+        let actor = if source == "bot_view" { "You" } else { "Bot" };
+        let preview = format!("{actor}: {}", text.chars().take(170).collect::<String>());
         sqlx::query(
             r#"INSERT INTO conversations
                    (bot_id, chat_id, display_name, last_message_preview, last_update_at, expires_at)
-               SELECT bots.id, $2, $3, $4, now(),
-                      now() + make_interval(days => bot_effective_retention_days(bots.id))
+               SELECT bots.id, $2, $3, $4, $5,
+                      $5 + make_interval(days => bot_effective_retention_days(bots.id))
                  FROM bots
                 WHERE bots.id = $1
                ON CONFLICT (bot_id, chat_id) DO UPDATE SET
-                   last_message_preview = EXCLUDED.last_message_preview,
-                   last_update_at = EXCLUDED.last_update_at,
-                   expires_at = EXCLUDED.expires_at"#,
+                   last_message_preview = CASE
+                       WHEN EXCLUDED.last_update_at >= conversations.last_update_at
+                       THEN EXCLUDED.last_message_preview
+                       ELSE conversations.last_message_preview
+                   END,
+                   last_update_at = GREATEST(conversations.last_update_at, EXCLUDED.last_update_at),
+                   expires_at = GREATEST(conversations.expires_at, EXCLUDED.expires_at)"#,
         )
         .bind(message.bot_id)
         .bind(message.chat_id)
         .bind(format!("Chat {}", message.chat_id))
         .bind(preview)
+        .bind(created_at)
         .execute(&mut *tx)
         .await?;
     }
