@@ -88,7 +88,7 @@ dataPlane:
   gateway:
     image:
       repository: ghcr.io/phenogram/data-plane-gateway
-      digest: sha256:a9ed255478fa5aa38c05e24ce83c44739873be0d667c877fc619f5962f001823
+      digest: sha256:973e08b0d7c5fb1f3987778243336062f52d0cd639ca41ce0fee6d0fa131517f
     persistence:
       storageClass: standard
   official:
