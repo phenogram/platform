@@ -87,6 +87,7 @@ pub const ALL_UPDATE_TYPES: &[&str] = &[
     "managed_bot",
     "subscription",
 ];
+const OBSERVATION_BYPASS_HEADER: &str = "x-phenogram-observation-bypass";
 
 pub async fn proxy_method(
     State(state): State<AppState>,
@@ -340,23 +341,16 @@ async fn forward_method(
         Ok(response) => response,
         Err(error) => {
             let error = error.without_url().to_string();
-            if let Some(capture) = &capture {
-                let _ = record_outbound_message(
+            if let Some(capture) = capture {
+                observe_outbound_capture(
                     state,
-                    OutboundMessageRecord {
-                        bot_id: bot.id,
-                        user_id: None,
-                        chat_id: capture.chat_id,
-                        telegram_message_id: None,
-                        method: method_name,
-                        source: "proxy",
-                        text: capture.text.as_deref(),
-                        status: "failed",
-                        response_status: None,
-                        error_summary: Some(&error),
-                    },
-                )
-                .await;
+                    bot.id,
+                    method_name,
+                    capture,
+                    "failed",
+                    None,
+                    Some(error.clone()),
+                );
             }
             return Err(AppError::Upstream(error));
         }
@@ -374,29 +368,20 @@ async fn forward_method(
         None,
     )
     .await;
-    if let Some(capture) = &capture
-        && let Err(error) = record_outbound_message(
+    if let Some(capture) = capture {
+        observe_outbound_capture(
             state,
-            OutboundMessageRecord {
-                bot_id: bot.id,
-                user_id: None,
-                chat_id: capture.chat_id,
-                telegram_message_id: None,
-                method: method_name,
-                source: "proxy",
-                text: capture.text.as_deref(),
-                status: if status.is_success() {
-                    "sent"
-                } else {
-                    "failed"
-                },
-                response_status: Some(status.as_u16() as i32),
-                error_summary: None,
+            bot.id,
+            method_name,
+            capture,
+            if status.is_success() {
+                "sent"
+            } else {
+                "failed"
             },
-        )
-        .await
-    {
-        tracing::warn!(bot_id = %bot.id, error = ?error, "could not record proxied outbound message");
+            Some(status.as_u16() as i32),
+            None,
+        );
     }
     stream_response(status, response_headers, response)
 }
@@ -404,6 +389,55 @@ async fn forward_method(
 struct OutboundCapture {
     chat_id: i64,
     text: Option<String>,
+}
+
+fn observe_outbound_capture(
+    state: &AppState,
+    bot_id: Uuid,
+    method: &str,
+    capture: OutboundCapture,
+    status: &'static str,
+    response_status: Option<i32>,
+    error_summary: Option<String>,
+) {
+    let Ok(permit) = state.observation_budget.clone().try_acquire_owned() else {
+        tracing::warn!(%bot_id, %method, "dropping proxied outbound observation: budget is full");
+        return;
+    };
+    let state = state.clone();
+    let method = method.to_owned();
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = record_outbound_message(
+            &state,
+            OutboundMessageRecord {
+                bot_id,
+                user_id: None,
+                conversation_id: None,
+                chat_id: capture.chat_id,
+                telegram_message_id: None,
+                receiver_user_id: None,
+                ephemeral_message_id: None,
+                observation_key: None,
+                business_connection_id: None,
+                guest_query_id: None,
+                message_thread_id: None,
+                direct_messages_topic_id: None,
+                method: &method,
+                source: "proxy",
+                text: capture.text.as_deref(),
+                payload: None,
+                status,
+                response_status,
+                error_summary: error_summary.as_deref(),
+                created_at: None,
+            },
+        )
+        .await
+        {
+            tracing::warn!(%bot_id, error = ?error, "could not record proxied outbound message");
+        }
+    });
 }
 
 fn outbound_capture(
@@ -485,6 +519,18 @@ async fn forward_file(
         .await
         .map_err(|error| AppError::Upstream(error.without_url().to_string()))?;
     stream_response(response.status(), response.headers().clone(), response)
+}
+
+pub(crate) async fn stream_authenticated_bot_file(
+    state: &AppState,
+    bot: &BotRecord,
+    file_path: &str,
+    range: Option<HeaderValue>,
+) -> Result<Response> {
+    let token = decrypt_token(state, bot)?;
+    let token = std::str::from_utf8(&token)
+        .map_err(|_| AppError::Crypto("invalid token encoding".into()))?;
+    forward_file(state, bot, token, file_path, range).await
 }
 
 async fn forward_data_plane_local_file(
@@ -1050,6 +1096,19 @@ pub async fn raw_telegram_json_for_dc(
     method: &str,
     payload: &Value,
 ) -> Result<(StatusCode, Value)> {
+    raw_telegram_json_for_dc_with_bypass(client, base, token, is_test_dc, method, payload, None)
+        .await
+}
+
+async fn raw_telegram_json_for_dc_with_bypass(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    is_test_dc: bool,
+    method: &str,
+    payload: &Value,
+    observation_bypass: Option<&str>,
+) -> Result<(StatusCode, Value)> {
     if !valid_method_name(method) {
         return Err(AppError::Validation("Invalid Telegram method name".into()));
     }
@@ -1060,9 +1119,11 @@ pub async fn raw_telegram_json_for_dc(
         telegram_environment_segment(is_test_dc),
         method
     );
-    let response = client
-        .post(url)
-        .json(payload)
+    let mut request = client.post(url).json(payload);
+    if let Some(secret) = observation_bypass {
+        request = request.header(OBSERVATION_BYPASS_HEADER, secret);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| AppError::Upstream(error.without_url().to_string()))?;
@@ -1083,6 +1144,27 @@ pub async fn telegram_json_for_bot(
     payload: &Value,
     source: &str,
 ) -> Result<Value> {
+    let (status, body) =
+        telegram_json_envelope_for_bot(state, bot, method, payload, source).await?;
+    let ok = body.get("ok").and_then(Value::as_bool);
+    if !status.is_success() || ok == Some(false) {
+        return Err(AppError::TelegramRejected(
+            body.get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Telegram rejected the request")
+                .to_owned(),
+        ));
+    }
+    Ok(body)
+}
+
+pub async fn telegram_json_envelope_for_bot(
+    state: &AppState,
+    bot: &BotRecord,
+    method: &str,
+    payload: &Value,
+    source: &str,
+) -> Result<(StatusCode, Value)> {
     if bot.data_plane_pool.is_none() && data_plane_request_fenced(state, bot.id).await {
         return Err(AppError::Conflict(
             "Bot API migration is in progress or requires recovery".into(),
@@ -1090,7 +1172,7 @@ pub async fn telegram_json_for_bot(
     }
     let started = Instant::now();
     let token = decrypt_token(state, bot)?;
-    let (status, body) = raw_telegram_json_for_dc(
+    let (status, body) = raw_telegram_json_for_dc_with_bypass(
         &state.telegram,
         bot_api_base(state, bot)?,
         std::str::from_utf8(&token)
@@ -1098,6 +1180,9 @@ pub async fn telegram_json_for_bot(
         bot.telegram_test_dc,
         method,
         payload,
+        (source == "bot_view" && bot.data_plane_pool.is_some())
+            .then_some(state.config.data_plane_sync_token.as_deref())
+            .flatten(),
     )
     .await?;
     let ok = body.get("ok").and_then(Value::as_bool);
@@ -1116,15 +1201,90 @@ pub async fn telegram_json_for_bot(
         error,
     )
     .await;
-    if !status.is_success() || ok == Some(false) {
-        return Err(AppError::Upstream(
-            body.get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Telegram rejected the request")
-                .to_owned(),
+    Ok((status, body))
+}
+
+/// Forward an already validated, streaming Bot View request to the bot's
+/// active Bot API pool. Request bytes are never retained by the control plane;
+/// only Telegram's small JSON result is decoded for the audit/timeline path.
+pub async fn telegram_raw_for_bot(
+    state: &AppState,
+    bot: &BotRecord,
+    method: &str,
+    content_type: HeaderValue,
+    body: reqwest::Body,
+    source: &str,
+) -> Result<(StatusCode, Value)> {
+    if !valid_method_name(method) {
+        return Err(AppError::Validation("Invalid Telegram method name".into()));
+    }
+    if bot.data_plane_pool.is_none() && data_plane_request_fenced(state, bot.id).await {
+        return Err(AppError::Conflict(
+            "Bot API migration is in progress or requires recovery".into(),
         ));
     }
-    Ok(body)
+    let started = Instant::now();
+    let token = decrypt_token(state, bot)?;
+    let url = format!(
+        "{}/bot{}/{}{}",
+        bot_api_base(state, bot)?.trim_end_matches('/'),
+        std::str::from_utf8(&token)
+            .map_err(|_| AppError::Crypto("invalid token encoding".into()))?,
+        telegram_environment_segment(bot.telegram_test_dc),
+        method
+    );
+    let mut request = state
+        .telegram
+        .post(url)
+        .header(header::CONTENT_TYPE, content_type)
+        // The shared client keeps short JSON calls bounded at 70 seconds, but
+        // Bot View streams legal 50MB cloud and 2GB local uploads through this
+        // request. Give uploads a request-specific deadline and never retry an
+        // ambiguous transport result.
+        .timeout(Duration::from_secs(60 * 60))
+        .body(body);
+    if source == "bot_view"
+        && bot.data_plane_pool.is_some()
+        && let Some(secret) = state.config.data_plane_sync_token.as_deref()
+    {
+        request = request.header(OBSERVATION_BYPASS_HEADER, secret);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| AppError::Upstream(error.without_url().to_string()))?;
+    let status = response.status();
+    const RESULT_LIMIT: usize = 8 * 1024 * 1024;
+    let mut response_stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response_stream.next().await {
+        let chunk = chunk.map_err(|error| AppError::Upstream(error.without_url().to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > RESULT_LIMIT {
+            return Err(AppError::Upstream(
+                "Telegram response exceeded the safe result limit".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let payload: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Upstream("Telegram returned an invalid response".into()))?;
+    let ok = payload.get("ok").and_then(Value::as_bool);
+    let error = payload
+        .get("description")
+        .and_then(Value::as_str)
+        .map(truncate_error);
+    record_api_call(
+        state,
+        bot.id,
+        method,
+        source,
+        Some(status.as_u16() as i32),
+        ok,
+        started.elapsed(),
+        error,
+    )
+    .await;
+    Ok((status, payload))
 }
 
 fn telegram_environment_segment(is_test_dc: bool) -> &'static str {
@@ -1142,7 +1302,20 @@ async fn record_api_call(
     elapsed: Duration,
     error: Option<String>,
 ) {
-    let result = sqlx::query(
+    let Ok(permit) = state
+        .api_call_observation_budget
+        .clone()
+        .try_acquire_owned()
+    else {
+        tracing::warn!(%bot_id, %method, "dropping API-call observation: budget is full");
+        return;
+    };
+    let db = state.db.clone();
+    let method = method.to_owned();
+    let source = source.to_owned();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = sqlx::query(
         r#"WITH inserted AS (
                INSERT INTO api_calls
                       (bot_id, method, source, http_status, telegram_ok, latency_ms, error_summary, expires_at)
@@ -1154,30 +1327,45 @@ async fn record_api_call(
            UPDATE bots SET last_api_call_at = now(), updated_at = now() WHERE id = $1"#,
     )
     .bind(bot_id)
-    .bind(method)
-    .bind(source)
+    .bind(&method)
+    .bind(&source)
     .bind(http_status)
     .bind(telegram_ok)
     .bind(elapsed.as_millis().min(i32::MAX as u128) as i32)
     .bind(error)
-    .execute(&state.db)
+    .execute(&db)
     .await;
-    if let Err(error) = result {
-        tracing::warn!(bot_id = %bot_id, error = ?error, "could not record API call");
-    }
+        if let Err(error) = result {
+            tracing::warn!(bot_id = %bot_id, error = ?error, "could not record API call");
+        }
+    });
 }
 
 pub struct OutboundMessageRecord<'a> {
     pub bot_id: Uuid,
     pub user_id: Option<Uuid>,
+    pub conversation_id: Option<Uuid>,
     pub chat_id: i64,
     pub telegram_message_id: Option<i64>,
+    pub receiver_user_id: Option<i64>,
+    pub ephemeral_message_id: Option<i64>,
+    /// Stable data-plane event identity used to make retried telemetry batches
+    /// idempotent. Direct and Bot View sends leave this unset.
+    pub observation_key: Option<&'a str>,
+    pub business_connection_id: Option<&'a str>,
+    pub guest_query_id: Option<&'a str>,
+    pub message_thread_id: Option<i64>,
+    pub direct_messages_topic_id: Option<i64>,
     pub method: &'a str,
     pub source: &'a str,
     pub text: Option<&'a str>,
+    /// Sanitized Telegram Message result. This must never contain a bot token
+    /// or a resolved Telegram file_path.
+    pub payload: Option<&'a Value>,
     pub status: &'a str,
     pub response_status: Option<i32>,
     pub error_summary: Option<&'a str>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 pub async fn record_outbound_message(
@@ -1185,16 +1373,83 @@ pub async fn record_outbound_message(
     message: OutboundMessageRecord<'_>,
 ) -> Result<()> {
     let mut tx = state.db.begin().await?;
-    let stored = sqlx::query_as::<_, (String, Option<String>, DateTime<Utc>)>(
+    let context = outbound_message_context(&message);
+    let conversation_id = if let Some(conversation_id) = message.conversation_id {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM conversations WHERE id = $1 AND bot_id = $2")
+            .bind(conversation_id)
+            .bind(message.bot_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"INSERT INTO conversations
+                   (bot_id, chat_id, business_connection_id, guest_query_id,
+                    message_thread_id, direct_messages_topic_id, receiver_user_id,
+                    chat_type, title, username, display_name, last_message_preview,
+                    last_update_at, expires_at)
+               SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                      COALESCE($11, 'Chat ' || $2::text), NULL, now(),
+                      now() + make_interval(days => bot_effective_retention_days(bots.id))
+                 FROM bots WHERE bots.id = $1
+               ON CONFLICT ON CONSTRAINT conversations_identity_unique DO UPDATE SET
+                   chat_type = COALESCE(EXCLUDED.chat_type, conversations.chat_type),
+                   title = COALESCE(EXCLUDED.title, conversations.title),
+                   username = COALESCE(EXCLUDED.username, conversations.username),
+                   display_name = CASE
+                       WHEN EXCLUDED.display_name IS NOT NULL THEN EXCLUDED.display_name
+                       ELSE conversations.display_name
+                   END,
+                   last_update_at = GREATEST(conversations.last_update_at, EXCLUDED.last_update_at),
+                   expires_at = GREATEST(conversations.expires_at, EXCLUDED.expires_at)
+               RETURNING id"#,
+        )
+        .bind(message.bot_id)
+        .bind(context.chat_id)
+        .bind(context.business_connection_id.as_deref())
+        .bind(context.guest_query_id.as_deref())
+        .bind(context.message_thread_id)
+        .bind(context.direct_messages_topic_id)
+        .bind(context.receiver_user_id)
+        .bind(context.chat_type.as_deref())
+        .bind(context.title.as_deref())
+        .bind(context.username.as_deref())
+        .bind(context.display_name.as_deref())
+        .fetch_one(&mut *tx)
+        .await?
+    };
+    let dedupe_key = message
+        .telegram_message_id
+        .filter(|message_id| *message_id != 0)
+        .map(|message_id| {
+            format!(
+                "message:{}:{}:{}",
+                message.bot_id, conversation_id, message_id
+            )
+        })
+        .or_else(|| message.observation_key.map(str::to_owned));
+    let stored = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<Value>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ),
+    >(
         r#"INSERT INTO outbound_messages
-               (bot_id, user_id, chat_id, telegram_message_id, method, source, text, status,
-                response_status, error_summary, expires_at)
-           SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                  now() + make_interval(days => bot_effective_retention_days(bots.id))
+               (bot_id, user_id, conversation_id, chat_id, telegram_message_id,
+                receiver_user_id, ephemeral_message_id, method, source, text, payload,
+                status, response_status, error_summary, dedupe_key, created_at, expires_at)
+           SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                  $15, COALESCE($16, now()),
+                  COALESCE($16, now()) + make_interval(days => bot_effective_retention_days(bots.id))
              FROM bots
             WHERE bots.id = $1
-           ON CONFLICT (bot_id, chat_id, telegram_message_id)
-               WHERE telegram_message_id IS NOT NULL
+           ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL
            DO UPDATE SET
                user_id = COALESCE(EXCLUDED.user_id, outbound_messages.user_id),
                source = CASE
@@ -1211,6 +1466,11 @@ pub async fn record_outbound_message(
                    THEN COALESCE(EXCLUDED.text, outbound_messages.text)
                    ELSE outbound_messages.text
                END,
+               payload = CASE
+                   WHEN EXCLUDED.created_at > outbound_messages.created_at
+                   THEN COALESCE(EXCLUDED.payload, outbound_messages.payload)
+                   ELSE outbound_messages.payload
+               END,
                status = CASE
                    WHEN EXCLUDED.created_at > outbound_messages.created_at
                    THEN EXCLUDED.status ELSE outbound_messages.status
@@ -1224,43 +1484,86 @@ pub async fn record_outbound_message(
                    WHEN EXCLUDED.created_at > outbound_messages.created_at
                    THEN EXCLUDED.error_summary ELSE outbound_messages.error_summary
                END,
+               dedupe_key = COALESCE(
+                   outbound_messages.dedupe_key,
+                   EXCLUDED.dedupe_key
+               ),
                created_at = GREATEST(outbound_messages.created_at, EXCLUDED.created_at),
                expires_at = GREATEST(outbound_messages.expires_at, EXCLUDED.expires_at)
-           RETURNING source, text, created_at"#,
+           RETURNING id, method, source, text, payload, created_at, expires_at"#,
     )
     .bind(message.bot_id)
     .bind(message.user_id)
+    .bind(conversation_id)
     .bind(message.chat_id)
     .bind(message.telegram_message_id)
+    .bind(message.receiver_user_id)
+    .bind(message.ephemeral_message_id)
     .bind(message.method)
     .bind(message.source)
     .bind(message.text)
+    .bind(message.payload)
     .bind(message.status)
     .bind(message.response_status)
     .bind(message.error_summary.map(truncate_error))
+    .bind(dedupe_key.as_deref())
+    .bind(message.created_at)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some((source, Some(text), created_at)) = stored {
+    if let Some((outbound_id, method, _source, text, payload, created_at, expires_at)) = &stored {
+        sqlx::query(
+            r#"INSERT INTO conversation_events
+                   (bot_id, conversation_id, direction, event_type, source_table,
+                    source_id, telegram_message_id, receiver_user_id,
+                    ephemeral_message_id, text, status, payload, created_at, expires_at)
+               VALUES ($1, $2, 'outgoing', $3, 'outbound_messages', $4, $5, $6,
+                       $7, $8, $9, $10, $11, $12)
+               ON CONFLICT (source_table, source_id) WHERE source_id IS NOT NULL
+               DO UPDATE SET
+                   id = nextval(pg_get_serial_sequence('conversation_events', 'id')),
+                   conversation_id = EXCLUDED.conversation_id,
+                   event_type = EXCLUDED.event_type,
+                   telegram_message_id = EXCLUDED.telegram_message_id,
+                   receiver_user_id = EXCLUDED.receiver_user_id,
+                   ephemeral_message_id = EXCLUDED.ephemeral_message_id,
+                   text = EXCLUDED.text,
+                   status = EXCLUDED.status,
+                   payload = EXCLUDED.payload,
+                   created_at = EXCLUDED.created_at,
+                   expires_at = EXCLUDED.expires_at"#,
+        )
+        .bind(message.bot_id)
+        .bind(conversation_id)
+        .bind(method)
+        .bind(outbound_id)
+        .bind(message.telegram_message_id)
+        .bind(message.receiver_user_id)
+        .bind(message.ephemeral_message_id)
+        .bind(text)
+        .bind(message.status)
+        .bind(payload)
+        .bind(created_at)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some((_, _, source, Some(text), _, created_at, _)) = stored {
         let actor = if source == "bot_view" { "You" } else { "Bot" };
         let preview = format!("{actor}: {}", text.chars().take(170).collect::<String>());
         sqlx::query(
-            r#"INSERT INTO conversations
-                   (bot_id, chat_id, display_name, last_message_preview, last_update_at, expires_at)
-               SELECT bots.id, $2, $3, $4, $5,
-                      $5 + make_interval(days => bot_effective_retention_days(bots.id))
-                 FROM bots
-                WHERE bots.id = $1
-               ON CONFLICT (bot_id, chat_id) DO UPDATE SET
-                   last_message_preview = CASE
-                       WHEN EXCLUDED.last_update_at >= conversations.last_update_at
-                       THEN EXCLUDED.last_message_preview
-                       ELSE conversations.last_message_preview
-                   END,
-                   last_update_at = GREATEST(conversations.last_update_at, EXCLUDED.last_update_at),
-                   expires_at = GREATEST(conversations.expires_at, EXCLUDED.expires_at)"#,
+            r#"UPDATE conversations
+                  SET display_name = COALESCE(display_name, $2),
+                      last_message_preview = CASE
+                          WHEN $4 >= last_update_at THEN $3 ELSE last_message_preview
+                      END,
+                      last_update_at = GREATEST(last_update_at, $4),
+                      expires_at = GREATEST(
+                          expires_at,
+                          $4 + make_interval(days => bot_effective_retention_days(bot_id))
+                      )
+                WHERE id = $1"#,
         )
-        .bind(message.bot_id)
-        .bind(message.chat_id)
+        .bind(conversation_id)
         .bind(format!("Chat {}", message.chat_id))
         .bind(preview)
         .bind(created_at)
@@ -1269,6 +1572,82 @@ pub async fn record_outbound_message(
     }
     tx.commit().await?;
     Ok(())
+}
+
+struct OutboundMessageContext {
+    chat_id: i64,
+    business_connection_id: Option<String>,
+    guest_query_id: Option<String>,
+    message_thread_id: Option<i64>,
+    direct_messages_topic_id: Option<i64>,
+    receiver_user_id: Option<i64>,
+    chat_type: Option<String>,
+    title: Option<String>,
+    username: Option<String>,
+    display_name: Option<String>,
+}
+
+fn outbound_message_context(record: &OutboundMessageRecord<'_>) -> OutboundMessageContext {
+    let message = record.payload.unwrap_or(&Value::Null);
+    let peer_receiver = record
+        .ephemeral_message_id
+        .and_then(|_| {
+            message
+                .pointer("/receiver_user/id")
+                .or_else(|| message.pointer("/receiver/id"))
+                .and_then(Value::as_i64)
+        })
+        .or(record.receiver_user_id);
+    let chat = message.get("chat");
+    let first_name = chat
+        .and_then(|chat| chat.get("first_name"))
+        .and_then(Value::as_str);
+    let last_name = chat
+        .and_then(|chat| chat.get("last_name"))
+        .and_then(Value::as_str);
+    OutboundMessageContext {
+        chat_id: message
+            .pointer("/chat/id")
+            .and_then(Value::as_i64)
+            .unwrap_or(record.chat_id),
+        business_connection_id: message
+            .get("business_connection_id")
+            .and_then(Value::as_str)
+            .or(record.business_connection_id)
+            .map(str::to_owned),
+        guest_query_id: message
+            .get("guest_query_id")
+            .and_then(Value::as_str)
+            .or(record.guest_query_id)
+            .map(str::to_owned),
+        message_thread_id: message
+            .get("message_thread_id")
+            .and_then(Value::as_i64)
+            .or(record.message_thread_id),
+        direct_messages_topic_id: message
+            .pointer("/direct_messages_topic/topic_id")
+            .or_else(|| message.pointer("/direct_messages_topic/id"))
+            .and_then(Value::as_i64)
+            .or(record.direct_messages_topic_id),
+        receiver_user_id: peer_receiver,
+        chat_type: chat
+            .and_then(|chat| chat.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        title: chat
+            .and_then(|chat| chat.get("title"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        username: chat
+            .and_then(|chat| chat.get("username"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        display_name: match (first_name, last_name) {
+            (Some(first), Some(last)) => Some(format!("{first} {last}")),
+            (Some(first), None) => Some(first.to_owned()),
+            _ => None,
+        },
+    }
 }
 
 fn truncate_error(value: &str) -> String {
@@ -2745,9 +3124,10 @@ fn managed_sync_error_code(error: &AppError) -> &'static str {
         AppError::GatewayDrainPending => "gateway_draining",
         AppError::Unauthorized | AppError::Forbidden | AppError::NotFound => "manager_unavailable",
         AppError::Config(_) | AppError::Internal => "internal_error",
-        AppError::Upstream(_) | AppError::RateLimited | AppError::PlanLimit(_) => {
-            "telegram_unavailable"
-        }
+        AppError::Upstream(_)
+        | AppError::TelegramRejected(_)
+        | AppError::RateLimited
+        | AppError::PlanLimit(_) => "telegram_unavailable",
     }
 }
 

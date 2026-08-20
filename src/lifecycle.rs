@@ -2025,7 +2025,7 @@ fn lifecycle_error_code(error: &AppError) -> &'static str {
     match error {
         AppError::Database(_) => "database_unavailable",
         AppError::GatewayDrainPending => "gateway_draining",
-        AppError::Upstream(_) => "telegram_or_gateway_unavailable",
+        AppError::Upstream(_) | AppError::TelegramRejected(_) => "telegram_or_gateway_unavailable",
         AppError::Validation(_) => "unsupported_webhook",
         AppError::Conflict(_) => "lifecycle_conflict",
         AppError::Crypto(_) => "credential_unavailable",

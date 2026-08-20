@@ -79,9 +79,15 @@ pub struct ActivitySummary {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct ConversationSummary {
+    pub id: Uuid,
     pub chat_id: i64,
+    pub business_connection_id: Option<String>,
+    pub guest_query_id: Option<String>,
+    pub message_thread_id: Option<i64>,
+    pub direct_messages_topic_id: Option<i64>,
+    pub receiver_user_id: Option<i64>,
     pub chat_type: Option<String>,
     pub title: Option<String>,
     pub username: Option<String>,

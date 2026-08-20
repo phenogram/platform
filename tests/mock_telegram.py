@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -25,6 +27,7 @@ STATE: dict[str, object] = {
     "gateway_official_fenced": True,
     "gateway_official_active_requests": {"standard": 0, "local": 0},
     "drain_requests": [],
+    "next_message_id": 9001,
 }
 BOT_PATH = re.compile(r"^/bot([^/]+)/(test/)?([^/]+)$")
 FILE_PATH = re.compile(r"^/file/bot([^/]+)/(test/)?(.+)$")
@@ -133,6 +136,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["gateway_official_fenced"] = True
             STATE["gateway_official_active_requests"] = {"standard": 0, "local": 0}
             STATE["drain_requests"] = []
+            STATE["next_message_id"] = 9001
             self.respond(200, {"ok": True})
             return
         if path == "/__fail_next_logout":
@@ -310,12 +314,116 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         elif normalized == "sendmessage":
-            result = {
-                "message_id": 9001,
-                "date": 1_786_620_000,
-                "chat": {"id": int(params.get("chat_id", 0)), "type": "private"},
-                "text": params.get("text", ""),
+            result = self.message_result(params, text=str(params.get("text", "")))
+        elif normalized in {
+            "sendphoto",
+            "sendaudio",
+            "senddocument",
+            "sendvideo",
+            "sendanimation",
+            "sendvoice",
+            "sendvideonote",
+            "sendsticker",
+        }:
+            media_key = normalized.removeprefix("send")
+            telegram_key = {"videonote": "video_note"}.get(media_key, media_key)
+            media = {
+                "file_id": f"{telegram_key}-file-1",
+                "file_unique_id": f"{telegram_key}-unique-1",
+                "file_size": 21,
             }
+            if telegram_key in {"photo", "video", "animation", "video_note", "sticker"}:
+                media.update({"width": 640, "height": 480})
+            if telegram_key in {"video", "animation", "video_note", "audio", "voice"}:
+                media["duration"] = 2
+            result = self.message_result(
+                params,
+                caption=str(params.get("caption", "")) or None,
+                **({"photo": [media]} if telegram_key == "photo" else {telegram_key: media}),
+            )
+        elif normalized == "sendmediagroup":
+            media = params.get("media", [])
+            if isinstance(media, str):
+                media = json.loads(media)
+            result = []
+            for index, item in enumerate(media if isinstance(media, list) else []):
+                media_type = str(item.get("type", "document"))
+                descriptor = {
+                    "file_id": f"{media_type}-album-{index + 1}",
+                    "file_unique_id": f"{media_type}-album-unique-{index + 1}",
+                    "file_size": 21,
+                }
+                if media_type in {"photo", "video"}:
+                    descriptor.update({"width": 640, "height": 480})
+                result.append(
+                    self.message_result(
+                        params,
+                        caption=item.get("caption"),
+                        media_group_id="album-e2e",
+                        **({"photo": [descriptor]} if media_type == "photo" else {media_type: descriptor}),
+                    )
+                )
+        elif normalized == "editmessagetext":
+            result = self.message_result(
+                params,
+                message_id=int(params.get("message_id", 0)),
+                text=str(params.get("text", "")),
+                edit_date=1_786_620_100,
+            )
+        elif normalized == "editmessagecaption":
+            result = self.message_result(
+                params,
+                message_id=int(params.get("message_id", 0)),
+                caption=str(params.get("caption", "")),
+                edit_date=1_786_620_100,
+            )
+        elif normalized == "sendpoll":
+            options = params.get("options", [])
+            if isinstance(options, str):
+                options = json.loads(options)
+            result = self.message_result(
+                params,
+                poll={
+                    "id": "poll-e2e",
+                    "question": params.get("question", "Question"),
+                    "options": [
+                        {"text": option.get("text", ""), "voter_count": 0}
+                        for option in options
+                    ],
+                    "total_voter_count": 0,
+                    "is_closed": False,
+                    "is_anonymous": bool(params.get("is_anonymous", True)),
+                    "type": "regular",
+                    "allows_multiple_answers": bool(params.get("allows_multiple_answers", False)),
+                },
+            )
+        elif normalized == "sendlocation":
+            result = self.message_result(
+                params,
+                location={
+                    "latitude": float(params.get("latitude", 0)),
+                    "longitude": float(params.get("longitude", 0)),
+                },
+            )
+        elif normalized == "sendcontact":
+            result = self.message_result(
+                params,
+                contact={
+                    "phone_number": params.get("phone_number", ""),
+                    "first_name": params.get("first_name", ""),
+                },
+            )
+        elif normalized == "senddice":
+            result = self.message_result(
+                params,
+                dice={"emoji": params.get("emoji", "🎲"), "value": 6},
+            )
+        elif normalized in {
+            "deleteMessage".lower(),
+            "setMessageReaction".lower(),
+            "sendChatAction".lower(),
+        }:
+            result = True
         elif normalized == "getfile":
             if params.get("file_id") == "native-local-file":
                 native_directory = f"{token}:T" if test_dc else token
@@ -354,14 +462,76 @@ class Handler(BaseHTTPRequestHandler):
 
     def params(self, query: str) -> dict[str, object]:
         values: dict[str, object] = {key: item[-1] for key, item in parse_qs(query).items()}
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length) if length else b""
+        body = self.read_body()
         content_type = self.headers.get("Content-Type", "")
         if body and content_type.startswith("application/json"):
             values.update(json.loads(body))
         elif body and content_type.startswith("application/x-www-form-urlencoded"):
             values.update({key: item[-1] for key, item in parse_qs(body.decode()).items()})
+        elif body and content_type.startswith("multipart/form-data"):
+            message = BytesParser(policy=email_policy).parsebytes(
+                b"Content-Type: "
+                + content_type.encode()
+                + b"\r\nMIME-Version: 1.0\r\n\r\n"
+                + body
+            )
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if not name:
+                    continue
+                payload = part.get_payload(decode=True) or b""
+                filename = part.get_filename()
+                if filename:
+                    values[name] = {
+                        "filename": filename,
+                        "content_type": part.get_content_type(),
+                        "size": len(payload),
+                    }
+                else:
+                    values[name] = payload.decode("utf-8")
         return values
+
+    def read_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
+            length = int(self.headers.get("Content-Length", "0"))
+            return self.rfile.read(length) if length else b""
+        chunks: list[bytes] = []
+        while True:
+            line = self.rfile.readline().strip().split(b";", 1)[0]
+            if not line:
+                continue
+            size = int(line, 16)
+            if size == 0:
+                while self.rfile.readline() not in {b"\r\n", b"\n", b""}:
+                    pass
+                return b"".join(chunks)
+            chunks.append(self.rfile.read(size))
+            self.rfile.read(2)
+
+    def message_result(
+        self,
+        params: dict[str, object],
+        *,
+        message_id: int | None = None,
+        **fields: object,
+    ) -> dict[str, object]:
+        if message_id is None:
+            message_id = int(STATE["next_message_id"])
+            STATE["next_message_id"] = message_id + 1
+        result: dict[str, object] = {
+            "message_id": message_id,
+            "date": 1_786_620_000,
+            "chat": {"id": int(params.get("chat_id", 0)), "type": "private"},
+        }
+        for name in (
+            "business_connection_id",
+            "message_thread_id",
+            "direct_messages_topic_id",
+        ):
+            if name in params:
+                result[name] = params[name]
+        result.update({key: value for key, value in fields.items() if value is not None})
+        return result
 
     def respond(self, status: int, payload: object) -> None:
         data = json.dumps(payload).encode()
@@ -389,5 +559,6 @@ if __name__ == "__main__":
     STATE["gateway_official_fenced"] = True
     STATE["gateway_official_active_requests"] = {"standard": 0, "local": 0}
     STATE["drain_requests"] = []
+    STATE["next_message_id"] = 9001
     port = int(os.environ.get("MOCK_TELEGRAM_PORT", "18081"))
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

@@ -56,6 +56,16 @@ async fn sweep(state: &AppState) -> crate::error::Result<()> {
            )"#,
     )
     .await?;
+    let conversation_events = drain_expired(
+        &state.db,
+        r#"DELETE FROM conversation_events WHERE id IN (
+               SELECT id FROM conversation_events
+                WHERE expires_at <= now()
+                ORDER BY expires_at, id
+                LIMIT $1
+           )"#,
+    )
+    .await?;
     let api_calls = drain_expired(
         &state.db,
         r#"DELETE FROM api_calls WHERE id IN (
@@ -68,10 +78,10 @@ async fn sweep(state: &AppState) -> crate::error::Result<()> {
     .await?;
     let conversations = drain_expired(
         &state.db,
-        r#"DELETE FROM conversations WHERE (bot_id, chat_id) IN (
-               SELECT bot_id, chat_id FROM conversations
+        r#"DELETE FROM conversations WHERE id IN (
+               SELECT id FROM conversations
                 WHERE expires_at <= now()
-                ORDER BY expires_at, bot_id, chat_id
+                ORDER BY expires_at, id
                 LIMIT $1
            )"#,
     )
@@ -87,13 +97,21 @@ async fn sweep(state: &AppState) -> crate::error::Result<()> {
     )
     .await?;
 
-    if updates + sessions + outbound_messages + api_calls + conversations + audit_logs + recovered
+    if updates
+        + sessions
+        + outbound_messages
+        + conversation_events
+        + api_calls
+        + conversations
+        + audit_logs
+        + recovered
         > 0
     {
         tracing::info!(
             updates,
             sessions,
             outbound_messages,
+            conversation_events,
             api_calls,
             conversations,
             audit_logs,

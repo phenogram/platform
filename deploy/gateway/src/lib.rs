@@ -42,11 +42,20 @@ const MAX_BYTE_RANGES: usize = 16;
 const OFFICIAL_MAX_REQUEST_HEAD_BYTES: usize = 1 << 18;
 const MAX_DRAIN_REQUEST_BYTES: usize = 1024;
 const MAX_OFFICIAL_DRAIN_RESPONSE_BYTES: usize = 1024;
+// Response observation is byte-bounded and fail-open. This accommodates the
+// largest legal Bot API 10.2 Message/RichMessage result while the upstream
+// response itself is always streamed unchanged.
 const MAX_OUTBOUND_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_OUTBOUND_PAYLOAD_BYTES: usize = 448 * 1024;
+const MAX_OUTBOUND_PAYLOAD_DEPTH: usize = 64;
+const MAX_OUTBOUND_OBJECT_FIELDS: usize = 512;
+const MAX_OUTBOUND_ARRAY_ITEMS: usize = 512;
 const MAX_CONCURRENT_OUTBOUND_OBSERVATIONS: usize = 8;
-const MAX_TELEMETRY_BATCH_BYTES: usize = 60 * 1024;
+const MAX_TELEMETRY_BATCH_BYTES: usize = 512 * 1024;
+const MAX_TELEMETRY_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TELEMETRY_QUEUE_EVENTS: usize = 1024;
 const ROUTE_GENERATION_HEADER: &str = "x-phenogram-route-generation";
+const OBSERVATION_BYPASS_HEADER: &str = "x-phenogram-observation-bypass";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -191,6 +200,7 @@ pub struct GatewayState {
     in_flight: Arc<Mutex<HashMap<String, usize>>>,
     ready: Arc<AtomicBool>,
     telemetry: tokio::sync::mpsc::Sender<TelemetryEvent>,
+    telemetry_byte_budget: Arc<tokio::sync::Semaphore>,
     telemetry_metrics: Arc<TelemetryMetrics>,
     outbound_observation_slots: Arc<tokio::sync::Semaphore>,
     outbound_observation_clock_us: Arc<AtomicU64>,
@@ -227,6 +237,7 @@ impl GatewayState {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             ready: Arc::new(AtomicBool::new(false)),
             telemetry,
+            telemetry_byte_budget: Arc::new(tokio::sync::Semaphore::new(MAX_TELEMETRY_QUEUE_BYTES)),
             telemetry_metrics: Arc::new(TelemetryMetrics::default()),
             outbound_observation_slots: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_OUTBOUND_OBSERVATIONS,
@@ -348,7 +359,25 @@ impl GatewayState {
         self.routes.read().map_or(0, |routes| routes.generation)
     }
 
-    fn record_telemetry(&self, event: TelemetryEvent) {
+    fn record_telemetry(&self, mut event: TelemetryEvent) {
+        let event_bytes = telemetry_event_json_len(&event).saturating_add(1);
+        let Ok(event_bytes) = u32::try_from(event_bytes) else {
+            self.telemetry_metrics
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let Ok(permit) = self
+            .telemetry_byte_budget
+            .clone()
+            .try_acquire_many_owned(event_bytes)
+        else {
+            self.telemetry_metrics
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        event.set_queue_permit(permit);
         match self.telemetry.try_send(event) {
             Ok(()) => {
                 self.telemetry_metrics
@@ -663,14 +692,23 @@ struct TelemetryMetrics {
     delivery_failed: AtomicU64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum TelemetryEvent {
     ApiCall(ApiCallTelemetryEvent),
-    OutboundMessage(OutboundMessageTelemetryEvent),
+    OutboundMessage(Box<OutboundMessageTelemetryEvent>),
 }
 
-#[derive(Clone, Debug, Serialize)]
+impl TelemetryEvent {
+    fn set_queue_permit(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        match self {
+            Self::ApiCall(event) => event._queue_permit = Some(permit),
+            Self::OutboundMessage(event) => event._queue_permit = Some(permit),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct ApiCallTelemetryEvent {
     schema_version: u32,
     token_lookup_hash: String,
@@ -679,9 +717,11 @@ pub struct ApiCallTelemetryEvent {
     upstream_status: u16,
     latency_ms: u64,
     observed_at_unix_ms: u64,
+    #[serde(skip)]
+    _queue_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct OutboundMessageTelemetryEvent {
     schema_version: u32,
     kind: &'static str,
@@ -691,17 +731,26 @@ pub struct OutboundMessageTelemetryEvent {
     upstream_status: u16,
     observed_at_unix_us: u64,
     message: ObservedOutboundMessage,
+    #[serde(skip)]
+    _queue_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ObservedOutboundMessage {
     chat_id: i64,
-    telegram_message_id: i64,
+    telegram_message_id: Option<i64>,
+    receiver_user_id: Option<i64>,
+    ephemeral_message_id: Option<i64>,
+    business_connection_id: Option<String>,
+    guest_query_id: Option<String>,
+    message_thread_id: Option<i64>,
+    direct_messages_topic_id: Option<i64>,
     text: Option<String>,
     chat_type: Option<String>,
     title: Option<String>,
     username: Option<String>,
     display_name: Option<String>,
+    payload: Option<Box<serde_json::Value>>,
 }
 
 struct OutboundObservation {
@@ -713,9 +762,9 @@ struct OutboundObservation {
 }
 
 #[derive(Serialize)]
-struct TelemetryBatch {
+struct TelemetryBatch<'a> {
     schema_version: u32,
-    events: Vec<TelemetryEvent>,
+    events: &'a [TelemetryEvent],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -905,30 +954,42 @@ pub async fn telemetry_delivery_loop(
             }
         }
         let count = events.len() as u64;
-        let result = state
-            .client
-            .post(config.telemetry_url.clone())
-            .bearer_auth(&config.sync_token)
-            .timeout(Duration::from_secs(2))
-            .json(&TelemetryBatch {
-                schema_version: 1,
-                events,
-            })
-            .send()
-            .await;
-        match result {
-            Ok(response) if response.status().is_success() => {
-                state
-                    .telemetry_metrics
-                    .delivered
-                    .fetch_add(count, Ordering::Relaxed);
+        let mut retry_delay = Duration::from_millis(100);
+        loop {
+            let result = state
+                .client
+                .post(config.telemetry_url.clone())
+                .bearer_auth(&config.sync_token)
+                .timeout(Duration::from_secs(2))
+                .json(&TelemetryBatch {
+                    schema_version: 1,
+                    events: &events,
+                })
+                .send()
+                .await;
+            let retryable = match result {
+                Ok(response) if response.status().is_success() => {
+                    state
+                        .telemetry_metrics
+                        .delivered
+                        .fetch_add(count, Ordering::Relaxed);
+                    break;
+                }
+                Ok(response) => {
+                    response.status() == StatusCode::TOO_MANY_REQUESTS
+                        || response.status().is_server_error()
+                }
+                Err(_) => true,
+            };
+            state
+                .telemetry_metrics
+                .delivery_failed
+                .fetch_add(count, Ordering::Relaxed);
+            if !retryable {
+                break;
             }
-            _ => {
-                state
-                    .telemetry_metrics
-                    .delivery_failed
-                    .fetch_add(count, Ordering::Relaxed);
-            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
         }
     }
 }
@@ -1045,6 +1106,11 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
     let upstream_url = format!("{upstream}{path_and_query}");
 
     let (parts, body) = request.into_parts();
+    let suppress_outbound_observation = valid_secret_header(
+        &parts.headers,
+        OBSERVATION_BYPASS_HEADER,
+        &state.sync_token_digest,
+    );
     let mut builder = state.client.request(parts.method, upstream_url);
     let connection_headers = connection_nominated_headers(&parts.headers);
     for (name, value) in &parts.headers {
@@ -1052,6 +1118,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
             && !connection_headers.contains(name)
             && name != header::HOST
             && name.as_str() != ROUTE_GENERATION_HEADER
+            && name.as_str() != OBSERVATION_BYPASS_HEADER
         {
             builder = builder.header(name, value);
         }
@@ -1086,7 +1153,9 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response 
         status,
         started.elapsed(),
     ));
-    let observation = state.admit_outbound_observation(token_lookup_hash, pool, method, status);
+    let observation = (!suppress_outbound_observation)
+        .then(|| state.admit_outbound_observation(token_lookup_hash, pool, method, status))
+        .flatten();
     let expected_body_bytes = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok());
@@ -1258,7 +1327,21 @@ fn valid_internal_authorization(headers: &HeaderMap, expected_digest: &[u8; 32])
     else {
         return false;
     };
-    let presented: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+    secret_matches_digest(value.as_bytes(), expected_digest)
+}
+
+fn valid_secret_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    expected_digest: &[u8; 32],
+) -> bool {
+    headers
+        .get(name)
+        .is_some_and(|value| secret_matches_digest(value.as_bytes(), expected_digest))
+}
+
+fn secret_matches_digest(value: &[u8], expected_digest: &[u8; 32]) -> bool {
+    let presented: [u8; 32] = Sha256::digest(value).into();
     presented
         .iter()
         .zip(expected_digest)
@@ -2034,6 +2117,7 @@ fn telemetry_event(
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64,
+        _queue_permit: None,
     })
 }
 
@@ -2042,7 +2126,7 @@ fn outbound_telemetry_event(
     observed_at_unix_us: u64,
     message: ObservedOutboundMessage,
 ) -> TelemetryEvent {
-    TelemetryEvent::OutboundMessage(OutboundMessageTelemetryEvent {
+    let mut event = TelemetryEvent::OutboundMessage(Box::new(OutboundMessageTelemetryEvent {
         schema_version: 1,
         kind: "outbound_message",
         token_lookup_hash: observation.token_lookup_hash.clone(),
@@ -2051,7 +2135,17 @@ fn outbound_telemetry_event(
         upstream_status: observation.upstream_status,
         observed_at_unix_us,
         message,
-    })
+        _queue_permit: None,
+    }));
+    // A rich payload is optional observation data. If duplicating text and
+    // metadata would make a single event exceed the bounded delivery batch,
+    // keep the compact message identity instead of growing the queue.
+    if telemetry_event_json_len(&event) > MAX_TELEMETRY_BATCH_BYTES.saturating_sub(64)
+        && let TelemetryEvent::OutboundMessage(event) = &mut event
+    {
+        event.message.payload = None;
+    }
+    event
 }
 
 fn outbound_messages_from_response(body: &[u8]) -> Vec<ObservedOutboundMessage> {
@@ -2076,14 +2170,34 @@ fn outbound_messages_from_response(body: &[u8]) -> Vec<ObservedOutboundMessage> 
 }
 
 fn observed_outbound_message(value: &serde_json::Value) -> Option<ObservedOutboundMessage> {
-    let telegram_message_id = value.get("message_id")?.as_i64()?;
-    let chat = value.get("chat")?.as_object()?;
-    let chat_id = chat.get("id")?.as_i64()?;
-    if telegram_message_id <= 0 || chat_id == 0 {
+    let telegram_message_id = value.get("message_id").and_then(serde_json::Value::as_i64);
+    if telegram_message_id.is_some_and(|message_id| message_id < 0) {
         return None;
     }
-    let first_name = chat.get("first_name").and_then(serde_json::Value::as_str);
-    let last_name = chat.get("last_name").and_then(serde_json::Value::as_str);
+    let receiver_user_id = value
+        .pointer("/receiver_user/id")
+        .or_else(|| value.pointer("/receiver/id"))
+        .and_then(serde_json::Value::as_i64);
+    let ephemeral_message_id = value
+        .get("ephemeral_message_id")
+        .and_then(serde_json::Value::as_i64);
+    let chat = value.get("chat").and_then(serde_json::Value::as_object);
+    let chat_id = chat
+        .and_then(|chat| chat.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|chat_id| *chat_id != 0)
+        .or(receiver_user_id)?;
+    let durable_message = telegram_message_id.is_some_and(|message_id| message_id > 0);
+    let ephemeral_message = receiver_user_id.is_some() && ephemeral_message_id.is_some();
+    if !durable_message && !ephemeral_message {
+        return None;
+    }
+    let first_name = chat
+        .and_then(|chat| chat.get("first_name"))
+        .and_then(serde_json::Value::as_str);
+    let last_name = chat
+        .and_then(|chat| chat.get("last_name"))
+        .and_then(serde_json::Value::as_str);
     let display_name = match (first_name, last_name) {
         (Some(first), Some(last)) => Some(format!("{first} {last}")),
         (Some(first), None) => Some(first.to_owned()),
@@ -2093,27 +2207,89 @@ fn observed_outbound_message(value: &serde_json::Value) -> Option<ObservedOutbou
     Some(ObservedOutboundMessage {
         chat_id,
         telegram_message_id,
+        receiver_user_id,
+        ephemeral_message_id,
+        business_connection_id: value
+            .get("business_connection_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| bounded_telemetry_string(value, 512, 2 * 1024)),
+        guest_query_id: value
+            .get("guest_query_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| bounded_telemetry_string(value, 512, 2 * 1024)),
+        message_thread_id: value
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64),
+        direct_messages_topic_id: value
+            .pointer("/direct_messages_topic/topic_id")
+            .or_else(|| value.pointer("/direct_messages_topic/id"))
+            .and_then(serde_json::Value::as_i64),
         text: value
             .get("text")
             .or_else(|| value.get("caption"))
             .and_then(serde_json::Value::as_str)
             .and_then(|value| bounded_telemetry_string(value, 4_096, 16 * 1024)),
         chat_type: chat
-            .get("type")
+            .and_then(|chat| chat.get("type"))
             .and_then(serde_json::Value::as_str)
             .and_then(|value| bounded_telemetry_string(value, 64, 256)),
         title: chat
-            .get("title")
+            .and_then(|chat| chat.get("title"))
             .and_then(serde_json::Value::as_str)
             .and_then(|value| bounded_telemetry_string(value, 512, 2 * 1024)),
         username: chat
-            .get("username")
+            .and_then(|chat| chat.get("username"))
             .and_then(serde_json::Value::as_str)
             .and_then(|value| bounded_telemetry_string(value, 128, 512)),
         display_name: display_name
             .as_deref()
             .and_then(|value| bounded_telemetry_string(value, 512, 2 * 1024)),
+        payload: sanitized_outbound_payload(value).map(Box::new),
     })
+}
+
+fn sanitized_outbound_payload(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let payload = sanitize_outbound_value(value, 0)?;
+    (serde_json::to_vec(&payload).ok()?.len() <= MAX_OUTBOUND_PAYLOAD_BYTES).then_some(payload)
+}
+
+fn sanitize_outbound_value(value: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    if depth > MAX_OUTBOUND_PAYLOAD_DEPTH {
+        return None;
+    }
+    match value {
+        serde_json::Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in values.iter().take(MAX_OUTBOUND_OBJECT_FIELDS) {
+                let normalized = key.to_ascii_lowercase();
+                if normalized == "file_path"
+                    || normalized == "authorization"
+                    || normalized.contains("token")
+                {
+                    continue;
+                }
+                if let Some(value) = sanitize_outbound_value(value, depth + 1) {
+                    sanitized.insert(key.clone(), value);
+                }
+            }
+            Some(serde_json::Value::Object(sanitized))
+        }
+        serde_json::Value::Array(values) => Some(serde_json::Value::Array(
+            values
+                .iter()
+                .take(MAX_OUTBOUND_ARRAY_ITEMS)
+                .filter_map(|value| sanitize_outbound_value(value, depth + 1))
+                .collect(),
+        )),
+        // Bot API 10.2 RichText permits 32,768 Unicode characters. Keep the
+        // complete legal scalar (including four-byte UTF-8) while the enclosing
+        // sanitized payload and queue retain their independent byte budgets.
+        serde_json::Value::String(value) => {
+            bounded_telemetry_string(value, 32_768, 32_768 * char::MAX_LEN_UTF8)
+                .map(serde_json::Value::String)
+        }
+        value => Some(value.clone()),
+    }
 }
 
 fn bounded_telemetry_string(value: &str, max_chars: usize, max_bytes: usize) -> Option<String> {
@@ -2153,6 +2329,9 @@ fn outbound_response_candidate(method: &str) -> bool {
     method.starts_with("send")
         || method.starts_with("forward")
         || method.starts_with("editmessage")
+        || method.starts_with("editephemeralmessage")
+        || method == "answerguestquery"
+        || method == "stopmessagelivelocation"
         || method == "setgamescore"
 }
 
@@ -2365,10 +2544,11 @@ mod tests {
         let messages = outbound_messages_from_response(text.to_string().as_bytes());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].chat_id, 99);
-        assert_eq!(messages[0].telegram_message_id, 41);
+        assert_eq!(messages[0].telegram_message_id, Some(41));
         assert_eq!(messages[0].text.as_deref(), Some("hello"));
         assert_eq!(messages[0].username.as_deref(), Some("ada"));
         assert_eq!(messages[0].display_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(messages[0].payload.as_ref().unwrap()["text"], "hello");
 
         let media_group = serde_json::json!({
             "ok": true,
@@ -2390,6 +2570,63 @@ mod tests {
         assert_eq!(messages[0].text.as_deref(), Some("first photo"));
         assert_eq!(messages[1].text, None);
         assert_eq!(messages[1].title.as_deref(), Some("Launch"));
+        assert_eq!(
+            messages[0].payload.as_ref().unwrap()["photo"][0]["file_id"],
+            "photo"
+        );
+
+        let ephemeral = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 0,
+                "ephemeral_message_id": 73,
+                "receiver_user": {"id": 555, "first_name": "Grace"},
+                "text": "short-lived"
+            }
+        });
+        let messages = outbound_messages_from_response(ephemeral.to_string().as_bytes());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].chat_id, 555);
+        assert_eq!(messages[0].telegram_message_id, Some(0));
+        assert_eq!(messages[0].receiver_user_id, Some(555));
+        assert_eq!(messages[0].ephemeral_message_id, Some(73));
+
+        let secrets = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 44,
+                "chat": {"id": 99, "type": "private"},
+                "document": {
+                    "file_id": "safe-file-id",
+                    "file_path": "/native/private/path",
+                    "provider_token": "must-not-leave-the-gateway"
+                }
+            }
+        });
+        let messages = outbound_messages_from_response(secrets.to_string().as_bytes());
+        let payload = messages[0].payload.as_ref().unwrap();
+        assert_eq!(payload["document"]["file_id"], "safe-file-id");
+        assert!(payload["document"].get("file_path").is_none());
+        assert!(payload["document"].get("provider_token").is_none());
+
+        let maximum_rich_text = "🧪".repeat(32_768);
+        let rich = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 45,
+                "chat": {"id": 99, "type": "private"},
+                "rich_message": {"text": maximum_rich_text}
+            }
+        });
+        let messages = outbound_messages_from_response(rich.to_string().as_bytes());
+        assert_eq!(
+            messages[0].payload.as_ref().unwrap()["rich_message"]["text"]
+                .as_str()
+                .expect("sanitized rich text")
+                .chars()
+                .count(),
+            32_768
+        );
 
         assert!(
             outbound_messages_from_response(
@@ -2409,6 +2646,34 @@ mod tests {
             "http://127.0.0.1/api/internal/data-plane/telemetry",
         );
         let (state, mut receiver) = GatewayState::new(&config).expect("gateway state");
+        let oversized_event = outbound_telemetry_event(
+            &test_outbound_observation(&state),
+            1_786_620_000_000_000,
+            ObservedOutboundMessage {
+                chat_id: 99,
+                telegram_message_id: Some(9000),
+                receiver_user_id: None,
+                ephemeral_message_id: None,
+                business_connection_id: None,
+                guest_query_id: None,
+                message_thread_id: None,
+                direct_messages_topic_id: None,
+                text: Some("x".repeat(16 * 1024)),
+                chat_type: Some("private".into()),
+                title: Some("t".repeat(2 * 1024)),
+                username: Some("u".repeat(512)),
+                display_name: Some("d".repeat(2 * 1024)),
+                payload: Some(Box::new(serde_json::json!({
+                    "blocks": vec!["p".repeat(100_000); 6]
+                }))),
+            },
+        );
+        assert!(telemetry_event_json_len(&oversized_event) <= MAX_TELEMETRY_BATCH_BYTES);
+        let TelemetryEvent::OutboundMessage(oversized_event) = oversized_event else {
+            panic!("expected outbound telemetry");
+        };
+        assert!(oversized_event.message.payload.is_none());
+
         let response = serde_json::json!({
             "ok": true,
             "result": {
@@ -2439,7 +2704,8 @@ mod tests {
         };
         assert_eq!(event.method, "sendMessage");
         assert_eq!(event.message.chat_id, 99);
-        assert_eq!(event.message.telegram_message_id, 9001);
+        assert_eq!(event.message.telegram_message_id, Some(9001));
+        assert_eq!(event.message.payload.as_ref().unwrap()["text"], "observed");
         let first_observed_at_unix_us = event.observed_at_unix_us;
 
         let later_response = response.replace("9001", "9002");
@@ -2467,7 +2733,7 @@ mod tests {
         let TelemetryEvent::OutboundMessage(later_event) = later_event else {
             panic!("expected later outbound telemetry");
         };
-        assert_eq!(later_event.message.telegram_message_id, 9002);
+        assert_eq!(later_event.message.telegram_message_id, Some(9002));
         assert!(later_event.observed_at_unix_us > first_observed_at_unix_us);
 
         let mut oversized = OutboundObservationStream::new(
@@ -2650,6 +2916,86 @@ mod tests {
             state.outbound_observation_slots.available_permits(),
             MAX_CONCURRENT_OUTBOUND_OBSERVATIONS
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_bot_view_marker_is_stripped_and_suppresses_duplicate_observation() {
+        let (capture_tx, mut capture_rx) = mpsc::channel(2);
+        let upstream = Router::new()
+            .fallback(any(
+                |State(capture_tx): State<mpsc::Sender<bool>>, request: Request| async move {
+                    capture_tx
+                        .send(request.headers().contains_key(OBSERVATION_BYPASS_HEADER))
+                        .await
+                        .expect("capture receiver");
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "message_id": 9101,
+                            "date": 1_786_620_000,
+                            "chat": {"id": 99, "type": "private"},
+                            "text": "operator reply"
+                        }
+                    }))
+                },
+            ))
+            .with_state(capture_tx);
+        let upstream_url = spawn(upstream).await;
+        let config = test_config(
+            &upstream_url,
+            "http://127.0.0.1/api/internal/data-plane/telemetry",
+        );
+        let (state, mut receiver) = GatewayState::new(&config).expect("gateway state");
+        state
+            .install(RouteSnapshot {
+                schema_version: 1,
+                generation: 1,
+                routes: vec![RouteRecord {
+                    token_lookup_hash: bot_public_id(&state.public_id_key, b"123:secret", false),
+                    pool: Pool::Standard,
+                }],
+            })
+            .expect("install route");
+        let gateway_url = spawn_public_http1(public_router(state)).await;
+        let client = Client::new();
+
+        let response = client
+            .post(format!("{gateway_url}/bot123:secret/sendMessage"))
+            .header(OBSERVATION_BYPASS_HEADER, "s".repeat(32))
+            .send()
+            .await
+            .expect("trusted Bot View response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!capture_rx.recv().await.expect("captured trusted request"));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(TelemetryEvent::ApiCall(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), receiver.recv())
+                .await
+                .is_err(),
+            "trusted Bot View request must not create a second outbound timeline row"
+        );
+
+        let response = client
+            .post(format!("{gateway_url}/bot123:secret/sendMessage"))
+            .header(OBSERVATION_BYPASS_HEADER, "not-the-sync-token")
+            .send()
+            .await
+            .expect("untrusted marked response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!capture_rx.recv().await.expect("captured untrusted request"));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(TelemetryEvent::ApiCall(_))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("untrusted observation timeout"),
+            Some(TelemetryEvent::OutboundMessage(_))
+        ));
     }
 
     #[test]
@@ -3996,7 +4342,7 @@ mod tests {
                 Duration::from_millis(7),
             ));
         }
-        state.record_telemetry(TelemetryEvent::OutboundMessage(
+        state.record_telemetry(TelemetryEvent::OutboundMessage(Box::new(
             OutboundMessageTelemetryEvent {
                 schema_version: 1,
                 kind: "outbound_message",
@@ -4007,15 +4353,27 @@ mod tests {
                 observed_at_unix_us: 1_786_620_000_000_000,
                 message: ObservedOutboundMessage {
                     chat_id: 99,
-                    telegram_message_id: 9002,
+                    telegram_message_id: Some(9002),
+                    receiver_user_id: None,
+                    ephemeral_message_id: None,
+                    business_connection_id: None,
+                    guest_query_id: None,
+                    message_thread_id: None,
+                    direct_messages_topic_id: None,
                     text: Some("caption".into()),
                     chat_type: Some("private".into()),
                     title: None,
                     username: Some("ada".into()),
                     display_name: Some("Ada".into()),
+                    payload: Some(Box::new(serde_json::json!({
+                        "message_id": 9002,
+                        "chat": {"id": 99, "type": "private"},
+                        "photo": [{"file_id": "photo", "file_unique_id": "unique"}]
+                    }))),
                 },
+                _queue_permit: None,
             },
-        ));
+        )));
 
         let captured = tokio::time::timeout(Duration::from_secs(2), capture_rx.recv())
             .await
@@ -4043,6 +4401,70 @@ mod tests {
         .await
         .expect("delivery metric update");
         assert_eq!(state.telemetry_metrics.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn retryable_telemetry_failure_keeps_the_exact_batch_until_delivery() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (capture_tx, mut capture_rx) = mpsc::channel(1);
+        let telemetry = Router::new()
+            .fallback(any(
+                |State((attempts, capture_tx)): State<(
+                    Arc<AtomicUsize>,
+                    mpsc::Sender<serde_json::Value>,
+                )>,
+                 request: Request| async move {
+                    let body = serde_json::from_slice::<serde_json::Value>(
+                        &to_bytes(request.into_body(), 1024 * 1024)
+                            .await
+                            .expect("telemetry body"),
+                    )
+                    .expect("telemetry JSON");
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return StatusCode::SERVICE_UNAVAILABLE;
+                    }
+                    capture_tx.send(body).await.expect("capture retry");
+                    StatusCode::NO_CONTENT
+                },
+            ))
+            .with_state((attempts.clone(), capture_tx));
+        let telemetry_url = format!(
+            "{}/api/internal/data-plane/telemetry",
+            spawn(telemetry).await
+        );
+        let config = test_config("http://127.0.0.1:1", &telemetry_url);
+        let (state, receiver) = GatewayState::new(&config).expect("gateway state");
+        tokio::spawn(telemetry_delivery_loop(state.clone(), config, receiver));
+
+        state.record_telemetry(telemetry_event(
+            "phg_012345678901234567890123".into(),
+            Pool::Standard,
+            "sendMessage".into(),
+            StatusCode::OK,
+            Duration::from_millis(7),
+        ));
+
+        let captured = tokio::time::timeout(Duration::from_secs(2), capture_rx.recv())
+            .await
+            .expect("telemetry retry timeout")
+            .expect("captured retried batch");
+        assert_eq!(captured["events"].as_array().map(Vec::len), Some(1));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.telemetry_metrics.delivered.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delivery metric update after retry");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state
+                .telemetry_metrics
+                .delivery_failed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(state.telemetry_metrics.delivered.load(Ordering::Relaxed), 1);
     }
 
     async fn raw_http_request(base_url: &str, target: &str, header_lines: &[String]) -> Vec<u8> {

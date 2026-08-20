@@ -181,11 +181,11 @@ pub async fn security_headers(
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"),
+        HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"),
     );
     headers.insert(
         "permissions-policy",
-        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        HeaderValue::from_static("camera=(self), microphone=(self), geolocation=(self)"),
     );
     response
 }
@@ -390,5 +390,24 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(payload["deployment_revision"], "test-revision");
+    }
+
+    #[tokio::test]
+    async fn app_allows_only_first_party_chat_capture_and_blob_previews() {
+        let response = response(&test_app(), "app.phenogram.io", "/").await;
+        let policy = response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(policy.contains("img-src 'self' data: blob:"));
+        assert!(policy.contains("media-src 'self' blob:"));
+        assert_eq!(
+            response
+                .headers()
+                .get("permissions-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("camera=(self), microphone=(self), geolocation=(self)")
+        );
     }
 }

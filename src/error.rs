@@ -17,6 +17,8 @@ pub enum AppError {
     Database(#[from] sqlx::Error),
     #[error("upstream service error: {0}")]
     Upstream(String),
+    #[error("Telegram rejected the request: {0}")]
+    TelegramRejected(String),
     #[error("the data-plane gateway is still draining admitted requests")]
     GatewayDrainPending,
     #[error("invalid request: {0}")]
@@ -76,6 +78,11 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_GATEWAY,
                 "telegram_unavailable",
                 "Telegram is temporarily unavailable".to_owned(),
+            ),
+            Self::TelegramRejected(message) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "telegram_rejected",
+                message.clone(),
             ),
             Self::GatewayDrainPending => (
                 StatusCode::SERVICE_UNAVAILABLE,

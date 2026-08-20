@@ -18,6 +18,7 @@ tap_collector_pid=""
 tap_collector_dir=""
 tap_ack_listener_pid=""
 telemetry_outbound_seeded=false
+chat_upload_dir=""
 
 cleanup_live_stream() {
   if [[ -n "$live_stream_pid" ]]; then
@@ -49,6 +50,12 @@ cleanup() {
       "$tap_collector_dir/lifecycle-acks.jsonl" "$tap_collector_dir/collector.log"
     rmdir -- "$tap_collector_dir"
     tap_collector_dir=""
+  fi
+  if [[ -n "$chat_upload_dir" && -d "$chat_upload_dir" ]]; then
+    rm -f -- "$chat_upload_dir/photo.png" "$chat_upload_dir/document.txt" \
+      "$chat_upload_dir/range-body"
+    rmdir -- "$chat_upload_dir"
+    chat_upload_dir=""
   fi
   psql "$database_url" -v ON_ERROR_STOP=1 -v subject="$identity_subject" <<'SQL' >/dev/null || true
 DELETE FROM users
@@ -680,16 +687,24 @@ curl -fsS \
 child_updates="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/updates?limit=10")"
 jq -e '.updates | any(.update_id == 8100 and .event_type == "message" and .chat_id == 707)' <<<"$child_updates" >/dev/null
 
+child_conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations")"
+child_conversation_id="$(jq -er '.conversations[] | select(.chat_id == 707) | .id' <<<"$child_conversations")"
 child_operator_reply="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
-  -d '{"chat_id":707,"text":"managed child operator response"}' \
-  "$base_url/api/bots/$child_bot_id/messages")"
+  -d '{"text":"managed child operator response"}' \
+  "$base_url/api/bots/$child_bot_id/conversations/$child_conversation_id/actions/sendMessage")"
 jq -e '.ok == true and .result.text == "managed child operator response"' <<<"$child_operator_reply" >/dev/null
 
-child_conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations")"
+for _ in $(seq 1 40); do
+  child_conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations")"
+  if jq -e '.conversations[0].chat_id == 707 and .conversations[0].last_message_preview == "You: managed child operator response"' <<<"$child_conversations" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
 jq -e '.conversations[0].chat_id == 707 and .conversations[0].last_message_preview == "You: managed child operator response"' <<<"$child_conversations" >/dev/null
-child_timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations/707/messages")"
+child_timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$child_bot_id/conversations/$child_conversation_id/messages")"
 jq -e '[.messages[].direction] | contains(["incoming"]) and contains(["outgoing"])' <<<"$child_timeline" >/dev/null
 jq -e '[.messages[].text] | contains(["hello managed child"]) and contains(["managed child operator response"])' <<<"$child_timeline" >/dev/null
 curl -fsS "$mock_url/__state" \
@@ -788,25 +803,29 @@ proxied="$(curl -fsS \
   "$base_url/bot$bot_token/sendMessage")"
 jq -e '.ok == true and .result.text == "proxied response"' <<<"$proxied" >/dev/null
 
+operator_conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations")"
+operator_conversation_id="$(jq -er '.conversations[] | select(.chat_id == 99 and .message_thread_id == null) | .id' <<<"$operator_conversations")"
 operator_reply="$(curl -fsS -b "$auth_cookie" \
   -H 'content-type: application/json' \
   -H "x-phenogram-csrf: $csrf" \
-  -d '{"chat_id":99,"text":"operator response"}' \
-  "$base_url/api/bots/$bot_id/messages")"
+  -d '{"text":"operator response"}' \
+  "$base_url/api/bots/$bot_id/conversations/$operator_conversation_id/actions/sendMessage")"
 jq -e '.ok == true and .result.text == "operator response"' <<<"$operator_reply" >/dev/null
+operator_message_id="$(jq -er '.result.message_id' <<<"$operator_reply")"
 if [[ "$telemetry_outbound_seeded" = true ]]; then
   curl -fsS -X POST \
     -H 'host: phenogram' \
     -H 'content-type: application/json' \
     -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
-    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"late gateway duplicate\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":$operator_message_id,\"text\":\"late gateway duplicate\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
     "$base_url/api/internal/data-plane/telemetry" \
     | jq -e '.ok == true and .accepted == 1 and .unknown == 0' >/dev/null
-  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" \
+    -v operator_message_id="$operator_message_id" <<'SQL'
 SELECT count(*) FROM outbound_messages
  WHERE bot_id = :'bot_id'::uuid
    AND chat_id = 99
-   AND telegram_message_id = 9001
+   AND telegram_message_id = :'operator_message_id'::bigint
    AND source = 'bot_view'
    AND user_id IS NOT NULL
    AND text = 'operator response';
@@ -846,10 +865,146 @@ fi
 
 conversations="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations")"
 jq -e '.conversations[0].chat_id == 99 and .conversations[0].last_message_preview == "You: operator response"' <<<"$conversations" >/dev/null
+conversation_id="$(jq -er '.conversations[] | select(.chat_id == 99 and .message_thread_id == null) | .id' <<<"$conversations")"
 
-timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/99/messages")"
+timeline="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages")"
 jq -e '[.messages[].direction] | contains(["incoming"]) and contains(["outgoing"])' <<<"$timeline" >/dev/null
 jq -e '[.messages[].text] | contains(["hello from the e2e test"]) and contains(["operator response"]) and contains(["proxied response"])' <<<"$timeline" >/dev/null
+
+# The rich Bot View is a real Telegram client surface: opaque conversation
+# identity, cursor pagination, SSE delivery, multipart media, authenticated
+# media playback, edits, albums, and deletions all share one durable timeline.
+page_newest="$(curl -fsS -b "$auth_cookie" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages?limit=2")"
+jq -e '.messages | length == 2' <<<"$page_newest" >/dev/null
+next_before="$(jq -er '.next_before' <<<"$page_newest")"
+page_older="$(curl -fsS -b "$auth_cookie" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages?limit=2&before=$next_before")"
+jq -e --argjson newer "$(jq '[.messages[].id]' <<<"$page_newest")" \
+  '(.messages | length) >= 1 and ([.messages[].id] - $newer | length) == (.messages | length)' \
+  <<<"$page_older" >/dev/null
+
+updates_before_rich_chat="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates WHERE bot_id = :'bot_id'::uuid;
+SQL
+)"
+chat_upload_dir="$(mktemp -d)"
+printf 'phenogram-e2e-photo' >"$chat_upload_dir/photo.png"
+printf 'phenogram-e2e-document' >"$chat_upload_dir/document.txt"
+
+latest_chat_cursor="$(jq -er '.latest_cursor' <<<"$timeline")"
+live_stream_dir="$(mktemp -d)"
+curl -sS --no-buffer -b "$auth_cookie" --max-time 8 \
+  -D "$live_stream_dir/headers" \
+  -o "$live_stream_dir/events" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages/stream?after=$latest_chat_cursor" &
+live_stream_pid="$!"
+for _ in $(seq 1 40); do
+  if grep -qi '^content-type: text/event-stream' "$live_stream_dir/headers" 2>/dev/null; then
+    break
+  fi
+  kill -0 "$live_stream_pid" 2>/dev/null
+  sleep 0.05
+done
+grep -qi '^content-type: text/event-stream' "$live_stream_dir/headers"
+
+photo_response="$(curl -fsS -b "$auth_cookie" \
+  -H "x-phenogram-csrf: $csrf" \
+  -F 'caption=rich photo e2e' \
+  -F "photo=@$chat_upload_dir/photo.png;type=image/png" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/actions/sendPhoto")"
+jq -e '.ok == true
+  and .result.photo[-1].file_id == "photo-file-1"
+  and (._phenogram.timeline_messages | length) == 1' <<<"$photo_response" >/dev/null
+photo_message_id="$(jq -er '.result.message_id' <<<"$photo_response")"
+for _ in $(seq 1 80); do
+  if grep -q 'photo-file-1' "$live_stream_dir/events" 2>/dev/null; then
+    break
+  fi
+  kill -0 "$live_stream_pid" 2>/dev/null
+  sleep 0.05
+done
+grep -q 'event: message' "$live_stream_dir/events"
+grep -q 'photo-file-1' "$live_stream_dir/events"
+cleanup_live_stream
+
+rich_timeline="$(curl -fsS -b "$auth_cookie" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages")"
+photo_media_url="$(jq -er --argjson message_id "$photo_message_id" \
+  '.messages[] | select(.telegram_message_id == $message_id) | .content.media[]
+    | select(.file_id == "photo-file-1") | .url' <<<"$rich_timeline")"
+test "$(curl -sS -o /dev/null -w '%{http_code}' "$base_url$photo_media_url")" = "401"
+test "$(curl -sS -b "$auth_cookie" -o /dev/null -w '%{http_code}' \
+  "$base_url/api/bots/$bot_id/media/not-owned-file")" = "404"
+test "$(curl -sS -b "$auth_cookie" -I -o /dev/null -w '%{http_code}' \
+  "$base_url$photo_media_url")" = "200"
+test "$(curl -sS -b "$auth_cookie" -H 'Range: bytes=0-8' \
+  -o "$chat_upload_dir/range-body" -w '%{http_code}' "$base_url$photo_media_url")" = "206"
+test "$(cat "$chat_upload_dir/range-body")" = "phenogram"
+
+edited_photo="$(curl -fsS -b "$auth_cookie" \
+  -H 'content-type: application/json' \
+  -H "x-phenogram-csrf: $csrf" \
+  -d "{\"message_id\":$photo_message_id,\"caption\":\"edited rich caption\"}" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/actions/editMessageCaption")"
+jq -e '.ok == true and .result.caption == "edited rich caption"' <<<"$edited_photo" >/dev/null
+edited_timeline='{}'
+for _ in $(seq 1 50); do
+  edited_timeline="$(curl -fsS -b "$auth_cookie" \
+    "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages")"
+  if jq -e --argjson message_id "$photo_message_id" \
+    '[.messages[] | select(.telegram_message_id == $message_id)]
+      | length == 1 and .[0].content.caption == "edited rich caption"' \
+    <<<"$edited_timeline" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+jq -e --argjson message_id "$photo_message_id" \
+  '[.messages[] | select(.telegram_message_id == $message_id)]
+    | length == 1 and .[0].content.caption == "edited rich caption"' \
+  <<<"$edited_timeline" >/dev/null
+
+album_response="$(curl -fsS -b "$auth_cookie" \
+  -H "x-phenogram-csrf: $csrf" \
+  -F 'media=[{"type":"photo","media":"attach://photo_one","caption":"album photo"},{"type":"document","media":"attach://document_two","caption":"album document"}]' \
+  -F "photo_one=@$chat_upload_dir/photo.png;type=image/png" \
+  -F "document_two=@$chat_upload_dir/document.txt;type=text/plain" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/actions/sendMediaGroup")"
+jq -e '.ok == true and (.result | length) == 2
+  and (._phenogram.timeline_messages | length) == 2
+  and ([.result[].media_group_id] | unique) == ["album-e2e"]' \
+  <<<"$album_response" >/dev/null
+
+curl -fsS -b "$auth_cookie" \
+  -H 'content-type: application/json' \
+  -H "x-phenogram-csrf: $csrf" \
+  -d "{\"message_id\":$photo_message_id}" \
+  "$base_url/api/bots/$bot_id/conversations/$conversation_id/actions/deleteMessage" \
+  | jq -e '.ok == true and .result == true' >/dev/null
+deleted_timeline='{}'
+for _ in $(seq 1 50); do
+  deleted_timeline="$(curl -fsS -b "$auth_cookie" \
+    "$base_url/api/bots/$bot_id/conversations/$conversation_id/messages")"
+  if jq -e --argjson message_id "$photo_message_id" \
+    '[.messages[] | select(.telegram_message_id == $message_id)]
+      | length == 1 and .[0].status == "deleted"' <<<"$deleted_timeline" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+jq -e --argjson message_id "$photo_message_id" \
+  '[.messages[] | select(.telegram_message_id == $message_id)]
+    | length == 1 and .[0].status == "deleted"' <<<"$deleted_timeline" >/dev/null
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+SELECT count(*) FROM updates WHERE bot_id = :'bot_id'::uuid;
+SQL
+)" = "$updates_before_rich_chat"
+
+rm -f -- "$chat_upload_dir/photo.png" "$chat_upload_dir/document.txt" \
+  "$chat_upload_dir/range-body"
+rmdir -- "$chat_upload_dir"
+chat_upload_dir=""
 
 if [[ "$telemetry_outbound_seeded" = true ]]; then
   updates_before_outbound_edit="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
@@ -861,7 +1016,7 @@ SQL
     -H 'host: phenogram' \
     -H 'content-type: application/json' \
     -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
-    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"editMessageText\",\"upstream_status\":200,\"observed_at_unix_us\":$edit_observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"edited external response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"editMessageText\",\"upstream_status\":200,\"observed_at_unix_us\":$edit_observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":$operator_message_id,\"text\":\"edited external response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
     "$base_url/api/internal/data-plane/telemetry" \
     | jq -e '.ok == true and .accepted == 1 and .unknown == 0' >/dev/null
   # Replaying the older send observation after the edit must not restore stale text.
@@ -869,14 +1024,15 @@ SQL
     -H 'host: phenogram' \
     -H 'content-type: application/json' \
     -H "authorization: Bearer $PHENOGRAM_E2E_DATA_PLANE_SYNC_TOKEN" \
-    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":9001,\"text\":\"stale original response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
+    -d "{\"schema_version\":1,\"events\":[{\"schema_version\":1,\"kind\":\"outbound_message\",\"token_lookup_hash\":\"$token_lookup_hash\",\"pool\":\"standard\",\"method\":\"sendMessage\",\"upstream_status\":200,\"observed_at_unix_us\":$observed_at_unix_us,\"message\":{\"chat_id\":99,\"telegram_message_id\":$operator_message_id,\"text\":\"stale original response\",\"chat_type\":\"private\",\"title\":null,\"username\":\"ada\",\"display_name\":\"Ada\"}}]}" \
     "$base_url/api/internal/data-plane/telemetry" \
     | jq -e '.ok == true and .accepted == 1 and .unknown == 0' >/dev/null
-  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+  test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" \
+    -v operator_message_id="$operator_message_id" <<'SQL'
 SELECT count(*) FROM outbound_messages
  WHERE bot_id = :'bot_id'::uuid
    AND chat_id = 99
-   AND telegram_message_id = 9001
+   AND telegram_message_id = :'operator_message_id'::bigint
    AND source = 'bot_view'
    AND user_id IS NOT NULL
    AND method = 'editMessageText'

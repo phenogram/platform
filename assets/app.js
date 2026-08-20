@@ -69,6 +69,22 @@
     botViewRefreshGeneration: 0,
     botViewSendsInFlight: new Map(),
     botViewConversationListPinned: false,
+    botViewDrafts: new Map(),
+    botViewOptimisticMessages: new Map(),
+    botViewScrollState: new Map(),
+    botViewOpenPanel: null,
+    botViewUploadProgress: null,
+    botViewRecorder: null,
+    botViewMessagesStream: null,
+    botViewMessagesStreamRetryTimer: null,
+    botViewMessagesStreamRetryAttempt: 0,
+    botViewMessagesStreamGeneration: 0,
+    botViewMessageCursors: new Map(),
+    botViewMessageNextBefore: new Map(),
+    botViewLoadingOlder: false,
+    botViewTimelineResizeObserver: null,
+    botViewBulkModeKey: null,
+    botViewBulkSelection: new Map(),
   };
 
   const icon = (name, className = "") =>
@@ -120,6 +136,20 @@
     return [];
   };
 
+  const isPlatformUnauthorizedPayload = (payload) => Boolean(
+    payload
+      && typeof payload === "object"
+      && payload.error
+      && typeof payload.error === "object"
+      && payload.error.code === "unauthorized",
+  );
+
+  const isTelegramFailurePayload = (payload) => Boolean(
+    payload
+      && typeof payload === "object"
+      && payload.ok === false,
+  );
+
   const api = async (path, options = {}) => {
     const headers = { Accept: "application/json", ...(options.headers || {}) };
     const method = String(options.method || "GET").toUpperCase();
@@ -156,14 +186,16 @@
       }
     }
 
-    if (!response.ok) {
+    if (!response.ok || isTelegramFailurePayload(payload)) {
       const message = typeof payload === "string"
         ? payload
-        : payload?.message || payload?.error?.message || payload?.error || payload?.detail;
+        : payload?.description || payload?.message || payload?.error?.message || payload?.error || payload?.detail;
       const error = new Error(message || `Request failed (${response.status})`);
-      error.status = response.status;
+      error.status = isTelegramFailurePayload(payload) ? Number(payload?.error_code || response.status) : response.status;
+      error.httpStatus = response.status;
+      error.telegramRejected = isTelegramFailurePayload(payload);
       error.payload = payload;
-      if (response.status === 401 && state.user) {
+      if (response.status === 401 && state.user && isPlatformUnauthorizedPayload(payload)) {
         window.queueMicrotask(() => handleExpiredSession());
       }
       throw error;
@@ -445,16 +477,33 @@
   function clearBotState({ clearSelection = false } = {}) {
     stopUpdatesStream({ status: "idle" });
     stopBotViewRefresh();
+    stopBotViewMessageStream();
     stopBotSetupRefresh();
     state.botContextVersion += 1;
     state.requestTickets = {};
     state.bot = null;
     state.activity = [];
     state.updates = [];
+    state.conversations.forEach((conversation) => conversationMessages(conversation).forEach(revokeTimelineLocalPreviews));
     state.conversations = [];
     state.selectedConversationId = null;
     state.botViewConversationListPinned = false;
     state.botViewSendsInFlight.clear();
+    state.botViewDrafts.forEach((draft) => revokeDraftFiles(draft));
+    state.botViewOptimisticMessages.forEach((messages) => messages.forEach((message) => revokeDraftFiles(message?._draft)));
+    state.botViewDrafts.clear();
+    state.botViewOptimisticMessages.clear();
+    state.botViewScrollState.clear();
+    state.botViewMessageCursors.clear();
+    state.botViewMessageNextBefore.clear();
+    state.botViewBulkModeKey = null;
+    state.botViewBulkSelection.clear();
+    state.botViewLoadingOlder = false;
+    state.botViewTimelineResizeObserver?.disconnect?.();
+    state.botViewTimelineResizeObserver = null;
+    state.botViewOpenPanel = null;
+    state.botViewUploadProgress = null;
+    stopVoiceRecording({ cancel: true, renderResult: false });
     state.streamKey = null;
     state.streamKeyId = null;
     state.streamKeys = [];
@@ -745,7 +794,11 @@
       const payload = await api(`/bots/${encodeURIComponent(id)}/conversations`);
       if (!botRequestIsCurrent("conversations", ticket, id, contextVersion)
         || (refreshContext && !botViewRefreshContextIsCurrent(refreshContext))) return false;
-      state.conversations = listFrom(payload, "conversations");
+      const previousConversations = new Map(state.conversations.map((item) => [conversationId(item), item]));
+      state.conversations = listFrom(payload, "conversations").map((item) => {
+        const previous = previousConversations.get(conversationId(item));
+        return previous?.messages ? { ...item, messages: previous.messages } : item;
+      });
       const selectedConversationExists = state.selectedConversationId
         && state.conversations.some((item) => conversationId(item) === String(state.selectedConversationId));
       if (state.selectedConversationId && !selectedConversationExists) state.selectedConversationId = null;
@@ -754,7 +807,7 @@
         state.selectedConversationId = state.conversations[0] ? conversationId(state.conversations[0]) : null;
         state.botViewConversationListPinned = false;
       }
-      if (state.selectedConversationId) await loadConversationMessages(state.selectedConversationId);
+      if (state.selectedConversationId && (!refreshContext || !state.botViewMessagesStream)) await loadConversationMessages(state.selectedConversationId);
       if (!botRequestIsCurrent("conversations", ticket, id, contextVersion)) return false;
       setError("conversations", null);
       return true;
@@ -777,9 +830,19 @@
     const conversation = state.conversations.find((item) => conversationId(item) === String(chatId));
     if (!conversation || !botIdAtRequest) return;
     try {
-      const payload = await api(`/bots/${encodeURIComponent(botIdAtRequest)}/conversations/${encodeURIComponent(chatId)}/messages`);
+      const payload = await api(`/bots/${encodeURIComponent(botIdAtRequest)}/conversations/${encodeURIComponent(chatId)}/messages?limit=100`);
       if (!botRequestIsCurrent(requestKey, ticket, botIdAtRequest, contextVersion)) return;
-      conversation.messages = listFrom(payload, "messages");
+      const currentConversation = state.conversations.find((item) => conversationId(item) === String(chatId));
+      if (!currentConversation) return;
+      const key = botViewKey(botIdAtRequest, chatId);
+      const latestCursor = String(payload?.latest_cursor || payload?.data?.latest_cursor || "");
+      currentConversation.messages = mergeConversationMessageSnapshot(
+        listFrom(payload, "messages"),
+        conversationMessages(currentConversation),
+        latestCursor,
+      );
+      advanceBotViewMessageCursor(key, latestCursor);
+      state.botViewMessageNextBefore.set(key, payload?.next_before ?? payload?.data?.next_before ?? null);
     } catch (_) {
       // Conversation summaries remain useful even when historical payload loading fails.
     }
@@ -816,7 +879,7 @@
       state.botViewRefreshPromise = refresh;
       try {
         await refresh;
-        if (botViewRefreshContextIsCurrent(context)) renderBotViewLive();
+        if (botViewRefreshContextIsCurrent(context)) renderConversationListLive();
       } finally {
         if (state.botViewRefreshPromise === refresh) state.botViewRefreshPromise = null;
         if (botViewRefreshContextIsCurrent(context)) scheduleBotViewRefresh(context);
@@ -834,6 +897,301 @@
       generation: state.botViewRefreshGeneration,
     };
     scheduleBotViewRefresh(context);
+    startBotViewMessageStream();
+  }
+
+  function renderConversationListLive() {
+    if (state.route.name !== "bot-view") return;
+    const current = document.querySelector(".conversation-list");
+    if (!current) return;
+    const search = document.querySelector("#conversation-search");
+    const searchValue = search?.value || "";
+    const focused = document.activeElement === search;
+    current.outerHTML = renderConversationList();
+    const next = document.querySelector("#conversation-search");
+    if (next) {
+      next.value = searchValue;
+      applyConversationFilter(searchValue);
+      if (focused) next.focus({ preventScroll: true });
+    }
+  }
+
+  const BOT_VIEW_STREAM_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000, 30000];
+
+  function timelineItemCursor(item) {
+    return normalizeJournalId(item?._observed_cursor ?? item?.cursor ?? item?.event_id ?? item?.id);
+  }
+
+  function advanceBotViewMessageCursor(key, candidate) {
+    const next = normalizeJournalId(candidate);
+    const current = normalizeJournalId(state.botViewMessageCursors.get(key));
+    if (next && compareJournalIds(next, current) > 0) state.botViewMessageCursors.set(key, next);
+    return state.botViewMessageCursors.get(key) || "";
+  }
+
+  function mergeConversationMessageSnapshot(snapshot, observed, snapshotCursor) {
+    const merged = [...(snapshot || [])];
+    const positions = new Map(merged.map((item, index) => [messageStableId(item, index), index]));
+    const semanticPositions = new Map();
+    merged.forEach((item, index) => {
+      const semantic = timelineSemanticIdentity(item);
+      if (semantic) semanticPositions.set(semantic, index);
+    });
+    (observed || []).forEach((item, index) => {
+      const stableId = messageStableId(item, index);
+      const semantic = timelineSemanticIdentity(item);
+      const position = positions.get(stableId) ?? (semantic ? semanticPositions.get(semantic) : undefined);
+      const newerThanSnapshot = compareJournalIds(timelineItemCursor(item), snapshotCursor) > 0;
+      if (position != null) {
+        const snapshotItem = merged[position];
+        const pendingBaseline = normalizeJournalId(item?._response_baseline_cursor ?? timelineItemCursor(item));
+        const snapshotIsNotNewerThanPending = item?._response_pending
+          && compareJournalIds(timelineItemCursor(snapshotItem), pendingBaseline) <= 0;
+        if (newerThanSnapshot || snapshotIsNotNewerThanPending) {
+          merged[position] = {
+            ...item,
+            id: snapshotItem?.id ?? item?.id,
+            cursor: item?.cursor ?? snapshotItem?.cursor,
+          };
+        } else {
+          revokeTimelineLocalPreviews(item);
+        }
+        return;
+      }
+      if (newerThanSnapshot || item?._locally_observed) {
+        positions.set(stableId, merged.length);
+        if (semantic) semanticPositions.set(semantic, merged.length);
+        merged.push(item);
+      }
+    });
+    return merged.sort((left, right) => {
+      const cursorOrder = compareJournalIds(timelineItemCursor(left), timelineItemCursor(right));
+      if (cursorOrder) return cursorOrder;
+      return messageTimeMs(left) - messageTimeMs(right);
+    });
+  }
+
+  function stopBotViewMessageStream() {
+    state.botViewMessagesStreamGeneration += 1;
+    if (state.botViewMessagesStreamRetryTimer) window.clearTimeout(state.botViewMessagesStreamRetryTimer);
+    state.botViewMessagesStreamRetryTimer = null;
+    state.botViewMessagesStream?.close?.();
+    state.botViewMessagesStream = null;
+  }
+
+  function botViewMessageStreamContextIsCurrent(context, source = null) {
+    return state.route.name === "bot-view"
+      && Boolean(state.user)
+      && document.visibilityState === "visible"
+      && state.sessionVersion === context.sessionVersion
+      && state.botContextVersion === context.contextVersion
+      && state.botViewMessagesStreamGeneration === context.generation
+      && String(state.selectedBotId || "") === context.botId
+      && String(state.selectedConversationId || "") === context.conversationId
+      && (!source || state.botViewMessagesStream === source);
+  }
+
+  function scheduleBotViewMessageStreamRetry(context) {
+    if (!botViewMessageStreamContextIsCurrent(context) || state.botViewMessagesStreamRetryTimer) return;
+    const delay = BOT_VIEW_STREAM_RETRY_DELAYS[Math.min(state.botViewMessagesStreamRetryAttempt, BOT_VIEW_STREAM_RETRY_DELAYS.length - 1)];
+    state.botViewMessagesStreamRetryAttempt += 1;
+    state.botViewMessagesStreamRetryTimer = window.setTimeout(() => {
+      state.botViewMessagesStreamRetryTimer = null;
+      if (botViewMessageStreamContextIsCurrent(context)) startBotViewMessageStream();
+    }, delay);
+  }
+
+  function startBotViewMessageStream() {
+    if (state.route.name !== "bot-view" || !state.user || !state.selectedBotId || !state.selectedConversationId || document.visibilityState !== "visible" || typeof EventSource !== "function") return;
+    stopBotViewMessageStream();
+    const generation = state.botViewMessagesStreamGeneration;
+    const botIdValue = String(state.selectedBotId);
+    const conversationIdValue = String(state.selectedConversationId);
+    const key = botViewKey(botIdValue, conversationIdValue);
+    const cursor = state.botViewMessageCursors.get(key) || "0";
+    const url = `${API}/bots/${encodeURIComponent(botIdValue)}/conversations/${encodeURIComponent(conversationIdValue)}/messages/stream?after=${encodeURIComponent(cursor)}`;
+    const source = new EventSource(url, { withCredentials: true });
+    const context = { botId: botIdValue, conversationId: conversationIdValue, sessionVersion: state.sessionVersion, contextVersion: state.botContextVersion, generation };
+    state.botViewMessagesStream = source;
+    source.addEventListener("open", () => {
+      if (!botViewMessageStreamContextIsCurrent(context, source)) return;
+      state.botViewMessagesStreamRetryAttempt = 0;
+    });
+    source.addEventListener("message", (event) => {
+      if (!botViewMessageStreamContextIsCurrent(context, source)) return;
+      try {
+        let message = JSON.parse(event.data);
+        const eventId = String(event.lastEventId || message?.cursor || message?.event_id || "");
+        if (eventId) {
+          advanceBotViewMessageCursor(key, eventId);
+          message = { ...message, cursor: message?.cursor || eventId, _locally_observed: true };
+        }
+        mergeBotViewStreamMessage(context, message);
+      } catch (_) {
+        // Ignore malformed frames; the next reconnect snapshot is authoritative.
+      }
+    });
+    source.addEventListener("resync", async () => {
+      if (!botViewMessageStreamContextIsCurrent(context, source)) return;
+      source.close();
+      state.botViewMessagesStream = null;
+      await loadConversationMessages(conversationIdValue);
+      if (!botViewMessageStreamContextIsCurrent(context)) return;
+      renderBotViewLive();
+      startBotViewMessageStream();
+    });
+    source.addEventListener("error", () => {
+      if (!botViewMessageStreamContextIsCurrent(context, source)) return;
+      source.close();
+      state.botViewMessagesStream = null;
+      scheduleBotViewMessageStreamRetry(context);
+    });
+  }
+
+  function mergeBotViewStreamMessage(context, streamedItem) {
+    if (!botViewMessageStreamContextIsCurrent(context)) return;
+    const conversation = state.conversations.find((candidate) => conversationId(candidate) === context.conversationId);
+    if (!conversation) return;
+    const messages = conversationMessages(conversation);
+    let item = streamedItem;
+    const eventType = String(item?.event_type || item?.type || "");
+    const callback = callbackEventFromTimelineItem(item);
+    if (eventType === "callback_query" || callback) {
+      const targetId = callback?.message?.message_id ?? callback?.message_id;
+      const targetIndex = findLastMessageIndexByTelegramId(messages, targetId);
+      if (targetIndex >= 0) {
+        item = { ...withCallbackEvent(messages[targetIndex], callback, item), _observed_cursor: timelineItemCursor(streamedItem), _locally_observed: true };
+      } else {
+        item = { ...item, _timeline_callback_event: callback };
+      }
+    } else if (["poll", "poll_answer"].includes(eventType)) {
+      const poll = item?.payload?.poll || item?.poll;
+      const pollId = poll?.id || item?.payload?.poll_answer?.poll_id || item?.poll_answer?.poll_id;
+      const target = [...messages].reverse().find((candidate) => String(telegramMessage(candidate)?.poll?.id || "") === String(pollId || ""));
+      if (!target || !poll) return;
+      const targetMessage = telegramMessage(target);
+      item = {
+        ...target,
+        payload: target?.payload === targetMessage ? { ...targetMessage, poll } : target?.payload,
+        ...(target?.payload !== targetMessage ? { poll } : {}),
+        _observed_cursor: timelineItemCursor(streamedItem),
+        _locally_observed: true,
+      };
+    }
+    const deletion = item?.status === "deleted" || ["deleteMessage", "deleteBusinessMessages", "deleteEphemeralMessage", "deleted_business_messages"].includes(String(item?.event_type || item?.type || ""));
+    if (deletion) {
+      const telegramId = telegramMessageId(item);
+      const ephemeralId = item?.ephemeral_message_id ?? telegramMessage(item)?.ephemeral_message_id;
+      const receiverId = item?.receiver_user_id ?? telegramMessage(item)?.receiver_user_id;
+      const target = [...messages].reverse().find((candidate) => {
+        if (candidate?.direction === "action") return false;
+        if (telegramId !== "" && telegramId != null && Number(telegramId) !== 0) return String(telegramMessageId(candidate)) === String(telegramId);
+        return ephemeralId !== "" && ephemeralId != null && receiverId !== "" && receiverId != null
+          && String(candidate?.ephemeral_message_id ?? telegramMessage(candidate)?.ephemeral_message_id ?? "") === String(ephemeralId)
+          && String(candidate?.receiver_user_id ?? telegramMessage(candidate)?.receiver_user_id ?? "") === String(receiverId);
+      });
+      if (target) item = { ...target, status: "deleted", event_type: item.event_type || "deleted", cursor: item.cursor, created_at: item.created_at || target.created_at };
+    }
+    const streamedMessage = telegramMessage(item);
+    const streamedEphemeral = item?.ephemeral_message_id ?? streamedMessage?.ephemeral_message_id;
+    const streamedReceiver = item?.receiver_user_id ?? streamedMessage?.receiver_user_id ?? conversation?.receiver_user_id;
+    const staleEphemeralRows = [];
+    if (streamedEphemeral !== "" && streamedEphemeral != null && streamedReceiver !== "" && streamedReceiver != null) {
+      messages.forEach((candidate) => {
+        const candidateMessage = telegramMessage(candidate);
+        const candidateEphemeral = candidate?.ephemeral_message_id ?? candidateMessage?.ephemeral_message_id;
+        const candidateReceiver = candidate?.receiver_user_id ?? candidateMessage?.receiver_user_id ?? conversation?.receiver_user_id;
+        if (String(candidateEphemeral ?? "") === String(streamedEphemeral)
+          && String(candidateReceiver ?? "") === String(streamedReceiver)
+          && messageStableId(candidate) !== messageStableId(item)) {
+          candidate.actionable = false;
+          candidate._observed_cursor = timelineItemCursor(streamedItem);
+          candidate._locally_observed = true;
+          staleEphemeralRows.push(candidate);
+        }
+      });
+    }
+    const id = messageStableId(item);
+    const existingIndex = messages.findIndex((candidate) => messageStableId(candidate) === id);
+    if (existingIndex >= 0) messages[existingIndex] = item;
+    else messages.push(item);
+    conversation.messages = messages;
+    conversation.last_update_at = messageTime(item) || conversation.last_update_at;
+    conversation.last_message_preview = `${isOutgoing(item) ? "You: " : ""}${messagePreview(item)}`;
+    renderConversationListLive();
+    const timeline = document.querySelector("#chat-timeline");
+    if (!timeline) return;
+    const key = botViewKey(context.botId, context.conversationId);
+    const scrollState = state.botViewScrollState.get(key) || {};
+    const wasNearBottom = botViewNearBottom(timeline);
+    const selectorId = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id.replace(/[^a-zA-Z0-9_-]/g, "");
+    const existing = timeline.querySelector(`[data-message-id="${selectorId}"]`);
+    if (existing) existing.outerHTML = renderMessage(item, existingIndex);
+    else {
+      timeline.querySelector(".empty-state")?.remove();
+      if (!timeline.querySelector(".timeline-day")) timeline.insertAdjacentHTML("afterbegin", '<div class="timeline-day"><span>Conversation history</span></div>');
+      timeline.insertAdjacentHTML("beforeend", renderMessage(item, messages.length - 1));
+    }
+    staleEphemeralRows.forEach((candidate) => {
+      const stableId = messageStableId(candidate);
+      const escapedId = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(stableId) : stableId.replace(/[^a-zA-Z0-9_-]/g, "");
+      const row = timeline.querySelector(`[data-message-id="${escapedId}"]`);
+      if (row) row.outerHTML = renderMessage(candidate, messages.indexOf(candidate));
+    });
+    if (wasNearBottom) timeline.scrollTop = timeline.scrollHeight;
+    else scrollState.unread = botViewUnreadAfterInsert(scrollState.unread, existing ? 0 : 1, false);
+    scrollState.top = timeline.scrollTop;
+    scrollState.nearBottom = wasNearBottom;
+    scrollState.messageCount = messages.length;
+    state.botViewScrollState.set(key, scrollState);
+    updateScrollLatestControl();
+    observeBotViewMedia();
+  }
+
+  async function loadOlderBotViewMessages() {
+    if (state.botViewLoadingOlder || !state.selectedBotId || !state.selectedConversationId) return;
+    const botIdValue = String(state.selectedBotId);
+    const conversationIdValue = String(state.selectedConversationId);
+    const key = botViewKey(botIdValue, conversationIdValue);
+    const before = state.botViewMessageNextBefore.get(key);
+    if (!before) return;
+    const sessionVersion = state.sessionVersion;
+    const contextVersion = state.botContextVersion;
+    const timeline = document.querySelector("#chat-timeline");
+    const oldHeight = timeline?.scrollHeight || 0;
+    const oldTop = timeline?.scrollTop || 0;
+    state.botViewLoadingOlder = true;
+    timeline?.querySelector('[data-action="load-older-messages"]')?.setAttribute("disabled", "");
+    try {
+      const payload = await api(`/bots/${encodeURIComponent(botIdValue)}/conversations/${encodeURIComponent(conversationIdValue)}/messages?limit=100&before=${encodeURIComponent(before)}`);
+      if (state.sessionVersion !== sessionVersion || state.botContextVersion !== contextVersion || String(state.selectedConversationId) !== conversationIdValue) return;
+      const older = listFrom(payload, "messages");
+      const conversation = state.conversations.find((candidate) => conversationId(candidate) === conversationIdValue);
+      if (!conversation) return;
+      const existingIds = new Set(conversationMessages(conversation).map((item) => messageStableId(item)));
+      const uniqueOlder = older.filter((item) => !existingIds.has(messageStableId(item)));
+      conversation.messages = [...uniqueOlder, ...conversationMessages(conversation)];
+      state.botViewMessageNextBefore.set(key, payload?.next_before ?? payload?.data?.next_before ?? null);
+      const currentTimeline = document.querySelector("#chat-timeline");
+      if (currentTimeline && uniqueOlder.length) {
+        const day = currentTimeline.querySelector(".timeline-day");
+        day?.insertAdjacentHTML("afterend", uniqueOlder.map(renderMessage).join(""));
+        currentTimeline.scrollTop = botViewPrependScrollTop(oldTop, oldHeight, currentTimeline.scrollHeight);
+        observeBotViewMedia();
+      }
+      const loadContainer = currentTimeline?.querySelector(".load-older");
+      const nextBefore = state.botViewMessageNextBefore.get(key);
+      if (loadContainer) loadContainer.outerHTML = nextBefore ? '<div class="load-older"><button class="btn btn--secondary btn--sm" type="button" data-action="load-older-messages">Load earlier messages</button></div>' : "";
+      const scrollState = state.botViewScrollState.get(key) || {};
+      scrollState.top = currentTimeline?.scrollTop || 0;
+      scrollState.messageCount = conversation.messages.length;
+      state.botViewScrollState.set(key, scrollState);
+    } catch (error) {
+      toast(botViewErrorMessage(error), "error");
+    } finally {
+      state.botViewLoadingOlder = false;
+      document.querySelector('[data-action="load-older-messages"]')?.removeAttribute("disabled");
+    }
   }
 
   async function handleExpiredSession() {
@@ -1230,6 +1588,7 @@
   async function routeChanged() {
     stopUpdatesStream({ status: "idle" });
     stopBotViewRefresh();
+    stopBotViewMessageStream();
     const previousRouteName = state.route.name;
     state.route = parseRoute();
     if (previousRouteName !== "bot-view" || state.route.name !== "bot-view") {
@@ -1291,6 +1650,7 @@
       document.body.classList.add("console-open");
     }
     renderModal();
+    if (state.route.name === "bot-view") window.requestAnimationFrame(initializeBotViewDom);
   }
 
   function renderLanding() {
@@ -1527,12 +1887,12 @@
     return `<div class="app-shell ${state.mobileMenu ? "is-menu-open" : ""}">
       ${renderSidebar(bot)}
       <button class="mobile-overlay" type="button" data-action="close-menu" aria-label="Close navigation" aria-hidden="${state.mobileMenu ? "false" : "true"}" tabindex="${state.mobileMenu ? "0" : "-1"}"></button>
-      <div class="app-main">
+      <div class="app-main${routeName === "bot-view" ? " app-main--bot-view" : ""}">
         <header class="topbar">
           <div class="topbar__left"><button class="btn btn--ghost btn--icon mobile-menu-btn" type="button" data-action="toggle-menu" aria-label="${state.mobileMenu ? "Close" : "Open"} navigation" aria-controls="app-sidebar" aria-expanded="${state.mobileMenu ? "true" : "false"}">${icon(state.mobileMenu ? "close" : "menu")}</button><span class="topbar__title">${esc(titleMap[routeName] || "Phenogram")}</span>${bot && routeName.startsWith("bot-") ? `<span class="topbar__crumb">${esc(botCrumb)}</span>` : ""}</div>
           <div class="topbar__actions"><span class="health-pill ${healthClass}">${healthClass === "is-down" ? "API issue" : "Platform online"}</span><button class="btn btn--secondary btn--sm" type="button" data-action="open-connect">${icon("plus")}<span>Connect bot</span></button></div>
         </header>
-        <main id="main-content" tabindex="-1">${renderMain()}</main>
+        <main id="main-content"${routeName === "bot-view" ? ' class="main--bot-view"' : ""} tabindex="-1">${renderMain()}</main>
       </div>
       ${renderMobileNav()}
       ${renderDrawer()}
@@ -1770,19 +2130,551 @@
   }
 
   function conversationId(item) {
-    return String(item?.chat_id ?? item?.id ?? item?.chat?.id ?? item?.conversation_id ?? "");
+    return String(item?.conversation_id ?? item?.id ?? item?.chat_id ?? item?.chat?.id ?? "");
   }
 
-  const conversationTitle = (item) => item?.title || item?.display_name || item?.name || item?.chat?.title || [item?.first_name || item?.chat?.first_name, item?.last_name || item?.chat?.last_name].filter(Boolean).join(" ") || item?.username && `@${item.username}` || `Chat ${conversationId(item)}`;
+  const conversationChatId = (item) => String(item?.chat_id ?? item?.chat?.id ?? "");
+
+  const conversationTitle = (item) => item?.title || item?.display_name || item?.name || item?.chat?.title || [item?.first_name || item?.chat?.first_name, item?.last_name || item?.chat?.last_name].filter(Boolean).join(" ") || item?.username && `@${item.username}` || (conversationChatId(item) ? `Chat ${conversationChatId(item)}` : "Conversation");
+  const conversationContextLabel = (item) => {
+    const scopes = [];
+    if (item?.business_connection_id) scopes.push("Business");
+    if (item?.guest_query_id) scopes.push("Guest query");
+    if (item?.message_thread_id != null) scopes.push(item?.topic_name ? `Topic: ${item.topic_name}` : `Topic #${item.message_thread_id}`);
+    if (item?.direct_messages_topic_id != null) scopes.push(`Direct topic #${item.direct_messages_topic_id}`);
+    if (item?.receiver_user_id != null) scopes.push(`Ephemeral recipient ${item.receiver_user_id}`);
+    return scopes.join(" · ");
+  };
   const conversationMessages = (item) => Array.isArray(item?.messages) ? item.messages : Array.isArray(item?.items) ? item.items : [];
-  const messageText = (item) => item?.text || item?.message?.text || item?.caption || item?.message?.caption || item?.content?.text || "";
-  const messageTime = (item) => item?.sent_at || item?.created_at || item?.timestamp || item?.date;
+  const BOT_VIEW_MESSAGE_ENVELOPES = ["message", "edited_message", "channel_post", "edited_channel_post", "business_message", "edited_business_message", "guest_message"];
+  const BOT_VIEW_EMOJI = ["😀", "😂", "😍", "🥰", "😎", "🤔", "👍", "👎", "❤️", "🔥", "🎉", "🙏", "👀", "🚀", "✅", "✨"];
+  const BOT_VIEW_MAX_FILES = 10;
+  const BOT_VIEW_CLOUD_MAX_FILE_BYTES = 50_000_000;
+  const BOT_VIEW_CLOUD_MAX_TOTAL_BYTES = 500_000_000;
+  const BOT_VIEW_LOCAL_MAX_FILE_BYTES = 2_000_000_000;
+  const BOT_VIEW_LOCAL_MAX_TOTAL_BYTES = 20_000_000_000;
+  const BOT_VIEW_PHOTO_MAX_FILE_BYTES = 10_000_000;
+
+  function telegramMessage(item) {
+    const candidates = [item?.message, item?.payload, item?.content, item];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== "object") continue;
+      for (const key of BOT_VIEW_MESSAGE_ENVELOPES) {
+        if (candidate[key] && typeof candidate[key] === "object") return candidate[key];
+      }
+      if (candidate?.result && typeof candidate.result === "object") return candidate.result;
+      if (candidate?.message_id != null || candidate?.text != null || candidate?.caption != null) return candidate;
+    }
+    return item || {};
+  }
+
+  function replaceTelegramMessageValue(item, nextMessage) {
+    const current = telegramMessage(item);
+    if (current === item) return { ...item, ...nextMessage };
+    if (item?.message === current) return { ...item, message: nextMessage };
+    for (const containerKey of ["payload", "content"]) {
+      const container = item?.[containerKey];
+      if (container === current) return { ...item, [containerKey]: nextMessage };
+      if (!container || typeof container !== "object") continue;
+      for (const envelope of BOT_VIEW_MESSAGE_ENVELOPES) {
+        if (container[envelope] === current) return { ...item, [containerKey]: { ...container, [envelope]: nextMessage } };
+      }
+    }
+    return { ...item, payload: nextMessage };
+  }
+
+  const messageText = (item) => {
+    const message = telegramMessage(item);
+    return item?.text ?? message?.text ?? item?.caption ?? message?.caption ?? item?.content?.text ?? "";
+  };
+  const messageTime = (item) => item?.sent_at || item?.created_at || item?.timestamp || item?.date || telegramMessage(item)?.date;
   const isOutgoing = (item) => item?.outgoing === true || item?.is_outgoing === true || ["out", "outgoing", "bot", "sent"].includes(String(item?.direction || item?.sender_type || "").toLowerCase());
+
+  function botViewKey(botIdValue = state.selectedBotId, chatId = state.selectedConversationId) {
+    return `${String(botIdValue || "")}:${String(chatId || "")}`;
+  }
+
+  const botViewNearBottom = ({ scrollHeight = 0, scrollTop = 0, clientHeight = 0 }, threshold = 72) => scrollHeight - scrollTop - clientHeight <= threshold;
+  const botViewPrependScrollTop = (oldTop, oldHeight, newHeight) => Math.max(0, Number(oldTop || 0) + Math.max(0, Number(newHeight || 0) - Number(oldHeight || 0)));
+  const botViewUnreadAfterInsert = (previous, added, wasNearBottom) => wasNearBottom ? 0 : Math.max(0, Number(previous || 0)) + Math.max(0, Number(added || 0));
+
+  function emptyBotViewDraft() {
+    return { text: "", files: [], reply: null, edit: null, sendMode: "media", parseMode: "", replyMarkup: null, retryClientId: null, deliveryUnknown: false, suppressEphemeralReply: false };
+  }
+
+  function messageTimeMs(item) {
+    const value = messageTime(item);
+    if (typeof value === "number" && Number.isFinite(value)) return value < 1_000_000_000_000 ? value * 1000 : value;
+    const parsed = Date.parse(String(value || ""));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function recentEphemeralReply(conversation, now = Date.now()) {
+    if (conversation?.receiver_user_id == null) return null;
+    const incoming = [...conversationMessages(conversation)].reverse().find((item) => {
+      const ephemeralId = item?.ephemeral_message_id ?? telegramMessage(item)?.ephemeral_message_id;
+      const sentAt = messageTimeMs(item);
+      return !isOutgoing(item) && ephemeralId !== "" && ephemeralId != null && sentAt > 0 && now - sentAt >= 0 && now - sentAt <= 15_000;
+    });
+    if (!incoming) return null;
+    return {
+      ephemeral_message_id: incoming?.ephemeral_message_id ?? telegramMessage(incoming)?.ephemeral_message_id,
+      action_generation: incoming?.action_generation,
+      preview: messagePreview(incoming),
+    };
+  }
+
+  function ephemeralMessageIsActionable(item, conversation) {
+    const message = telegramMessage(item);
+    const ephemeralId = item?.ephemeral_message_id ?? message?.ephemeral_message_id;
+    const receiverId = item?.receiver_user_id ?? message?.receiver_user_id ?? conversation?.receiver_user_id;
+    if (ephemeralId === "" || ephemeralId == null || receiverId === "" || receiverId == null) return false;
+    if (typeof item?.actionable === "boolean") return item.actionable;
+    const newest = [...conversationMessages(conversation)].reverse().find((candidate) => {
+      const candidateMessage = telegramMessage(candidate);
+      const candidateEphemeral = candidate?.ephemeral_message_id ?? candidateMessage?.ephemeral_message_id;
+      const candidateReceiver = candidate?.receiver_user_id ?? candidateMessage?.receiver_user_id ?? conversation?.receiver_user_id;
+      return String(candidateEphemeral ?? "") === String(ephemeralId) && String(candidateReceiver ?? "") === String(receiverId);
+    });
+    return Boolean(newest) && messageStableId(newest) === messageStableId(item)
+      && newest?.status !== "deleted" && newest?.deleted !== true;
+  }
+
+  function effectiveReplyForConversation(draft, conversation) {
+    return draft?.reply || (!draft?.suppressEphemeralReply ? recentEphemeralReply(conversation) : null);
+  }
+
+  function botViewDraft({ create = true } = {}) {
+    const key = botViewKey();
+    if (!state.botViewDrafts.has(key) && create) state.botViewDrafts.set(key, emptyBotViewDraft());
+    return state.botViewDrafts.get(key) || emptyBotViewDraft();
+  }
+
+  function revokeDraftFiles(draft) {
+    (draft?.files || []).forEach((attachment) => {
+      if (attachment?.url?.startsWith?.("blob:")) URL.revokeObjectURL(attachment.url);
+    });
+  }
+
+  function revokeTimelineLocalPreviews(item) {
+    (item?._local_preview_urls || []).forEach((url) => {
+      if (String(url || "").startsWith("blob:")) URL.revokeObjectURL(url);
+    });
+  }
+
+  function telegramMessageId(item) {
+    const message = telegramMessage(item);
+    return item?.telegram_message_id ?? item?.message_id ?? message?.message_id ?? "";
+  }
+
+  function messageStableId(item, index = 0) {
+    if (item?.id || item?.client_id) return String(item.id || item.client_id);
+    if (item?.cursor !== "" && item?.cursor != null) return `cursor-${item.cursor}`;
+    const ephemeral = item?.ephemeral_message_id ?? telegramMessage(item)?.ephemeral_message_id;
+    const receiver = item?.receiver_user_id ?? telegramMessage(item)?.receiver_user_id;
+    if (ephemeral !== "" && ephemeral != null && receiver !== "" && receiver != null) return `ephemeral-${receiver}-${ephemeral}`;
+    return String(telegramMessageId(item) || `${messageTime(item) || "message"}-${index}`);
+  }
+
+  function timelineSemanticIdentity(item) {
+    if (!item || typeof item !== "object") return "";
+    const message = telegramMessage(item);
+    const eventType = String(item?.event_type || item?.type || item?.payload?.action || "");
+    const actionPayload = item?.payload && typeof item.payload === "object" ? item.payload : {};
+    const request = actionPayload?.request && typeof actionPayload.request === "object" ? actionPayload.request : {};
+    if (eventType === "answerGuestQuery") {
+      const resultId = request?.result?.id;
+      if (resultId != null) return `guest:${resultId}`;
+    }
+    const telegramId = telegramMessageId(item);
+    if (telegramId !== "" && telegramId != null && Number(telegramId) !== 0) {
+      if (String(item?.direction || "").toLowerCase() === "action") return `action:${eventType}:${telegramId}`;
+      return `message:${isOutgoing(item) ? "out" : "in"}:${telegramId}`;
+    }
+    const ephemeralId = item?.ephemeral_message_id ?? message?.ephemeral_message_id ?? request?.ephemeral_message_id;
+    const receiverId = item?.receiver_user_id ?? message?.receiver_user_id ?? message?.receiver_user?.id;
+    if (ephemeralId !== "" && ephemeralId != null && receiverId !== "" && receiverId != null) {
+      const date = message?.date ?? "";
+      return `${String(item?.direction || "").toLowerCase() === "action" ? `action:${eventType}` : `ephemeral:${isOutgoing(item) ? "out" : "in"}`}:${receiverId}:${ephemeralId}:${date}`;
+    }
+    return "";
+  }
+
+  function safeMediaUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw, window.location.origin);
+      if (parsed.protocol === "blob:") return parsed.origin === window.location.origin ? parsed.href : "";
+      return ["http:", "https:"].includes(parsed.protocol) && parsed.origin === window.location.origin ? parsed.href : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function safeExternalLink(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw, window.location.origin);
+      return ["http:", "https:", "tg:"].includes(parsed.protocol) ? parsed.href : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function formatBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 1) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    const position = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const size = bytes / (1024 ** position);
+    return `${size >= 10 || position === 0 ? Math.round(size) : size.toFixed(1)} ${units[position]}`;
+  }
+
+  function normalizedAttachments(item) {
+    const message = telegramMessage(item);
+    const normalized = Array.isArray(item?.media) ? item.media
+      : Array.isArray(item?.attachments) ? item.attachments
+        : Array.isArray(item?.content?.media) ? item.content.media
+        : Array.isArray(message?.media) ? message.media
+          : [];
+    if (normalized.length) return normalized.map((attachment) => ({ ...attachment, kind: attachment.kind || attachment.type || "document" }));
+    const attachments = [];
+    const photos = Array.isArray(message?.photo) ? message.photo : [];
+    if (photos.length) {
+      const photo = [...photos].sort((left, right) => ((left.width || 0) * (left.height || 0)) - ((right.width || 0) * (right.height || 0))).pop();
+      attachments.push({ ...photo, kind: "photo" });
+    }
+    ["animation", "video", "video_note", "audio", "voice", "document", "sticker", "story"].forEach((kind) => {
+      if (message?.[kind]) attachments.push({ ...message[kind], kind });
+    });
+    if (message?.live_photo) {
+      const livePhoto = message.live_photo;
+      const photoPart = Array.isArray(livePhoto.photo) ? livePhoto.photo[livePhoto.photo.length - 1] : livePhoto.photo || livePhoto;
+      if (photoPart?.file_id) attachments.push({ ...photoPart, kind: "photo", label: "Live photo" });
+      if (livePhoto.file_id) attachments.push({ ...livePhoto, kind: "live_photo", label: "Live photo" });
+    }
+    const paidMedia = message?.paid_media?.paid_media || message?.paid_media?.media;
+    if (Array.isArray(paidMedia)) paidMedia.forEach((entry) => {
+      if (Array.isArray(entry?.photo) && entry.photo.length) attachments.push({ ...entry.photo[entry.photo.length - 1], kind: "paid_photo", label: "Paid photo" });
+      else if (entry?.video) attachments.push({ ...entry.video, kind: "paid_video", label: "Paid video" });
+      else if (entry?.live_photo) {
+        const livePhoto = entry.live_photo;
+        const photo = Array.isArray(livePhoto.photo) ? livePhoto.photo[livePhoto.photo.length - 1] : null;
+        if (photo?.file_id) attachments.push({ ...photo, kind: "paid_photo", label: "Paid live photo" });
+        if (livePhoto.file_id) attachments.push({ ...livePhoto, kind: "paid_live_photo", label: "Paid live photo" });
+      } else if (entry?.preview) attachments.push({ ...entry.preview, kind: "paid_media", label: "Paid media preview" });
+    });
+    if (item?._optimistic && Array.isArray(item.media)) return item.media;
+    return attachments;
+  }
+
+  function attachmentUrl(attachment) {
+    const supplied = safeMediaUrl(attachment?.url || attachment?.file_url || attachment?.download_url || attachment?.src || attachment?.thumbnail?.url || attachment?.thumb?.url);
+    if (supplied) return supplied;
+    const fileId = String(attachment?.file_id || "");
+    return state.selectedBotId && /^[A-Za-z0-9_-]{1,512}$/.test(fileId) ? `${API}/bots/${encodeURIComponent(state.selectedBotId)}/media/${encodeURIComponent(fileId)}` : "";
+  }
+
+  function renderAttachment(attachment, index) {
+    const kind = String(attachment?.kind || attachment?.type || "document").toLowerCase();
+    const visualKind = kind === "live_photo" || kind.endsWith("_live_photo") ? "video" : kind.startsWith("paid_") ? kind.slice(5) : kind;
+    const url = attachmentUrl(attachment);
+    const name = attachment?.label || attachment?.file_name || attachment?.name || ({ photo: "Photo", video: "Video", animation: "Animation", video_note: "Video message", audio: "Audio", voice: "Voice message", sticker: attachment?.emoji ? `Sticker ${attachment.emoji}` : "Sticker", live_photo: "Live photo", story: "Story", media: "Paid media" }[visualKind] || "Document");
+    const detail = [attachment?.mime_type, formatBytes(attachment?.file_size || attachment?.size), attachment?.duration ? `${attachment.duration}s` : ""].filter(Boolean).join(" · ");
+    let content;
+    if (["photo", "sticker"].includes(visualKind) && url) {
+      content = `<img src="${esc(url)}" alt="${esc(name)}" loading="lazy">`;
+    } else if (["video", "animation", "video_note"].includes(visualKind) && url) {
+      content = `<video src="${esc(url)}" controls playsinline preload="metadata" aria-label="${esc(name)}"></video>`;
+    } else if (["audio", "voice"].includes(visualKind) && url) {
+      content = `<div class="message-media__audio"><span aria-hidden="true">${visualKind === "voice" ? "🎙" : "♫"}</span><audio src="${esc(url)}" controls preload="metadata"></audio></div>`;
+    } else {
+      const card = `<span class="message-file__icon" aria-hidden="true">${kind === "story" ? "◉" : kind.startsWith("paid_") ? "★" : "↧"}</span><span class="message-file__copy"><strong>${esc(name)}</strong>${detail ? `<small>${esc(detail)}</small>` : `<small>${url ? "Open attachment" : "Telegram file"}</small>`}</span>`;
+      content = url ? `<a class="message-file" href="${esc(url)}" target="_blank" rel="noopener noreferrer" download>${card}</a>` : `<div class="message-file">${card}</div>`;
+    }
+    const media = `<div class="message-media message-media--${esc(kind)}" data-media-index="${index}">${content}</div>`;
+    return attachment?.has_media_spoiler ? `<details class="message-spoiler"><summary>Reveal spoiler</summary>${media}</details>` : media;
+  }
+
+  function renderReplySnippet(reply) {
+    if (!reply) return "";
+    const author = reply.from?.first_name || reply.sender_name || reply.author || (reply.outgoing ? "Bot" : "Message");
+    const text = reply.text || reply.caption || reply.preview || normalizedAttachments(reply)[0]?.kind || "Message";
+    return `<div class="message-reply"><strong>${esc(author)}</strong><span>${esc(String(text).slice(0, 180))}</span></div>`;
+  }
+
+  function renderPoll(poll) {
+    if (!poll) return "";
+    const total = Number(poll.total_voter_count || 0);
+    return `<section class="message-poll"><strong>${esc(poll.question?.text || poll.question || "Poll")}</strong>${Array.isArray(poll.options) ? poll.options.map((option) => {
+      const votes = Number(option.voter_count || 0);
+      const percent = total ? Math.round((votes / total) * 100) : 0;
+      return `<div class="message-poll__option"><span><b>${esc(option.text || option.option || "Option")}</b><em>${percent}%</em></span><i style="--poll-result:${percent}%"></i></div>`;
+    }).join("") : ""}<small>${total} ${total === 1 ? "vote" : "votes"}${poll.is_closed ? " · closed" : ""}</small></section>`;
+  }
+
+  function renderStructuredMessage(item) {
+    const message = telegramMessage(item);
+    const chunks = [];
+    const attachments = message?.rich_message ? [] : normalizedAttachments(item);
+    if (attachments.length) chunks.push(`<div class="message-media-grid${attachments.length > 1 ? " is-album" : ""}">${attachments.map(renderAttachment).join("")}</div>`);
+    if (message?.contact) chunks.push(`<div class="message-card"><span aria-hidden="true">👤</span><div><strong>${esc([message.contact.first_name, message.contact.last_name].filter(Boolean).join(" ") || "Contact")}</strong><a href="tel:${esc(message.contact.phone_number || "")}">${esc(message.contact.phone_number || "No phone number")}</a></div></div>`);
+    const location = message?.venue?.location || message?.location;
+    if (location) {
+      const latitude = Number(location.latitude);
+      const longitude = Number(location.longitude);
+      const mapUrl = Number.isFinite(latitude) && Number.isFinite(longitude) ? `https://www.openstreetmap.org/?mlat=${encodeURIComponent(latitude)}&mlon=${encodeURIComponent(longitude)}#map=16/${encodeURIComponent(latitude)}/${encodeURIComponent(longitude)}` : "";
+      const label = message?.venue?.title || "Location";
+      chunks.push(`<div class="message-card message-card--location"><span aria-hidden="true">📍</span><div><strong>${esc(label)}</strong><span>${esc(message?.venue?.address || [latitude, longitude].filter(Number.isFinite).join(", "))}</span>${mapUrl ? `<a href="${esc(mapUrl)}" target="_blank" rel="noopener noreferrer">Open map</a>` : ""}</div></div>`);
+    }
+    if (message?.poll) chunks.push(renderPoll(message.poll));
+    if (message?.dice) chunks.push(`<div class="message-dice" aria-label="Dice result ${esc(message.dice.value)}"><span>${esc(message.dice.emoji || "🎲")}</span><strong>${esc(message.dice.value ?? "")}</strong></div>`);
+    if (message?.game) chunks.push(`<div class="message-card"><span aria-hidden="true">🎮</span><div><strong>${esc(message.game.title || "Game")}</strong><span>${esc(message.game.description || "")}</span></div></div>`);
+    if (message?.rich_message) chunks.push(renderRichMessage(message.rich_message));
+    if (message?.checklist) chunks.push(renderChecklist(message.checklist));
+    if (message?.new_chat_members) chunks.push(`<div class="message-service">${esc(message.new_chat_members.map((member) => member.first_name || member.username || "Member").join(", "))} joined the chat</div>`);
+    if (message?.left_chat_member) chunks.push(`<div class="message-service">${esc(message.left_chat_member.first_name || message.left_chat_member.username || "Member")} left the chat</div>`);
+    if (message?.pinned_message) chunks.push(`<div class="message-service">Pinned: ${esc(messageText(message.pinned_message) || "message")}</div>`);
+    if (message?.forward_origin) chunks.unshift(`<div class="message-service">Forwarded from ${esc(message.forward_origin.sender_user?.first_name || message.forward_origin.sender_user_name || message.forward_origin.chat?.title || message.forward_origin.type || "another chat")}</div>`);
+    if (message?.checklist_tasks_done) chunks.push(`<div class="message-service">Checklist updated · ${esc((message.checklist_tasks_done.checklist_task_ids || []).length)} completed</div>`);
+    if (message?.checklist_tasks_added) chunks.push(`<div class="message-service">Checklist updated · ${esc((message.checklist_tasks_added.tasks || []).length)} added</div>`);
+    if (message?.invoice) chunks.push(`<div class="message-card"><span aria-hidden="true">🧾</span><div><strong>${esc(message.invoice.title || "Invoice")}</strong><span>${esc(message.invoice.description || "")}</span><b>${esc(message.invoice.total_amount ?? "")} ${esc(message.invoice.currency || "")}</b></div></div>`);
+    if (message?.successful_payment) chunks.push(`<div class="message-card"><span aria-hidden="true">✓</span><div><strong>Payment received</strong><span>${esc(message.successful_payment.total_amount ?? "")} ${esc(message.successful_payment.currency || "")}</span></div></div>`);
+    if (message?.refunded_payment) chunks.push(`<div class="message-card"><span aria-hidden="true">↩</span><div><strong>Payment refunded</strong><span>${esc(message.refunded_payment.total_amount ?? "")} ${esc(message.refunded_payment.currency || "")}</span></div></div>`);
+    const serviceLabels = {
+      forum_topic_created: "Forum topic created", forum_topic_closed: "Forum topic closed", forum_topic_reopened: "Forum topic reopened", forum_topic_edited: "Forum topic edited",
+      video_chat_scheduled: "Video chat scheduled", video_chat_started: "Video chat started", video_chat_ended: "Video chat ended", video_chat_participants_invited: "Participants invited",
+      suggested_post_approved: "Suggested post approved", suggested_post_declined: "Suggested post declined", suggested_post_paid: "Suggested post paid", suggested_post_refunded: "Suggested post refunded",
+      giveaway_created: "Giveaway created", giveaway_completed: "Giveaway completed", giveaway_winners: "Giveaway winners announced", boost_added: "Chat boost added",
+    };
+    Object.entries(serviceLabels).forEach(([field, label]) => { if (message?.[field]) chunks.push(`<div class="message-service">${esc(label)}</div>`); });
+    if (Array.isArray(message?.reactions) && message.reactions.length) chunks.push(`<div class="message-reactions">${message.reactions.map((reaction) => `<span>${esc(reaction.emoji || reaction.type || "Reaction")}${reaction.count ? ` ${esc(reaction.count)}` : ""}</span>`).join("")}</div>`);
+    if (Array.isArray(item?._callback_events)) item._callback_events.forEach((callback) => {
+      chunks.push(renderCallbackEvent(callback));
+    });
+    return chunks.join("");
+  }
+
+  function renderRichMessage(richMessage) {
+    const blocks = Array.isArray(richMessage) ? richMessage : Array.isArray(richMessage?.blocks) ? richMessage.blocks : [richMessage];
+    return `<section class="message-rich"><span class="message-rich__label">Rich message</span>${renderRichBlocks(blocks)}</section>`;
+  }
+
+  function richTextPlain(value) {
+    if (typeof value === "string" || typeof value === "number") return String(value);
+    if (Array.isArray(value)) return value.map(richTextPlain).join("");
+    if (!value || typeof value !== "object") return "";
+    return richTextPlain(value.text ?? value.children ?? value.content ?? value.value ?? "");
+  }
+
+  function renderRichText(value, depth = 0) {
+    if (depth > 20) return esc(richTextPlain(value));
+    if (typeof value === "string" || typeof value === "number") return esc(String(value));
+    if (Array.isArray(value)) return value.map((part) => renderRichText(part, depth + 1)).join("");
+    if (!value || typeof value !== "object") return "";
+    const type = String(value.type || "plain").toLowerCase();
+    const inner = renderRichText(value.text ?? value.children ?? value.content ?? value.value ?? "", depth + 1);
+    const tag = {
+      bold: "strong", italic: "em", underline: "u", strikethrough: "s", code: "code",
+      monospace: "code", subscript: "sub", superscript: "sup", marked: "mark",
+    }[type];
+    if (tag) return `<${tag}>${inner}</${tag}>`;
+    if (["spoiler", "hidden"].includes(type)) return `<span class="text-spoiler" tabindex="0">${inner}</span>`;
+    if (["url", "text_url", "link"].includes(type)) {
+      const href = safeExternalLink(value.url || value.href || richTextPlain(value.text));
+      return href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${inner || esc(href)}</a>` : inner;
+    }
+    if (type === "email") {
+      const address = String(value.email || richTextPlain(value.text) || "").trim();
+      return /^[^\s@]+@[^\s@]+$/.test(address) ? `<a href="mailto:${esc(address)}">${inner || esc(address)}</a>` : inner;
+    }
+    if (["phone", "phone_number"].includes(type)) {
+      const number = String(value.phone_number || value.phone || richTextPlain(value.text) || "").trim();
+      return number && /^[+0-9().\-\s]+$/.test(number) ? `<a href="tel:${esc(number)}">${inner || esc(number)}</a>` : inner;
+    }
+    return inner || esc(richTextPlain(value));
+  }
+
+  function renderRichBlocks(blocks) {
+    return (Array.isArray(blocks) ? blocks : [blocks]).map((block) => {
+      if (typeof block === "string") return `<p>${esc(block)}</p>`;
+      if (!block || typeof block !== "object") return "";
+      const type = String(block.type || "paragraph");
+      const sourceText = block.text ?? block.expression ?? "";
+      const text = richTextPlain(sourceText);
+      const richText = renderRichText(sourceText);
+      if (type === "divider") return "<hr>";
+      if (["heading", "section_heading"].includes(type)) return `<h4>${richText}</h4>`;
+      if (["pre", "preformatted"].includes(type)) return `<pre><code>${esc(text)}</code></pre>`;
+      if (["paragraph", "footer", "mathematical_expression", "anchor", "thinking"].includes(type)) return `<p class="rich-${esc(type)}">${richText || esc(block.name || (type === "thinking" ? "Thinking…" : ""))}</p>`;
+      if (["blockquote", "pullquote", "block_quotation", "pull_quotation"].includes(type)) return `<blockquote>${block.blocks ? renderRichBlocks(block.blocks) : richText}${block.credit ? `<cite>${renderRichText(block.credit)}</cite>` : ""}</blockquote>`;
+      if (type === "details") return `<details${block.is_open ? " open" : ""}><summary>${renderRichText(block.summary) || "Details"}</summary>${renderRichBlocks(block.blocks || [])}</details>`;
+      if (type === "list") return `<ul>${(block.items || []).map((item) => `<li>${item.has_checkbox ? `<input type="checkbox" disabled${item.is_checked ? " checked" : ""}>` : item.label ? `<span>${renderRichText(item.label)}</span>` : ""}${renderRichBlocks(item.blocks || [])}</li>`).join("")}</ul>`;
+      if (type === "table") return `<div class="message-rich__table"><table>${(block.cells || []).map((row) => `<tr>${(row || []).map((cell) => {
+        const tag = cell?.is_header ? "th" : "td";
+        const colspan = Math.max(1, Math.min(20, Number(cell?.colspan) || 1));
+        const rowspan = Math.max(1, Math.min(100, Number(cell?.rowspan) || 1));
+        const content = cell?.blocks ? renderRichBlocks(cell.blocks) : renderRichText(cell?.text ?? cell ?? "");
+        return `<${tag}${colspan > 1 ? ` colspan="${colspan}"` : ""}${rowspan > 1 ? ` rowspan="${rowspan}"` : ""}>${content}</${tag}>`;
+      }).join("")}</tr>`).join("")}</table></div>`;
+      if (["collage", "slideshow"].includes(type)) return `<div class="message-rich__gallery">${renderRichBlocks(block.blocks || [])}</div>${block.caption ? `<p>${renderRichText(block.caption)}</p>` : ""}`;
+      if (type === "map" && block.location) return renderStructuredMessage({ location: block.location, venue: block.caption ? { location: block.location, title: richTextPlain(block.caption) } : null });
+      const media = block.photo || block.video || block.animation || block.audio || block.voice_note;
+      if (media) return `${renderAttachment({ ...(Array.isArray(media) ? media[media.length - 1] : media), kind: type === "voice_note" ? "voice" : type, has_media_spoiler: block.has_spoiler }, 0)}${block.caption ? `<p>${renderRichText(block.caption)}</p>` : ""}`;
+      return `<div class="message-rich__unsupported"><strong>${esc(type.replaceAll("_", " "))}</strong>${text ? `<p>${richText}</p>` : ""}</div>`;
+    }).join("");
+  }
+
+  function renderChecklist(checklist) {
+    const tasks = Array.isArray(checklist?.tasks) ? checklist.tasks : [];
+    return `<section class="message-checklist"><strong>${esc(richTextPlain(checklist?.title) || "Checklist")}</strong>${tasks.map((task) => `<label><input type="checkbox" disabled${task.completed_by_user || task.completed_by_chat || task.completion_date ? " checked" : ""}><span>${esc(richTextPlain(task.text) || "Task")}</span></label>`).join("")}</section>`;
+  }
+
+  function renderMessageText(text, entities = []) {
+    const source = String(text || "");
+    if (!Array.isArray(entities) || !entities.length) return esc(source);
+    const safeEntities = [...entities].filter((entity) => Number.isInteger(entity?.offset) && Number.isInteger(entity?.length) && entity.length > 0 && entity.offset >= 0 && entity.offset < source.length).map((entity) => ({ ...entity, end: Math.min(source.length, entity.offset + entity.length) })).sort((left, right) => left.offset - right.offset || right.end - left.end);
+    const wrap = (entity, inner) => {
+      const segment = source.slice(entity.offset, entity.end);
+      const type = String(entity.type || "");
+      const href = type === "text_link" ? safeExternalLink(entity.url) : type === "url" ? safeExternalLink(segment) : "";
+      if (href) return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${inner}</a>`;
+      const tag = { bold: "strong", italic: "em", underline: "u", strikethrough: "s", code: "code", pre: "code", spoiler: "span" }[type];
+      return tag ? `<${tag}${type === "spoiler" ? ' class="text-spoiler" tabindex="0"' : ""}>${inner}</${tag}>` : inner;
+    };
+    const renderRange = (start, end, candidates) => {
+      let cursor = start;
+      const chunks = [];
+      candidates.forEach((entity) => {
+        if (entity.offset < cursor || entity.offset >= end || entity.end > end) return;
+        chunks.push(esc(source.slice(cursor, entity.offset)));
+        const children = candidates.filter((candidate) => candidate !== entity && candidate.offset >= entity.offset && candidate.end <= entity.end);
+        chunks.push(wrap(entity, renderRange(entity.offset, entity.end, children)));
+        cursor = entity.end;
+      });
+      chunks.push(esc(source.slice(cursor, end)));
+      return chunks.join("");
+    };
+    return renderRange(0, source.length, safeEntities);
+  }
+
+  function renderReplyMarkup(message) {
+    const rows = message?.reply_markup?.inline_keyboard;
+    if (!Array.isArray(rows)) return "";
+    return `<div class="message-keyboard">${rows.map((row) => `<div>${(Array.isArray(row) ? row : []).map((button) => {
+      const label = esc(button?.text || "Button");
+      const url = safeExternalLink(button?.url || button?.web_app?.url);
+      return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${label}</a>` : `<span>${label}</span>`;
+    }).join("")}</div>`).join("")}</div>`;
+  }
+
+  function messagePreview(item) {
+    const text = messageText(item);
+    if (text) return text;
+    const message = telegramMessage(item);
+    const attachment = normalizedAttachments(item)[0];
+    if (attachment) return `${attachment.kind === "photo" ? "📷" : "📎"} ${attachment.file_name || attachment.kind}`;
+    if (message?.poll) return `📊 ${message.poll.question?.text || message.poll.question || "Poll"}`;
+    if (message?.location || message?.venue) return "📍 Location";
+    if (message?.contact) return "👤 Contact";
+    if (message?.dice) return `${message.dice.emoji || "🎲"} ${message.dice.value || ""}`.trim();
+    return item?.event_type || item?.type || "Message";
+  }
+
+  function callbackEventStableId(callback, item) {
+    return String(callback?._event_id || callback?.id || item?._event_id || item?.id || item?.cursor || `${callback?.from?.id || "actor"}:${callback?.message?.message_id || callback?.message_id || "message"}:${callback?.data || callback?.game_short_name || "button"}`);
+  }
+
+  function callbackEventFromTimelineItem(item) {
+    const raw = item?.payload?.callback_query || item?.callback_query;
+    if (raw) return {
+      ...raw,
+      _event_id: item?.id || item?.cursor || raw?.id,
+      _actionable: item?.actionable,
+      _action_generation: item?.action_generation,
+    };
+    const content = item?.content;
+    if (content?.kind !== "callback_query") return null;
+    return {
+      _event_id: item?.id || item?.cursor,
+      from: content.actor,
+      data: content.data,
+      game_short_name: content.game_short_name,
+      message_id: content.target_message_id,
+      _actionable: item?.actionable,
+      _action_generation: item?.action_generation,
+    };
+  }
+
+  function renderCallbackEvent(callback) {
+    const actor = callback?.from?.first_name || callback?.from?.username || callback?.from?.title || "A user";
+    const label = callback?.data || callback?.game_short_name || "an inline button";
+    const canAnswer = callback?._actionable !== false && callback?._action_generation != null && callback?._action_generation !== "";
+    return `<div class="message-service message-callback"><span>${esc(actor)} pressed <strong>${esc(label)}</strong></span>${canAnswer ? `<button type="button" data-action="open-callback-answer" data-action-generation="${esc(callback._action_generation)}" aria-label="Answer callback query">Answer</button>` : '<small>Answered</small>'}</div>`;
+  }
+
+  function withCallbackEvent(target, callback, item) {
+    const event = {
+      ...(callback || item?.payload || item),
+      _actionable: callback?._actionable ?? item?.actionable,
+      _action_generation: callback?._action_generation ?? item?.action_generation,
+    };
+    const eventId = callbackEventStableId(callback, item);
+    const events = [...(target?._callback_events || [])];
+    if (!events.some((candidate) => callbackEventStableId(candidate, candidate) === eventId)) events.push({ ...event, _event_id: eventId });
+    return { ...target, _callback_events: events };
+  }
+
+  function findLastMessageIndexByTelegramId(messages, targetId) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (String(telegramMessageId(messages[index])) === String(targetId)) return index;
+    }
+    return -1;
+  }
+
+  function collapseMediaGroups(messages) {
+    const result = [];
+    const groups = new Map();
+    messages.forEach((item) => {
+      const eventType = String(item?.event_type || item?.type || "");
+      const callback = callbackEventFromTimelineItem(item);
+      if (eventType === "callback_query" || callback) {
+        const targetId = callback?.message?.message_id ?? callback?.message_id;
+        const targetIndex = findLastMessageIndexByTelegramId(result, targetId);
+        if (targetIndex >= 0) result[targetIndex] = withCallbackEvent(result[targetIndex], callback, item);
+        else result.push({ ...item, _timeline_callback_event: callback });
+        return;
+      }
+      if (["poll", "poll_answer"].includes(eventType)) {
+        const poll = item?.payload?.poll || item?.poll;
+        const pollId = poll?.id || item?.payload?.poll_answer?.poll_id || item?.poll_answer?.poll_id;
+        const target = [...result].reverse().find((candidate) => String(telegramMessage(candidate)?.poll?.id || "") === String(pollId || ""));
+        if (target && poll) telegramMessage(target).poll = poll;
+        return;
+      }
+      const message = telegramMessage(item);
+      const groupId = item?.media_group_id || message?.media_group_id;
+      if (!groupId) { result.push(item); return; }
+      const groupKey = `${isOutgoing(item) ? "out" : "in"}:${groupId}`;
+      const existing = groups.get(groupKey);
+      if (!existing) {
+        const grouped = { ...item, media: [...normalizedAttachments(item)], _media_group: groupId };
+        groups.set(groupKey, grouped);
+        result.push(grouped);
+      } else {
+        existing.media.push(...normalizedAttachments(item));
+        if (!messageText(existing) && messageText(item)) existing.caption = messageText(item);
+      }
+    });
+    return result;
+  }
 
   function renderBotView() {
     const bot = currentBot();
     if (!bot) return `<div class="page">${renderNoBots()}</div>`;
-    return `<div class="page page--wide">
+    return `<div class="page page--wide page--bot-view">
       ${pageHeader("Bot View", `See conversations exactly as ${botName(bot)} does, then reply with clear operator intent.`, `<a class="btn btn--secondary btn--sm" href="${botPath(botId(bot), "updates")}">${icon("pulse")}Raw updates</a><span class="badge badge--success">Access audited</span>`)}
       <div id="bot-view-error" aria-live="polite">${renderBotViewError()}</div>
       <section class="bot-view ${state.selectedConversationId ? "has-chat" : ""}">${renderConversationList()}${renderChatPane(bot)}</section>
@@ -1801,6 +2693,7 @@
   }
 
   function captureBotViewUiState() {
+    saveBotViewDraftFromDom();
     const search = document.querySelector("#conversation-search");
     const composer = document.querySelector("#message-form textarea");
     const timeline = document.querySelector("#chat-timeline");
@@ -1813,7 +2706,8 @@
       composerSelectionStart: composer?.selectionStart,
       composerSelectionEnd: composer?.selectionEnd,
       timelineScrollTop: timeline?.scrollTop || 0,
-      timelineWasNearBottom: timeline ? timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight <= 72 : true,
+      timelineWasNearBottom: timeline ? botViewNearBottom(timeline) : true,
+      renderedMessageCount: timeline?.querySelectorAll(".message, .message-event").length || 0,
     };
   }
 
@@ -1827,7 +2721,8 @@
     if (snapshot.conversationId !== String(state.selectedConversationId || "")) return;
     const composer = document.querySelector("#message-form textarea");
     if (composer) {
-      composer.value = snapshot.composerValue;
+      composer.value = botViewDraft().text || snapshot.composerValue;
+      resizeBotViewComposer(composer);
       if (snapshot.composerFocused) {
         composer.focus({ preventScroll: true });
         if (Number.isInteger(snapshot.composerSelectionStart) && Number.isInteger(snapshot.composerSelectionEnd)) {
@@ -1837,9 +2732,23 @@
     }
     const timeline = document.querySelector("#chat-timeline");
     if (timeline) {
+      const key = botViewKey();
+      const nextCount = timeline.querySelectorAll(".message, .message-event").length;
+      const prior = state.botViewScrollState.get(key) || {};
+      const added = Math.max(0, nextCount - snapshot.renderedMessageCount);
       timeline.scrollTop = snapshot.timelineWasNearBottom
         ? timeline.scrollHeight
         : Math.min(snapshot.timelineScrollTop, Math.max(0, timeline.scrollHeight - timeline.clientHeight));
+      state.botViewScrollState.set(key, {
+        ...prior,
+        initialized: true,
+        top: timeline.scrollTop,
+        nearBottom: snapshot.timelineWasNearBottom,
+        messageCount: nextCount,
+        unread: botViewUnreadAfterInsert(prior.unread, added, snapshot.timelineWasNearBottom),
+      });
+      updateScrollLatestControl();
+      observeBotViewMedia();
     }
   }
 
@@ -1856,6 +2765,106 @@
     restoreBotViewUiState(snapshot);
   }
 
+  function saveBotViewDraftFromDom() {
+    if (!state.selectedConversationId) return;
+    const composer = document.querySelector("#message-form textarea");
+    if (!composer) return;
+    const draft = botViewDraft();
+    draft.text = composer.value;
+  }
+
+  function resizeBotViewComposer(textarea) {
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${Math.min(144, Math.max(42, textarea.scrollHeight))}px`;
+  }
+
+  function updateBotViewPrimaryAction() {
+    const textarea = document.querySelector("#message-form textarea");
+    const button = document.querySelector("#message-form .composer-send, #message-form .composer-record");
+    if (!textarea || !button) return;
+    const draft = botViewDraft();
+    const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
+    const guest = Boolean(conversation?.guest_query_id);
+    const canSend = Boolean(textarea.value.trim() || draft.files.length || draft.edit);
+    button.type = canSend || guest ? "submit" : "button";
+    button.classList.toggle("composer-send", canSend || guest);
+    button.classList.toggle("composer-record", !canSend && !guest);
+    button.disabled = guest && !canSend;
+    if (canSend || guest) button.removeAttribute("data-action");
+    else button.dataset.action = "start-voice-recording";
+    button.setAttribute("aria-label", canSend ? (draft.edit ? "Save edited message" : "Send message") : guest ? "Write a text reply" : "Record voice message");
+    button.innerHTML = canSend || guest ? icon(draft.edit ? "check" : "send") : "●";
+  }
+
+  function initializeBotViewDom() {
+    if (state.route.name !== "bot-view" || !state.selectedConversationId) return;
+    const timeline = document.querySelector("#chat-timeline");
+    if (!timeline) return;
+    const key = botViewKey();
+    const existing = state.botViewScrollState.get(key);
+    if (!existing?.initialized || existing.nearBottom !== false) timeline.scrollTop = timeline.scrollHeight;
+    else timeline.scrollTop = Math.min(existing.top || 0, Math.max(0, timeline.scrollHeight - timeline.clientHeight));
+    const nearBottom = botViewNearBottom(timeline);
+    state.botViewScrollState.set(key, {
+      ...existing,
+      initialized: true,
+      top: timeline.scrollTop,
+      nearBottom,
+      unread: nearBottom ? 0 : existing?.unread || 0,
+      messageCount: timeline.querySelectorAll(".message, .message-event").length,
+    });
+    resizeBotViewComposer(document.querySelector("#message-form textarea"));
+    updateScrollLatestControl();
+    observeBotViewMedia();
+  }
+
+  function observeBotViewMedia() {
+    state.botViewTimelineResizeObserver?.disconnect?.();
+    state.botViewTimelineResizeObserver = null;
+    const timeline = document.querySelector("#chat-timeline");
+    if (!timeline) return;
+    const key = botViewKey();
+    const repin = () => {
+      if (key !== botViewKey() || !timeline.isConnected) return;
+      const scrollState = state.botViewScrollState.get(key);
+      if (scrollState?.nearBottom) {
+        timeline.scrollTop = timeline.scrollHeight;
+        scrollState.top = timeline.scrollTop;
+      }
+    };
+    timeline.querySelectorAll("img, video, audio").forEach((media) => {
+      media.addEventListener("load", repin, { once: true });
+      media.addEventListener("loadedmetadata", repin, { once: true });
+    });
+    if (typeof ResizeObserver === "function") {
+      let previousHeight = timeline.scrollHeight;
+      const observer = new ResizeObserver(() => {
+        if (timeline.scrollHeight !== previousHeight) {
+          previousHeight = timeline.scrollHeight;
+          repin();
+        }
+      });
+      timeline.querySelectorAll(".message, .message-event").forEach((message) => observer.observe(message));
+      state.botViewTimelineResizeObserver = observer;
+    }
+  }
+
+  function updateScrollLatestControl() {
+    const key = botViewKey();
+    const timeline = document.querySelector("#chat-timeline");
+    const button = document.querySelector(".scroll-latest");
+    if (!timeline || !button) return;
+    const current = state.botViewScrollState.get(key) || {};
+    const nearBottom = botViewNearBottom(timeline);
+    current.top = timeline.scrollTop;
+    current.nearBottom = nearBottom;
+    if (nearBottom) current.unread = 0;
+    state.botViewScrollState.set(key, current);
+    button.classList.toggle("is-visible", !nearBottom);
+    button.innerHTML = `↓${current.unread ? `<span>${esc(current.unread > 99 ? "99+" : current.unread)}</span>` : ""}`;
+  }
+
   function renderConversationList() {
     const items = state.loading.conversations && !state.conversations.length
       ? `<div class="panel__body skeleton-stack skeleton-stack--conversations"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div>`
@@ -1864,7 +2873,8 @@
           const id = conversationId(item);
           const messages = conversationMessages(item);
           const last = item.last_message || messages[messages.length - 1] || {};
-          return `<button class="conversation ${String(state.selectedConversationId) === id ? "active" : ""}" type="button" data-action="select-conversation" data-conversation-id="${esc(id)}"><span class="chat-avatar">${initials(conversationTitle(item))}</span><span class="conversation__copy"><span class="conversation__line"><strong>${esc(conversationTitle(item))}</strong><time>${esc(formatDate(item.last_update_at || item.updated_at || messageTime(last), "time"))}</time></span><span class="conversation__preview">${esc(messageText(last) || item.last_message_preview || item.last_message_text || "No messages yet")}</span></span></button>`;
+          const contextLabel = conversationContextLabel(item);
+          return `<button class="conversation ${String(state.selectedConversationId) === id ? "active" : ""}" type="button" data-action="select-conversation" data-conversation-id="${esc(id)}"><span class="chat-avatar">${initials(conversationTitle(item))}</span><span class="conversation__copy"><span class="conversation__line"><strong>${esc(conversationTitle(item))}</strong><time>${esc(formatDate(item.last_update_at || item.updated_at || messageTime(last), "time"))}</time></span>${contextLabel ? `<small class="conversation__context">${esc(contextLabel)}</small>` : ""}<span class="conversation__preview">${esc(item.last_message_preview || item.last_message_text || messagePreview(last) || "No messages yet")}</span></span></button>`;
         }).join("")
         : `<div class="empty-state"><span class="empty-state__icon">${icon("message")}</span><h3>No conversations yet</h3><p>Chats appear after this bot receives message updates.</p></div>`;
     return `<aside class="conversation-list"><div class="conversation-list__head"><h2>Conversations</h2><div class="toolbar__search">${icon("search")}<input class="search-input" id="conversation-search" type="search" placeholder="Search name or chat ID" aria-label="Search conversations"></div></div><div class="conversation-list__items" id="conversation-items">${items}</div></aside>`;
@@ -1873,21 +2883,146 @@
   function renderChatPane(bot) {
     const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
     if (!conversation) return `<section class="chat-pane"><div class="empty-state empty-state--fill"><span class="empty-state__icon">${icon("message")}</span><h2>Select a conversation</h2><p>Choose a chat to inspect the timeline and reply as ${esc(botUsername(bot))}.</p></div></section>`;
-    const messages = conversationMessages(conversation);
+    const key = botViewKey(botId(bot), conversationId(conversation));
+    const optimistic = state.botViewOptimisticMessages.get(key) || [];
+    const messages = collapseMediaGroups([...conversationMessages(conversation), ...optimistic]);
     const sending = botViewSendIsInFlight(botId(bot), conversationId(conversation));
-    return `<section class="chat-pane"><header class="chat-pane__head"><button class="btn btn--ghost btn--icon chat-back" type="button" data-action="chat-back" aria-label="Back to conversations">${icon("arrow", "" )}</button><span class="chat-avatar">${initials(conversationTitle(conversation))}</span><span class="chat-pane__head-copy"><strong>${esc(conversationTitle(conversation))}</strong><span>chat_id: ${esc(conversationId(conversation))}</span></span><span class="badge badge--success">Bot can reply</span></header>
-      <div class="timeline" id="chat-timeline">${messages.length ? `<div class="timeline-day"><span>Conversation history</span></div>${messages.map(renderMessage).join("")}` : `<div class="empty-state"><span class="empty-state__icon">${icon("message")}</span><h3>No message history</h3><p>This conversation exists, but no message payloads were returned.</p></div>`}</div>
-      <footer class="composer"><div class="composer__label"><span>Reply as <strong>${esc(botUsername(bot))}</strong></span><span>Operator sends are audited</span></div><form class="composer__form" id="message-form"${sending ? ' aria-busy="true"' : ""}><textarea name="text" rows="1" maxlength="4096" placeholder="Write a reply…" aria-label="Reply text" required${sending ? " disabled" : ""}></textarea><button class="btn btn--primary btn--icon" type="submit" aria-label="${sending ? "Sending reply" : "Send reply"}"${sending ? " disabled" : ""}>${icon(sending ? "refresh" : "send")}</button></form><div data-form-error aria-live="polite"></div></footer>
+    const draft = botViewDraft();
+    const scrollState = state.botViewScrollState.get(key) || {};
+    const nextBefore = state.botViewMessageNextBefore.get(key);
+    const older = nextBefore ? `<div class="load-older"><button class="btn btn--secondary btn--sm" type="button" data-action="load-older-messages"${state.botViewLoadingOlder ? " disabled" : ""}>${state.botViewLoadingOlder ? `${icon("refresh")} Loading…` : "Load earlier messages"}</button></div>` : "";
+    const contextLabel = conversationContextLabel(conversation);
+    const selecting = state.botViewBulkModeKey === key;
+    const selected = state.botViewBulkSelection.get(key) || new Set();
+    const bulkCandidates = messages.filter((item) => {
+      const messageIdValue = telegramMessageId(item);
+      const ephemeralId = item?.ephemeral_message_id ?? telegramMessage(item)?.ephemeral_message_id;
+      return messageIdValue !== "" && messageIdValue != null && Number(messageIdValue) !== 0 && (ephemeralId === "" || ephemeralId == null) && item?.status !== "deleted";
+    });
+    const bulkBar = selecting ? `<div class="chat-bulk-bar"><strong>${selected.size ? `${esc(selected.size)} selected` : "Select messages"}</strong><details><summary>Choose from this page</summary><div class="chat-bulk-picker">${bulkCandidates.map((item) => { const messageIdValue = String(telegramMessageId(item)); return `<label><input type="checkbox" data-action="toggle-selected-message" data-telegram-message-id="${esc(messageIdValue)}"${selected.has(messageIdValue) ? " checked" : ""}><span>${esc(messagePreview(item).slice(0, 80))}</span><small>#${esc(messageIdValue)}</small></label>`; }).join("") || "<span>No deletable messages on this page.</span>"}</div></details><button class="btn btn--ghost btn--sm" type="button" data-action="cancel-bulk-select">Cancel</button><button class="btn btn--danger btn--sm" type="button" data-action="delete-selected-messages"${selected.size ? "" : " disabled"}>Delete selected</button></div>` : "";
+    return `<section class="chat-pane${selecting ? " is-selecting" : ""}" data-chat-key="${esc(key)}"><header class="chat-pane__head"><button class="btn btn--ghost btn--icon chat-back" type="button" data-action="chat-back" aria-label="Back to conversations">${icon("arrow", "" )}</button><span class="chat-avatar">${initials(conversationTitle(conversation))}</span><span class="chat-pane__head-copy"><strong>${esc(conversationTitle(conversation))}</strong><span>${esc(conversation.username ? `@${String(conversation.username).replace(/^@/, "")} · ` : "")}chat_id: ${esc(conversationChatId(conversation))}${contextLabel ? ` · ${esc(contextLabel)}` : ""}</span></span><button class="btn btn--ghost btn--sm" type="button" data-action="toggle-bulk-select" aria-pressed="${selecting ? "true" : "false"}">${selecting ? "Selecting" : "Select"}</button><span class="badge badge--success">Bot can reply</span></header>${bulkBar}
+      <div class="timeline-wrap"><div class="timeline" id="chat-timeline" tabindex="0" role="log" aria-live="polite" aria-relevant="additions">${messages.length ? `${older}<div class="timeline-day"><span>Conversation history</span></div>${messages.map(renderMessage).join("")}` : `<div class="empty-state"><span class="empty-state__icon">${icon("message")}</span><h3>No message history</h3><p>This conversation exists, but no message payloads were returned.</p></div>`}</div><button class="scroll-latest ${scrollState.nearBottom === false ? "is-visible" : ""}" type="button" data-action="scroll-latest" aria-label="Scroll to latest message">↓${scrollState.unread ? `<span>${esc(scrollState.unread > 99 ? "99+" : scrollState.unread)}</span>` : ""}</button><div class="drop-target" aria-hidden="true"><span>＋</span><strong>Drop files to send</strong><small>Up to ${BOT_VIEW_MAX_FILES} files</small></div></div>
+      ${renderComposer(bot, conversation, draft, sending)}
     </section>`;
   }
 
-  function renderMessage(item) {
+  function renderComposer(bot, conversation, draft, sending) {
+    const key = botViewKey(botId(bot), conversationId(conversation));
+    const panel = state.botViewOpenPanel?.key === key ? state.botViewOpenPanel.name : null;
+    const files = draft.files || [];
+    const recorder = state.botViewRecorder?.key === key ? state.botViewRecorder : null;
+    const guest = Boolean(conversation.guest_query_id);
+    const ephemeral = conversation.receiver_user_id != null;
+    const ephemeralEdit = draft.edit?.ephemeral_message_id !== "" && draft.edit?.ephemeral_message_id != null;
+    const recentEphemeral = draft.suppressEphemeralReply ? null : recentEphemeralReply(conversation);
+    const placeholder = draft.edit ? "Edit message…" : files.length ? "Add a caption…" : "Write a message…";
+    const context = draft.edit || draft.reply || (!draft.edit ? recentEphemeral : null);
+    const contextLabel = draft.edit ? "Editing message" : draft.reply ? "Replying to" : "Ephemeral reply window";
+    const progress = state.botViewUploadProgress?.key === key ? state.botViewUploadProgress : null;
+    return `<footer class="composer${files.length ? " has-files" : ""}${recorder ? " is-recording" : ""}">
+      ${context ? `<div class="composer-context"><span class="composer-context__bar"></span><div><strong>${esc(contextLabel)}</strong><span>${esc(context.preview || "Message")}</span></div><button type="button" data-action="cancel-message-context"${!draft.edit && !draft.reply ? ' data-auto-ephemeral="true"' : ""} aria-label="Cancel ${draft.edit ? "editing" : "reply"}">${icon("close")}</button></div>` : ""}
+      ${files.length ? `<div class="attachment-strip" aria-label="Selected attachments">${files.map((attachment) => `<figure class="attachment-preview">${attachment.type.startsWith("image/") ? `<img src="${esc(attachment.url)}" alt="">` : attachment.type.startsWith("video/") ? `<video src="${esc(attachment.url)}" muted></video>` : attachment.type.startsWith("audio/") ? `<audio src="${esc(attachment.url)}" controls preload="metadata"></audio>` : `<span aria-hidden="true">↧</span>`}<figcaption><strong>${esc(attachment.name)}</strong><small>${esc(formatBytes(attachment.size))}</small></figcaption><button type="button" data-action="remove-attachment" data-attachment-id="${esc(attachment.id)}" aria-label="Remove ${esc(attachment.name)}">${icon("close")}</button></figure>`).join("")}</div><div class="attachment-mode" role="radiogroup" aria-label="Attachment delivery"><button type="button" role="radio" aria-checked="${draft.sendMode !== "document"}" class="${draft.sendMode !== "document" ? "active" : ""}" data-action="set-attachment-mode" data-mode="media">Media / album</button><button type="button" role="radio" aria-checked="${draft.sendMode === "document"}" class="${draft.sendMode === "document" ? "active" : ""}" data-action="set-attachment-mode" data-mode="document">As files</button></div>` : ""}
+      ${progress ? `<div class="upload-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${esc(progress.percent || 0)}"><i style="--upload-progress:${esc(progress.percent || 0)}%"></i><span>${progress.percent ? `Uploading ${progress.percent}%` : "Preparing upload…"}</span></div>` : ""}
+      ${draft.parseMode || draft.replyMarkup ? `<div class="composer-options">${draft.parseMode ? `<span>${esc(draft.parseMode)}</span>` : ""}${draft.replyMarkup ? `<span>${esc(draft.replyMarkup.inline_keyboard?.length || 0)} button row(s)</span>` : ""}<button type="button" data-action="clear-composer-options">Clear</button></div>` : ""}
+      ${recorder ? `<div class="voice-recorder" role="status"><span class="voice-recorder__pulse" aria-hidden="true"></span><strong>Recording voice message</strong><time>00:00</time><button type="button" data-action="cancel-voice-recording">Cancel</button><button class="btn btn--primary btn--sm" type="button" data-action="stop-voice-recording">Stop</button></div>` : `<form class="composer__form" id="message-form"${sending ? ' aria-busy="true"' : ""}>
+        <input class="visually-hidden" id="message-attachments" name="attachments" type="file" multiple accept="image/*,video/*,audio/*,.pdf,.zip,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx" tabindex="-1">
+        <button class="composer-tool" type="button" data-action="toggle-composer-panel" data-panel="actions" aria-label="Attach or send another message type" aria-expanded="${panel === "actions"}"${guest || ephemeralEdit ? ` disabled title="${guest ? "Guest replies support text only" : "Telegram does not accept new uploads when editing ephemeral media"}"` : ""}><span aria-hidden="true">＋</span></button>
+        <div class="composer-input"><textarea name="text" rows="1" maxlength="${files.length ? 1024 : 4096}" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}"${sending ? " disabled" : ""}>${esc(draft.text || "")}</textarea><button class="composer-emoji" type="button" data-action="toggle-composer-panel" data-panel="emoji" aria-label="Choose emoji" aria-expanded="${panel === "emoji"}">☺</button></div>
+        ${sending ? `<button class="btn btn--primary btn--icon composer-send" type="button" aria-label="Sending message" disabled>${icon("refresh")}</button>` : draft.text.trim() || files.length || draft.edit ? `<button class="btn btn--primary btn--icon composer-send" type="submit" aria-label="${draft.edit ? "Save edited message" : "Send message"}">${icon(draft.edit ? "check" : "send")}</button>` : guest ? `<button class="btn btn--primary btn--icon composer-send" type="submit" aria-label="Write a text reply" disabled>${icon("send")}</button>` : `<button class="btn btn--primary btn--icon composer-record" type="button" data-action="start-voice-recording" aria-label="Record voice message">●</button>`}
+      </form>`}
+      ${renderComposerPanel(panel, conversation)}
+      <div class="composer__meta"><span>${guest ? "Guest query · text reply as" : ephemeral ? recentEphemeral ? "Ephemeral · recent reply window · as" : "Ephemeral · outside reply window; bot must be an admin · as" : "Reply as"} <strong>${esc(botUsername(bot))}</strong></span><span><kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line</span></div><div data-form-error aria-live="assertive"></div>
+    </footer>`;
+  }
+
+  function renderComposerPanel(panel, conversation) {
+    if (panel === "emoji") return `<div class="composer-panel composer-panel--emoji" role="group" aria-label="Emoji">${BOT_VIEW_EMOJI.map((emoji) => `<button type="button" data-action="insert-emoji" data-emoji="${esc(emoji)}" aria-label="Insert ${esc(emoji)}">${esc(emoji)}</button>`).join("")}</div>`;
+    if (panel === "reaction") {
+      const data = state.botViewOpenPanel?.data || {};
+      return `<div class="composer-panel composer-panel--reaction" role="group" aria-label="Choose reaction"><strong>React</strong>${["👍", "❤️", "🔥", "🎉", "😁", "😢", "👎", "🤯"].map((emoji) => `<button type="button" data-action="set-message-reaction" data-telegram-message-id="${esc(data.messageId || "")}" data-reaction="${esc(emoji)}" aria-label="React ${esc(emoji)}">${esc(emoji)}</button>`).join("")}<button class="composer-panel__clear" type="button" data-action="remove-message-reaction" data-telegram-message-id="${esc(data.messageId || "")}">Remove</button></div>`;
+    }
+    if (panel === "callback-answer") {
+      const data = state.botViewOpenPanel?.data || {};
+      return `<form class="composer-panel composer-special-form" id="callback-answer-form"><input type="hidden" name="action_generation" value="${esc(data.actionGeneration || "")}"><div class="composer-panel__head"><strong>Answer button press</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Notification text <span>(optional)</span><textarea name="text" rows="3" maxlength="200" placeholder="Your request was received"></textarea></label><div class="composer-special-form__checks"><label><input type="checkbox" name="show_alert"> Show as an alert</label></div><button class="btn btn--primary btn--sm" type="submit">Answer callback</button><div data-form-error aria-live="assertive"></div></form>`;
+    }
+    if (panel === "suggested-post-approve") {
+      const data = state.botViewOpenPanel?.data || {};
+      return `<form class="composer-panel composer-special-form" id="suggested-post-approve-form"><input type="hidden" name="message_id" value="${esc(data.messageId || "")}"><div class="composer-panel__head"><strong>Approve suggested post</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><p class="composer-panel__hint">Publish it now, or choose a future time.</p><label>Publish time <span>(optional)</span><input name="send_date" type="datetime-local"></label><button class="btn btn--primary btn--sm" type="submit">Approve post</button><div data-form-error aria-live="assertive"></div></form>`;
+    }
+    if (panel === "suggested-post-decline") {
+      const data = state.botViewOpenPanel?.data || {};
+      return `<form class="composer-panel composer-special-form" id="suggested-post-decline-form"><input type="hidden" name="message_id" value="${esc(data.messageId || "")}"><div class="composer-panel__head"><strong>Decline suggested post</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Comment <span>(optional)</span><textarea name="comment" rows="3" maxlength="128" placeholder="Tell the sender what should change"></textarea></label><button class="btn btn--danger btn--sm" type="submit">Decline post</button><div data-form-error aria-live="assertive"></div></form>`;
+    }
+    if (panel === "poll") return `<form class="composer-panel composer-special-form" id="poll-form"><div class="composer-panel__head"><strong>Create poll</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Question<input name="question" maxlength="300" required placeholder="Ask a question"></label><label>Options<textarea name="options" rows="3" required placeholder="One option per line"></textarea></label><div class="composer-special-form__checks"><label><input type="checkbox" name="is_anonymous" checked> Anonymous</label><label><input type="checkbox" name="allows_multiple_answers"> Multiple answers</label></div><button class="btn btn--primary btn--sm" type="submit">Send poll</button><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "location") return `<form class="composer-panel composer-special-form" id="location-form"><div class="composer-panel__head"><strong>Send location</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><div class="composer-special-form__grid"><label>Latitude<input name="latitude" inputmode="decimal" required placeholder="51.5074"></label><label>Longitude<input name="longitude" inputmode="decimal" required placeholder="-0.1278"></label></div><div class="composer-special-form__actions"><button class="btn btn--secondary btn--sm" type="button" data-action="use-current-location">Use current location</button><button class="btn btn--primary btn--sm" type="submit">Send location</button></div><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "contact") return `<form class="composer-panel composer-special-form" id="contact-form"><div class="composer-panel__head"><strong>Send contact</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><div class="composer-special-form__grid"><label>First name<input name="first_name" maxlength="64" required></label><label>Phone number<input name="phone_number" type="tel" required placeholder="+1 555 0100"></label></div><button class="btn btn--primary btn--sm" type="submit">Send contact</button><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "venue") return `<form class="composer-panel composer-special-form" id="venue-form"><div class="composer-panel__head"><strong>Send venue</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><div class="composer-special-form__grid"><label>Latitude<input name="latitude" inputmode="decimal" required></label><label>Longitude<input name="longitude" inputmode="decimal" required></label></div><label>Place name<input name="title" maxlength="256" required></label><label>Address<input name="address" maxlength="256" required></label><button class="btn btn--primary btn--sm" type="submit">Send venue</button><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "live-photo") return `<form class="composer-panel composer-special-form" id="live-photo-form"><div class="composer-panel__head"><strong>Send live photo</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Short video<input name="live_photo" type="file" accept="video/mp4,video/quicktime" required></label><label>Static photo<input name="photo" type="file" accept="image/jpeg,image/heic,image/heif" required></label><label>Caption<textarea name="caption" rows="2" maxlength="1024" placeholder="Optional caption"></textarea></label><p class="composer-panel__hint">Telegram accepts a video up to 10 seconds / 10 MB and a matching static photo up to 10 MB.</p><button class="btn btn--primary btn--sm" type="submit">Send live photo</button><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "rich") return `<form class="composer-panel composer-special-form" id="rich-message-form"><div class="composer-panel__head"><strong>Rich message</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Markdown<textarea name="markdown" rows="6" maxlength="32768" required placeholder="# Heading&#10;&#10;A formatted message with **bold text**."></textarea></label><p class="composer-panel__hint">Telegram renders this as a native rich message.</p><button class="btn btn--primary btn--sm" type="submit">Send rich message</button><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "format") return `<form class="composer-panel composer-special-form" id="message-format-form"><div class="composer-panel__head"><strong>Text formatting</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Format<select name="parse_mode"><option value="">Plain text</option><option value="MarkdownV2">MarkdownV2</option><option value="HTML">HTML</option></select></label><button class="btn btn--primary btn--sm" type="submit">Apply</button></form>`;
+    if (panel === "buttons") return `<form class="composer-panel composer-special-form" id="message-buttons-form"><div class="composer-panel__head"><strong>Inline buttons</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Buttons<textarea name="buttons" rows="4" maxlength="2048" required placeholder="Open website | https://example.com&#10;Help | https://example.com/help"></textarea></label><p class="composer-panel__hint">One button per row. Only HTTPS links are opened by users.</p><button class="btn btn--primary btn--sm" type="submit">Apply buttons</button><div data-form-error aria-live="assertive"></div></form>`;
+    if (panel === "checklist" && conversation?.business_connection_id) {
+      const data = state.botViewOpenPanel?.data || {};
+      const checklist = data.checklist || {};
+      const tasks = Array.isArray(checklist.tasks) ? checklist.tasks.map((task) => richTextPlain(task.text)).join("\n") : "";
+      return `<form class="composer-panel composer-special-form" id="checklist-form"><input type="hidden" name="message_id" value="${esc(data.messageId || "")}"><div class="composer-panel__head"><strong>${data.messageId ? "Edit" : "Send"} checklist</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Title<input name="title" maxlength="255" required value="${esc(richTextPlain(checklist.title))}"></label><label>Tasks<textarea name="tasks" rows="5" maxlength="3029" required placeholder="One task per line">${esc(tasks)}</textarea></label><div class="composer-special-form__checks"><label><input type="checkbox" name="others_can_add_tasks"${checklist.others_can_add_tasks ? " checked" : ""}> Others can add</label><label><input type="checkbox" name="others_can_mark_tasks_as_done"${checklist.others_can_mark_tasks_as_done ? " checked" : ""}> Others can complete</label></div><button class="btn btn--primary btn--sm" type="submit">${data.messageId ? "Save checklist" : "Send checklist"}</button><div data-form-error aria-live="assertive"></div></form>`;
+    }
+    if (panel === "forward") {
+      const data = state.botViewOpenPanel?.data || {};
+      const choices = state.conversations.filter((item) => !item.guest_query_id && item.receiver_user_id == null);
+      return `<form class="composer-panel composer-special-form" id="forward-message-form"><input type="hidden" name="message_id" value="${esc(data.messageId || "")}"><input type="hidden" name="from_chat_id" value="${esc(data.fromChatId || "")}"><div class="composer-panel__head"><strong>Forward or copy</strong><button type="button" data-action="close-composer-panel" aria-label="Close">${icon("close")}</button></div><label>Destination<select name="conversation_id" required>${choices.map((item) => `<option value="${esc(conversationId(item))}">${esc(conversationTitle(item))}${conversationContextLabel(item) ? ` · ${esc(conversationContextLabel(item))}` : ""}</option>`).join("")}</select></label><div class="composer-special-form__checks"><label><input type="radio" name="mode" value="forward" checked> Forward with attribution</label><label><input type="radio" name="mode" value="copy"> Copy without attribution</label></div><button class="btn btn--primary btn--sm" type="submit">Send</button><div data-form-error aria-live="assertive"></div></form>`;
+    }
+    if (panel === "dice") return `<div class="composer-panel composer-panel--dice" role="group" aria-label="Send dice"><strong>Choose dice</strong>${["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"].map((emoji) => `<button type="button" data-action="send-dice" data-emoji="${esc(emoji)}" aria-label="Send ${esc(emoji)}">${esc(emoji)}</button>`).join("")}</div>`;
+    if (panel !== "actions") return "";
+    const ephemeral = conversation?.receiver_user_id != null;
+    const direct = conversation?.direct_messages_topic_id != null;
+    return `<div class="composer-panel composer-panel--actions" role="menu"><button type="button" data-action="pick-attachments" data-accept="image/*,video/*" data-mode="media" role="menuitem"><span aria-hidden="true">▧</span><strong>Photo or video</strong></button><button type="button" data-action="pick-attachments" data-accept="*/*" data-mode="document" role="menuitem"><span aria-hidden="true">↧</span><strong>File</strong></button><button type="button" data-action="pick-attachments" data-accept="image/webp,.tgs,video/webm" data-mode="media" data-method="sendSticker" role="menuitem"><span aria-hidden="true">◇</span><strong>Sticker</strong></button><button type="button" data-action="pick-attachments" data-accept="video/mp4" data-mode="media" data-method="sendVideoNote" role="menuitem"><span aria-hidden="true">◉</span><strong>Video note</strong></button><button type="button" data-action="open-special-panel" data-panel="live-photo" role="menuitem"><span aria-hidden="true">◐</span><strong>Live photo</strong></button>${!ephemeral && !direct ? `<button type="button" data-action="open-special-panel" data-panel="poll" role="menuitem"><span aria-hidden="true">▥</span><strong>Poll</strong></button>` : ""}<button type="button" data-action="open-special-panel" data-panel="location" role="menuitem"><span aria-hidden="true">⌖</span><strong>Location</strong></button><button type="button" data-action="open-special-panel" data-panel="venue" role="menuitem"><span aria-hidden="true">⌂</span><strong>Venue</strong></button><button type="button" data-action="open-special-panel" data-panel="contact" role="menuitem"><span aria-hidden="true">♙</span><strong>Contact</strong></button>${!ephemeral ? `<button type="button" data-action="open-special-panel" data-panel="dice" role="menuitem"><span aria-hidden="true">⚄</span><strong>Dice</strong></button><button type="button" data-action="open-special-panel" data-panel="rich" role="menuitem"><span aria-hidden="true">¶</span><strong>Rich message</strong></button><button type="button" data-action="open-special-panel" data-panel="format" role="menuitem"><span aria-hidden="true">Aa</span><strong>Formatting</strong></button><button type="button" data-action="open-special-panel" data-panel="buttons" role="menuitem"><span aria-hidden="true">▤</span><strong>Buttons</strong></button>` : ""}${conversation?.business_connection_id ? `<button type="button" data-action="open-special-panel" data-panel="checklist" role="menuitem"><span aria-hidden="true">☑</span><strong>Checklist</strong></button>` : ""}</div>`;
+  }
+
+  function renderMessage(item, index) {
     const text = messageText(item);
     const type = item?.type || item?.event_type || "message";
-    if (!text) return `<div class="message-event">${icon("pulse")}<span>${esc(type)}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
     const outgoing = isOutgoing(item);
     const status = item.status || item.delivery_status || (outgoing ? "sent" : "received");
-    return `<article class="message ${outgoing ? "message--out" : ""}"><div class="message__bubble"><div class="message__text">${esc(text)}</div><div class="message__meta"><span>${esc(formatDate(messageTime(item), "time"))}</span>${outgoing ? `<span>${esc(status)}</span>` : ""}</div></div></article>`;
+    const message = telegramMessage(item);
+    const structured = renderStructuredMessage(item);
+    const reply = message?.reply_to_message || message?.external_reply || message?.quote || item?.reply_to;
+    const id = messageStableId(item, index);
+    const telegramId = telegramMessageId(item);
+    const ephemeralId = item?.ephemeral_message_id ?? message?.ephemeral_message_id ?? "";
+    const usableMessageId = telegramId !== "" && telegramId != null && Number(telegramId) !== 0;
+    const conversation = state.conversations.find((candidate) => conversationId(candidate) === String(state.selectedConversationId));
+    const actionableEphemeral = ephemeralId !== "" && ephemeralId != null && ephemeralMessageIsActionable(item, conversation);
+    const hasMessageIdentity = item?.actionable === false ? false : usableMessageId || actionableEphemeral;
+    const deleted = status === "deleted" || type === "deleted_business_messages" || item?.deleted === true;
+    if (deleted) return `<div class="message-event message-event--deleted">${icon("trash")}<span>Message deleted</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    if (item?._timeline_callback_event) return `<div class="message-event message-event--callback">${renderCallbackEvent(item._timeline_callback_event)}<time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    if (item?._timeline_event_label) return `<div class="message-event message-event--action">${icon("pulse")}<span>${esc(item._timeline_event_label)}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    if (String(item?.direction || "").toLowerCase() === "action") {
+      const actionLabel = String(type || "Bot action").replace(/^send|^edit/, "").replaceAll("_", " ").replace(/([a-z])([A-Z])/g, "$1 $2").trim();
+      return `<div class="message-event message-event--action">${icon("check")}<span>${esc(actionLabel || "Bot action")} ${status === "failed" ? "failed" : "completed"}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    }
+    if (!text && !structured) {
+      const ignored = new Set(["message_id", "date", "chat", "from", "sender_chat", "business_connection_id", "message_thread_id", "direct_messages_topic", "reply_to_message", "external_reply", "quote", "forward_origin", "edit_date", "author_signature", "has_protected_content"]);
+      const field = Object.keys(message || {}).find((key) => !ignored.has(key));
+      const label = field || type;
+      return `<details class="message-event message-event--raw"><summary>${icon("pulse")}<span>${esc(String(label).replaceAll("_", " "))}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></summary><pre>${esc(JSON.stringify(field ? message[field] : item?.content || {}, null, 2).slice(0, 4000))}</pre></details>`;
+    }
+    const business = Boolean(conversation?.business_connection_id);
+    const guest = Boolean(conversation?.guest_query_id);
+    const suggestedPost = !outgoing && conversation?.direct_messages_topic_id != null && usableMessageId && Boolean(message?.suggested_post_info);
+    const attachments = normalizedAttachments(item);
+    const editableMedia = attachments.some((attachment) => ["animation", "audio", "document", "live_photo", "photo", "video"].includes(String(attachment.kind || attachment.type || "").replace(/^paid_/, "")));
+    const editable = outgoing && hasMessageIdentity && (message?.text != null || message?.caption != null || editableMedia);
+    const statusLabel = { pending: "Sending…", uploading: "Uploading…", sending: "Sending…", sent: "Sent", failed: "Not sent", delivery_unknown: "Delivery unknown" }[status] || status;
+    const replyData = esc(JSON.stringify({ message_id: telegramId, ephemeral_message_id: ephemeralId, action_generation: item?.action_generation, preview: messagePreview(item), text, has_media: attachments.length > 0, has_caption: message?.caption != null, reply_markup: message?.reply_markup || null }));
+    const entities = message?.caption != null && text === message.caption ? message.caption_entities : message?.entities;
+    const retryAction = item?._action ? "retry-special-action" : "retry-message";
+    const failureAction = ["failed", "delivery_unknown"].includes(status) ? `<div class="message-failure">${item.error ? `<span>${esc(item.error)}</span>` : ""}<button class="message-retry" type="button" data-action="${retryAction}" data-client-id="${esc(item.client_id || "")}">${status === "delivery_unknown" ? "Review and retry" : "Try again"}</button></div>` : "";
+    const canReply = hasMessageIdentity && !guest;
+    const canOperate = hasMessageIdentity && !guest;
+    const checklistData = message?.checklist ? esc(JSON.stringify(message.checklist)) : "";
+    return `<article class="message ${outgoing ? "message--out" : "message--in"} ${["failed", "delivery_unknown"].includes(status) ? "message--failed" : ""}" data-message-id="${esc(id)}"><div class="message__actions">${canReply ? `<button type="button" data-action="reply-message" data-message="${replyData}" aria-label="Reply to message">↩</button>` : ""}${text ? `<button type="button" data-action="copy-message-text" data-text="${esc(text)}" aria-label="Copy message">${icon("copy")}</button>` : ""}${usableMessageId && !guest ? `<button type="button" data-action="forward-message" data-telegram-message-id="${esc(telegramId)}" data-from-chat-id="${esc(conversationChatId(conversation))}" aria-label="Forward or copy message">↗</button>` : ""}${usableMessageId && !business && !guest ? `<button type="button" data-action="open-reaction-panel" data-telegram-message-id="${esc(telegramId)}" aria-label="Choose reaction">☺</button>` : ""}${suggestedPost ? `<button class="message__action-label" type="button" data-action="review-suggested-post" data-decision="approve" data-telegram-message-id="${esc(telegramId)}" aria-label="Approve suggested post">Approve</button><button class="message__action-label text-danger" type="button" data-action="review-suggested-post" data-decision="decline" data-telegram-message-id="${esc(telegramId)}" aria-label="Decline suggested post">Decline</button>` : ""}${outgoing && usableMessageId && message?.poll && !message.poll.is_closed ? `<button type="button" data-action="stop-poll" data-telegram-message-id="${esc(telegramId)}" aria-label="Stop poll">■</button>` : ""}${outgoing && usableMessageId && message?.location?.live_period ? `<button type="button" data-action="stop-live-location" data-telegram-message-id="${esc(telegramId)}" aria-label="Stop live location">⌖</button>` : ""}${business && outgoing && usableMessageId && message?.checklist ? `<button type="button" data-action="edit-checklist" data-telegram-message-id="${esc(telegramId)}" data-checklist="${checklistData}" aria-label="Edit checklist">☑</button>` : ""}${business && !outgoing && usableMessageId ? `<button type="button" data-action="mark-business-message-read" data-telegram-message-id="${esc(telegramId)}" aria-label="Mark message read">✓</button>` : ""}${editable && !guest ? `<button type="button" data-action="edit-message" data-message="${replyData}" aria-label="${editableMedia ? "Edit caption, media, or buttons" : "Edit message"}">✎</button>` : ""}${canOperate ? `<button type="button" data-action="delete-message" data-telegram-message-id="${esc(telegramId)}" data-ephemeral-message-id="${esc(ephemeralId)}" data-action-generation="${esc(item?.action_generation ?? "")}" aria-label="Delete message">${icon("trash")}</button>` : ""}</div><div class="message__bubble">${renderReplySnippet(reply)}${structured}${text ? `<div class="message__text">${renderMessageText(text, entities)}</div>` : ""}${renderReplyMarkup(message)}<div class="message__meta"><span>${esc(formatDate(messageTime(item), "time"))}</span>${message?.edit_date || type.startsWith("edit") ? "<span>edited</span>" : ""}${outgoing ? `<span class="message-status message-status--${esc(status)}">${status === "sent" ? "✓✓" : ["failed", "delivery_unknown"].includes(status) ? "!" : "◷"} ${esc(statusLabel)}</span>` : ""}</div>${failureAction}</div></article>`;
   }
 
   function renderStreamKeyList() {
@@ -2085,6 +3220,12 @@
     return state.botViewSendsInFlight.has(botViewSendKey(botIdValue, chatId));
   }
 
+  function reserveBotViewSend(key, context) {
+    if (state.botViewSendsInFlight.has(key)) return false;
+    state.botViewSendsInFlight.set(key, context);
+    return true;
+  }
+
   function finishBotViewSend(context) {
     if (state.botViewSendsInFlight.get(context.key) === context) {
       state.botViewSendsInFlight.delete(context.key);
@@ -2221,52 +3362,956 @@
     }
   }
 
+  function botViewActionPath(botIdValue, conversationIdValue, method) {
+    return `/bots/${encodeURIComponent(botIdValue)}/conversations/${encodeURIComponent(conversationIdValue)}/actions/${encodeURIComponent(method)}`;
+  }
+
+  function botViewErrorMessage(error) {
+    const payload = error?.payload?.telegram || error?.payload || {};
+    const detail = payload?.description || payload?.error?.description || payload?.message || errorMessage(error);
+    const parameters = payload?.parameters || payload?.error?.parameters || {};
+    const notes = [];
+    if (parameters.retry_after) notes.push(`Try again in ${parameters.retry_after} seconds.`);
+    if (parameters.migrate_to_chat_id) notes.push(`Telegram moved this chat to ${parameters.migrate_to_chat_id}.`);
+    return [detail, ...notes].filter(Boolean).join(" ");
+  }
+
+  function botViewTimelineMessagesFromResponse(payload, previewFiles = []) {
+    const messages = payload?._phenogram?.timeline_messages;
+    if (!Array.isArray(messages) || !previewFiles.length) return Array.isArray(messages) ? messages : [];
+    const urls = previewFiles.map((file) => file?.url).filter((url) => String(url || "").startsWith("blob:"));
+    let urlIndex = 0;
+    return messages.map((item) => {
+      const media = Array.isArray(item?.content?.media) ? item.content.media : [];
+      if (!media.length || !urls.length) return item;
+      const claimedUrls = [];
+      const previewMedia = media.map((entry) => {
+        const url = urls[urlIndex];
+        if (!url) return entry;
+        urlIndex += 1;
+        claimedUrls.push(url);
+        return { ...entry, url };
+      });
+      if (!claimedUrls.length) return item;
+      return {
+        ...item,
+        content: { ...item.content, media: previewMedia },
+        _local_preview_urls: claimedUrls,
+      };
+    });
+  }
+
+  function mergeConversationTimelineItems(base, incoming) {
+    const reconciled = reconcileBotViewActionPreviews(base || [], incoming || []);
+    const merged = [...reconciled.messages];
+    const positions = new Map(merged.map((item, index) => [messageStableId(item, index), index]));
+    const semanticPositions = new Map();
+    merged.forEach((item, index) => {
+      const semantic = timelineSemanticIdentity(item);
+      if (semantic) semanticPositions.set(semantic, index);
+    });
+    reconciled.remaining.forEach((item, index) => {
+      if (!item || typeof item !== "object") return;
+      const durableIncoming = Boolean(item?.id || item?.cursor || item?.event_id);
+      const observed = durableIncoming
+        ? { ...item, _locally_observed: true }
+        : { ...item, _locally_observed: true, _response_pending: true, _response_baseline_cursor: timelineItemCursor(item) };
+      const stableId = messageStableId(observed, index);
+      const semantic = timelineSemanticIdentity(observed);
+      const position = positions.get(stableId) ?? (semantic ? semanticPositions.get(semantic) : undefined);
+      if (position == null) {
+        positions.set(stableId, merged.length);
+        if (semantic) semanticPositions.set(semantic, merged.length);
+        merged.push(observed);
+      } else {
+        const durable = merged[position];
+        const next = {
+          ...durable,
+          ...observed,
+          id: durable?.id ?? observed?.id,
+          cursor: durable?.cursor ?? observed?.cursor,
+        };
+        if (durableIncoming) {
+          if (durable?._local_preview_urls?.length) revokeTimelineLocalPreviews(durable);
+          delete next._local_preview_urls;
+          delete next._response_pending;
+          delete next._response_baseline_cursor;
+        } else if (!next._response_baseline_cursor) {
+          next._response_baseline_cursor = timelineItemCursor(durable);
+        }
+        merged[position] = next;
+      }
+    });
+    return merged.sort((left, right) => {
+      const cursorOrder = compareJournalIds(timelineItemCursor(left), timelineItemCursor(right));
+      if (cursorOrder) return cursorOrder;
+      return messageTimeMs(left) - messageTimeMs(right);
+    });
+  }
+
+  function reconcileBotViewActionPreviews(base, incoming) {
+    const messages = [...base];
+    const remaining = [];
+    const markPending = (item) => ({
+      ...item,
+      _locally_observed: true,
+      _response_pending: true,
+      _response_baseline_cursor: item?._response_baseline_cursor || timelineItemCursor(item),
+    });
+    incoming.forEach((item) => {
+      const method = String(item?.event_type || item?.payload?.action || "");
+      const payload = item?.payload && typeof item.payload === "object" ? item.payload : {};
+      const request = payload?.request && typeof payload.request === "object" ? payload.request : {};
+      const result = payload?.telegram_result;
+      const isActionPreview = String(item?.direction || "").toLowerCase() === "action" || payload?.action;
+      if (!isActionPreview) { remaining.push(item); return; }
+
+      if (["deleteMessage", "deleteMessages", "deleteBusinessMessages", "deleteEphemeralMessage"].includes(method)) {
+        const ids = Array.isArray(request.message_ids)
+          ? request.message_ids.map(String)
+          : request.message_id != null ? [String(request.message_id)] : [];
+        const ephemeralId = request.ephemeral_message_id ?? item?.ephemeral_message_id;
+        let matched = false;
+        messages.forEach((candidate, index) => {
+          const candidateMessage = telegramMessage(candidate);
+          const standardMatch = ids.length && ids.includes(String(telegramMessageId(candidate)));
+          const candidateEphemeral = candidate?.ephemeral_message_id ?? candidateMessage?.ephemeral_message_id;
+          const ephemeralMatch = ephemeralId !== "" && ephemeralId != null && String(candidateEphemeral ?? "") === String(ephemeralId);
+          if (!standardMatch && !ephemeralMatch) return;
+          messages[index] = markPending({ ...candidate, status: "deleted", event_type: method });
+          matched = true;
+        });
+        if (!matched) remaining.push(item);
+        return;
+      }
+
+      if (["editEphemeralMessageText", "editEphemeralMessageCaption", "editEphemeralMessageMedia", "editEphemeralMessageReplyMarkup"].includes(method)) {
+        const ephemeralId = request.ephemeral_message_id ?? item?.ephemeral_message_id;
+        const receiverId = item?.receiver_user_id;
+        let targetIndex = -1;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const candidate = messages[index];
+          const candidateMessage = telegramMessage(candidate);
+          const candidateEphemeral = candidate?.ephemeral_message_id ?? candidateMessage?.ephemeral_message_id;
+          const candidateReceiver = candidate?.receiver_user_id ?? candidateMessage?.receiver_user_id ?? candidateMessage?.receiver_user?.id;
+          if (String(candidateEphemeral ?? "") === String(ephemeralId ?? "")
+            && (receiverId == null || String(candidateReceiver ?? "") === String(receiverId))) {
+            targetIndex = index;
+            break;
+          }
+        }
+        if (targetIndex < 0) { remaining.push(item); return; }
+        const target = messages[targetIndex];
+        const currentMessage = telegramMessage(target);
+        const nextMessage = { ...currentMessage };
+        if (method === "editEphemeralMessageText") nextMessage.text = String(request.text ?? "");
+        if (method === "editEphemeralMessageCaption") nextMessage.caption = String(request.caption ?? "");
+        if (method === "editEphemeralMessageMedia" && request.media?.caption != null) nextMessage.caption = String(request.media.caption);
+        if (method === "editEphemeralMessageReplyMarkup" || request.reply_markup != null) nextMessage.reply_markup = request.reply_markup || undefined;
+        messages[targetIndex] = markPending({
+          ...replaceTelegramMessageValue(target, nextMessage),
+          text: nextMessage.text ?? nextMessage.caption ?? target?.text,
+        });
+        return;
+      }
+
+      if (method === "stopPoll" && result && typeof result === "object") {
+        const targetIndex = findLastMessageIndexByTelegramId(messages, request.message_id ?? item?.telegram_message_id);
+        if (targetIndex < 0) { remaining.push(item); return; }
+        const target = messages[targetIndex];
+        const currentMessage = telegramMessage(target);
+        messages[targetIndex] = markPending(replaceTelegramMessageValue(target, { ...currentMessage, poll: result }));
+        return;
+      }
+
+      remaining.push(item);
+    });
+    return { messages, remaining };
+  }
+
+  function mergeBotViewActionResponse(conversationIdValue, payload, previewFiles = []) {
+    const incoming = botViewTimelineMessagesFromResponse(payload, previewFiles);
+    if (!incoming.length) return 0;
+    const conversation = state.conversations.find((item) => conversationId(item) === String(conversationIdValue));
+    if (!conversation) return 0;
+    conversation.messages = mergeConversationTimelineItems(conversationMessages(conversation), incoming);
+    const key = botViewKey(state.selectedBotId, conversationIdValue);
+    incoming.forEach((item) => advanceBotViewMessageCursor(key, timelineItemCursor(item)));
+    return incoming.length;
+  }
+
+  function replyParametersFromDraft(draft) {
+    if (!draft?.reply) return null;
+    if (draft.reply.ephemeral_message_id !== "" && draft.reply.ephemeral_message_id != null) return { ephemeral_message_id: draft.reply.ephemeral_message_id };
+    return draft.reply.message_id !== "" && draft.reply.message_id != null && Number(draft.reply.message_id) !== 0 ? { message_id: Number(draft.reply.message_id) || draft.reply.message_id } : null;
+  }
+
+  function botViewActionGenerationHeaders(source) {
+    const generation = source && typeof source === "object" ? source.action_generation : source;
+    if (generation === "" || generation == null) return {};
+    const value = String(generation).trim();
+    return value && value.length <= 256 && !/[\r\n]/.test(value) ? { "x-phenogram-action-generation": value } : {};
+  }
+
+  function botViewUsesLocalPool(bot = currentBot()) {
+    const local = [bot?.pool, bot?.routing_mode, bot?.delivery_mode, bot?.telegram_environment].some((value) => String(value || "").toLowerCase().includes("local"));
+    return local;
+  }
+
+  function botViewUploadLimit(bot = currentBot()) {
+    return botViewUsesLocalPool(bot) ? BOT_VIEW_LOCAL_MAX_FILE_BYTES : BOT_VIEW_CLOUD_MAX_FILE_BYTES;
+  }
+
+  function botViewAggregateUploadLimit(bot = currentBot()) {
+    return botViewUsesLocalPool(bot) ? BOT_VIEW_LOCAL_MAX_TOTAL_BYTES : BOT_VIEW_CLOUD_MAX_TOTAL_BYTES;
+  }
+
+  function botViewDefinitivelyRejected(error) {
+    const status = Number(error?.status || 0);
+    return !error?.deliveryUnknown && (error?.telegramRejected === true || (status >= 400 && status < 500));
+  }
+
+  function methodForAttachment(attachment, sendMode) {
+    if (attachment.explicitMethod) return attachment.explicitMethod;
+    if (sendMode === "document" || attachment.forceDocument) return "sendDocument";
+    if (attachment.isVoice && ["audio/ogg", "audio/mp4", "audio/mpeg", "audio/x-m4a"].some((type) => attachment.type.startsWith(type))) return "sendVoice";
+    if (attachment.type === "image/gif") return "sendAnimation";
+    if (attachment.type.startsWith("image/")) return "sendPhoto";
+    if (attachment.type.startsWith("video/")) return "sendVideo";
+    if (attachment.type.startsWith("audio/")) return "sendAudio";
+    return "sendDocument";
+  }
+
+  function uploadFieldForMethod(method) {
+    return { sendPhoto: "photo", sendAnimation: "animation", sendVideo: "video", sendVideoNote: "video_note", sendAudio: "audio", sendVoice: "voice", sendSticker: "sticker", sendDocument: "document" }[method] || "document";
+  }
+
+  function uploadApi(path, body, onProgress, headers = {}) {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open("POST", `${API}${path}`);
+      request.withCredentials = true;
+      request.setRequestHeader("Accept", "application/json");
+      if (state.csrfToken) request.setRequestHeader("X-Phenogram-CSRF", state.csrfToken);
+      Object.entries(headers || {}).forEach(([name, value]) => request.setRequestHeader(name, value));
+      request.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) onProgress?.(Math.max(1, Math.round((event.loaded / event.total) * 100)));
+      });
+      request.addEventListener("load", () => {
+        let payload = null;
+        try { payload = request.responseText ? JSON.parse(request.responseText) : null; } catch (_) { payload = request.responseText; }
+        if (request.status >= 200 && request.status < 300 && !isTelegramFailurePayload(payload)) { resolve(payload); return; }
+        const message = typeof payload === "string" ? payload : payload?.description || payload?.message || payload?.error?.message;
+        const error = new Error(message || `Request failed (${request.status})`);
+        error.status = isTelegramFailurePayload(payload) ? Number(payload?.error_code || request.status) : request.status;
+        error.httpStatus = request.status;
+        error.telegramRejected = isTelegramFailurePayload(payload);
+        error.payload = payload;
+        if (request.status === 401 && state.user && isPlatformUnauthorizedPayload(payload)) window.queueMicrotask(() => handleExpiredSession());
+        reject(error);
+      });
+      request.addEventListener("error", () => {
+        const error = new Error("The connection ended before Phenogram could confirm delivery.");
+        error.deliveryUnknown = true;
+        reject(error);
+      });
+      request.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
+      request.send(body);
+    });
+  }
+
+  function buildAttachmentUpload(draft) {
+    const files = draft.files || [];
+    const form = new FormData();
+    const replyParameters = replyParametersFromDraft(draft);
+    if (replyParameters) form.append("reply_parameters", JSON.stringify(replyParameters));
+    if (files.length === 1) {
+      const attachment = files[0];
+      const method = methodForAttachment(attachment, draft.sendMode);
+      if (draft.text.trim() && ["sendSticker", "sendVideoNote"].includes(method)) throw new Error("Stickers and video notes do not support captions. Send the text as a separate message.");
+      if (draft.text.trim()) form.append("caption", draft.text.trim());
+      if (draft.text.trim() && draft.parseMode) form.append("parse_mode", draft.parseMode);
+      if (draft.replyMarkup) form.append("reply_markup", JSON.stringify(draft.replyMarkup));
+      form.append(uploadFieldForMethod(method), attachment.file, attachment.name);
+      return { method, form };
+    }
+    if (files.some((attachment) => attachment.explicitMethod)) throw new Error("Stickers and video notes must be sent one at a time.");
+    const media = files.map((attachment, index) => {
+      const method = methodForAttachment(attachment, draft.sendMode);
+      const type = { sendPhoto: "photo", sendVideo: "video", sendAudio: "audio" }[method] || "document";
+      const field = `media_${index}`;
+      return { type, media: `attach://${field}`, ...(index === 0 && draft.text.trim() ? { caption: draft.text.trim(), ...(draft.parseMode ? { parse_mode: draft.parseMode } : {}) } : {}) };
+    });
+    if (draft.replyMarkup) throw new Error("Telegram media albums do not support inline buttons. Send the buttons with a separate message.");
+    const kinds = new Set(media.map((entry) => entry.type));
+    const validVisualAlbum = [...kinds].every((type) => ["photo", "video"].includes(type));
+    const validSingleKindAlbum = kinds.size === 1 && ["audio", "document"].includes(media[0]?.type);
+    if (!validVisualAlbum && !validSingleKindAlbum) throw new Error("Telegram albums can mix photos and videos, but audio and documents must each be sent in their own album.");
+    form.append("media", JSON.stringify(media));
+    files.forEach((attachment, index) => form.append(`media_${index}`, attachment.file, attachment.name));
+    return { method: "sendMediaGroup", form };
+  }
+
+  function buildEditMediaUpload(draft) {
+    if (draft.files.length !== 1) throw new Error("Choose exactly one replacement file when editing media.");
+    const attachment = draft.files[0];
+    if (attachment.explicitMethod) throw new Error("Stickers and video notes cannot replace message media here.");
+    const sendMethod = methodForAttachment(attachment, draft.sendMode);
+    const type = { sendPhoto: "photo", sendVideo: "video", sendAnimation: "animation", sendAudio: "audio", sendVoice: "voice_note", sendDocument: "document" }[sendMethod];
+    if (!type) throw new Error("This attachment type cannot replace message media.");
+    const ephemeral = draft.edit?.ephemeral_message_id !== "" && draft.edit?.ephemeral_message_id != null;
+    const form = new FormData();
+    form.append("media", JSON.stringify({ type, media: "attach://media_file", ...(draft.text.trim() ? { caption: draft.text.trim(), ...(draft.parseMode ? { parse_mode: draft.parseMode } : {}) } : {}) }));
+    form.append(ephemeral ? "ephemeral_message_id" : "message_id", String(ephemeral ? draft.edit.ephemeral_message_id : draft.edit.message_id));
+    if (draft.replyMarkup) form.append("reply_markup", JSON.stringify(draft.replyMarkup));
+    form.append("media_file", attachment.file, attachment.name);
+    return { method: ephemeral ? "editEphemeralMessageMedia" : "editMessageMedia", form };
+  }
+
+  function optimisticMessageFromDraft(draft, clientId) {
+    const media = (draft.files || []).map((attachment) => ({ kind: methodForAttachment(attachment, draft.sendMode).replace(/^send/, "").replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`).replace(/^_/, ""), url: attachment.url, file_name: attachment.name, file_size: attachment.size, mime_type: attachment.type }));
+    return { id: clientId, client_id: clientId, direction: "outgoing", event_type: draft.edit ? "editMessageText" : draft.files?.length > 1 ? "sendMediaGroup" : draft.files?.length ? methodForAttachment(draft.files[0], draft.sendMode) : "sendMessage", text: draft.files?.length ? null : draft.text, caption: draft.files?.length ? draft.text : null, media, created_at: new Date().toISOString(), status: draft.files?.length ? "uploading" : "sending", _optimistic: true, _draft: draft };
+  }
+
+  function removeOptimisticMessage(key, clientId, { revoke = false } = {}) {
+    const optimistic = state.botViewOptimisticMessages.get(key) || [];
+    const found = optimistic.find((item) => item.client_id === clientId);
+    state.botViewOptimisticMessages.set(key, optimistic.filter((item) => item.client_id !== clientId));
+    if (revoke && found?._draft) revokeDraftFiles(found._draft);
+  }
+
   async function submitMessage(form) {
     formError(form, "");
+    saveBotViewDraftFromDom();
     const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
-    const chatId = conversationId(conversation);
-    const id = state.selectedBotId;
+    const conversationIdValue = conversationId(conversation);
+    const id = String(state.selectedBotId || "");
     const contextVersion = state.botContextVersion;
     const sessionVersion = state.sessionVersion;
-    const text = String(new FormData(form).get("text") || "").trim();
-    if (!chatId || !text) return;
-    const key = botViewSendKey(id, chatId);
+    const draft = botViewDraft();
+    draft.text = String(draft.text || "").trim();
+    if (!conversationIdValue || (!draft.text && !draft.files.length)) return;
+    const key = botViewSendKey(id, conversationIdValue);
     if (state.botViewSendsInFlight.has(key)) return;
-    const requestKey = `sendMessage:${chatId}`;
+    if (draft.deliveryUnknown && !window.confirm("Telegram may already have received the previous attempt. Send it again and risk a duplicate?")) return;
+    if (draft.retryClientId) removeOptimisticMessage(key, draft.retryClientId);
+    const requestKey = `botAction:${conversationIdValue}`;
     const ticket = startRequest(requestKey);
-    const sendContext = { key, requestKey, botId: String(id), chatId: String(chatId), contextVersion, sessionVersion, ticket };
-    state.botViewSendsInFlight.set(key, sendContext);
-    stopBotViewRefresh();
-    setBotViewComposerSubmitting(form, true);
+    const clientId = window.crypto?.randomUUID?.() || `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const sendContext = { key, requestKey, botId: id, chatId: conversationIdValue, contextVersion, sessionVersion, ticket };
+    const draftSnapshot = { ...draft, files: [...draft.files], reply: effectiveReplyForConversation(draft, conversation) };
+    const actionGenerationHeaders = botViewActionGenerationHeaders(draftSnapshot.edit || draftSnapshot.reply);
+    const optimistic = optimisticMessageFromDraft(draftSnapshot, clientId);
+    if (!reserveBotViewSend(key, sendContext)) return;
+    if (!draft.edit) state.botViewOptimisticMessages.set(key, [...(state.botViewOptimisticMessages.get(key) || []), optimistic]);
+    if (draftSnapshot.files.length) state.botViewUploadProgress = { key, percent: 0 };
+    state.botViewDrafts.set(key, emptyBotViewDraft());
+    state.botViewOpenPanel = null;
+    renderBotViewLive();
+    const timeline = document.querySelector("#chat-timeline");
+    if (timeline) timeline.scrollTop = timeline.scrollHeight;
     try {
-      await api(`/bots/${encodeURIComponent(id)}/messages`, { method: "POST", body: { chat_id: Number(chatId), text } });
-      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
-      const currentConversation = state.conversations.find((item) => conversationId(item) === String(chatId));
-      if (currentConversation) await loadConversationMessages(chatId);
-      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
-      finishBotViewSend(sendContext);
-      form.reset();
-      if (String(state.selectedConversationId) === String(chatId)) {
-        const currentForm = document.querySelector("#message-form");
-        if (currentForm && currentForm !== form) currentForm.reset();
+      let response;
+      if (draftSnapshot.edit && draftSnapshot.files.length) {
+        const limit = botViewUploadLimit();
+        if (draftSnapshot.files[0].size > limit) throw new Error(`This file is larger than the ${formatBytes(limit)} limit for this bot.`);
+        if (methodForAttachment(draftSnapshot.files[0], draftSnapshot.sendMode) === "sendPhoto" && draftSnapshot.files[0].size > BOT_VIEW_PHOTO_MAX_FILE_BYTES) throw new Error("Telegram photos must be 10 MB or smaller. Send the image as a file instead.");
+        const upload = buildEditMediaUpload(draftSnapshot);
+        response = await uploadApi(botViewActionPath(id, conversationIdValue, upload.method), upload.form, (percent) => {
+          state.botViewUploadProgress = { key, percent };
+          const progress = document.querySelector(".upload-progress");
+          if (progress) {
+            progress.setAttribute("aria-valuenow", String(percent));
+            progress.querySelector("i")?.style.setProperty("--upload-progress", `${percent}%`);
+            const label = progress.querySelector("span");
+            if (label) label.textContent = `Uploading ${percent}%`;
+          }
+        }, actionGenerationHeaders);
+      } else if (draftSnapshot.edit) {
+        const ephemeral = draftSnapshot.edit.ephemeral_message_id !== "" && draftSnapshot.edit.ephemeral_message_id != null;
+        const captionEdit = draftSnapshot.edit.has_caption || draftSnapshot.edit.has_media;
+        const method = ephemeral ? captionEdit ? "editEphemeralMessageCaption" : "editEphemeralMessageText" : captionEdit ? "editMessageCaption" : "editMessageText";
+        const identity = ephemeral ? { ephemeral_message_id: draftSnapshot.edit.ephemeral_message_id } : { message_id: Number(draftSnapshot.edit.message_id) || draftSnapshot.edit.message_id };
+        const content = method === "editMessageCaption" ? { caption: draftSnapshot.text, ...(draftSnapshot.parseMode ? { parse_mode: draftSnapshot.parseMode } : {}) } : { text: draftSnapshot.text, ...(draftSnapshot.parseMode ? { parse_mode: draftSnapshot.parseMode } : {}) };
+        if (method === "editEphemeralMessageCaption") {
+          delete content.text;
+          content.caption = draftSnapshot.text;
+        }
+        response = await api(botViewActionPath(id, conversationIdValue, method), { method: "POST", body: { ...identity, ...content, ...(draftSnapshot.replyMarkup ? { reply_markup: draftSnapshot.replyMarkup } : {}) }, headers: actionGenerationHeaders });
+      } else if (draftSnapshot.files.length) {
+        const limit = botViewUploadLimit();
+        if (draftSnapshot.files.some((attachment) => attachment.size > limit)) throw new Error(`One of these files is larger than the ${formatBytes(limit)} limit for this bot.`);
+        const totalLimit = botViewAggregateUploadLimit();
+        if (draftSnapshot.files.reduce((sum, attachment) => sum + attachment.size, 0) > totalLimit) throw new Error(`This upload is larger than the ${formatBytes(totalLimit)} combined limit for this bot.`);
+        if (draftSnapshot.files.some((attachment) => methodForAttachment(attachment, draftSnapshot.sendMode) === "sendPhoto" && attachment.size > BOT_VIEW_PHOTO_MAX_FILE_BYTES)) throw new Error("Telegram photos must be 10 MB or smaller. Send the image as a file instead.");
+        const upload = buildAttachmentUpload(draftSnapshot);
+        response = await uploadApi(botViewActionPath(id, conversationIdValue, upload.method), upload.form, (percent) => {
+          state.botViewUploadProgress = { key, percent };
+          const progress = document.querySelector(".upload-progress");
+          if (progress) {
+            progress.setAttribute("aria-valuenow", String(percent));
+            progress.querySelector("i")?.style.setProperty("--upload-progress", `${percent}%`);
+            const label = progress.querySelector("span");
+            if (label) label.textContent = `Uploading ${percent}%`;
+          }
+        }, actionGenerationHeaders);
+      } else {
+        const guest = Boolean(conversation?.guest_query_id);
+        const messageContent = { message_text: draftSnapshot.text, ...(draftSnapshot.parseMode ? { parse_mode: draftSnapshot.parseMode } : {}) };
+        const params = guest ? { result: { type: "article", id: clientId.slice(0, 64), title: "Reply from bot", input_message_content: messageContent } } : { text: draftSnapshot.text, ...(draftSnapshot.parseMode ? { parse_mode: draftSnapshot.parseMode } : {}), ...(draftSnapshot.replyMarkup ? { reply_markup: draftSnapshot.replyMarkup } : {}) };
+        const replyParameters = replyParametersFromDraft(draftSnapshot);
+        if (replyParameters && !guest) params.reply_parameters = replyParameters;
+        response = await api(botViewActionPath(id, conversationIdValue, guest ? "answerGuestQuery" : "sendMessage"), { method: "POST", body: params, headers: guest ? {} : actionGenerationHeaders });
       }
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      const mergedResponseCount = mergeBotViewActionResponse(conversationIdValue, response, draftSnapshot.files);
+      removeOptimisticMessage(key, clientId, { revoke: draftSnapshot.files.length > 0 && !mergedResponseCount });
       renderBotViewLive();
-      window.setTimeout(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; }, 10);
-      toast("Reply sent as the bot.");
+      await loadConversationMessages(conversationIdValue);
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      renderBotViewLive();
+      window.requestAnimationFrame(() => { const currentTimeline = document.querySelector("#chat-timeline"); if (currentTimeline) currentTimeline.scrollTop = currentTimeline.scrollHeight; });
+      surfaceWarnings(response);
     } catch (error) {
       if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
-      finishBotViewSend(sendContext);
+      const definitive = botViewDefinitivelyRejected(error);
+      optimistic.status = definitive ? "failed" : "delivery_unknown";
+      optimistic.error = botViewErrorMessage(error);
+      draftSnapshot.retryClientId = clientId;
+      draftSnapshot.deliveryUnknown = !definitive;
+      state.botViewDrafts.set(key, draftSnapshot);
+      renderBotViewLive();
       const currentForm = document.querySelector("#message-form");
-      if (currentForm && String(state.selectedConversationId) === String(chatId)) {
-        formError(currentForm, errorMessage(error));
-        setBotViewComposerSubmitting(currentForm, false);
+      if (currentForm) formError(currentForm, `${optimistic.error}${definitive ? "" : " Delivery may have succeeded; check the timeline before retrying."}`);
+    } finally {
+      state.botViewUploadProgress = null;
+      document.querySelector(".upload-progress")?.remove();
+      finishBotViewSend(sendContext);
+      if (state.sessionVersion === sessionVersion && state.botContextVersion === contextVersion && String(state.selectedBotId || "") === id && state.route.name === "bot-view") {
+        startBotViewRefresh();
       }
+    }
+  }
+
+  function addBotViewFiles(fileList, { sendMode = null, explicitMethod = "" } = {}) {
+    const files = [...(fileList || [])].filter((file) => file instanceof File);
+    if (!files.length) return;
+    const draft = botViewDraft();
+    const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
+    if (conversation?.guest_query_id) { toast("Guest queries can only be answered with a text result.", "error"); return; }
+    if (draft.edit?.ephemeral_message_id !== "" && draft.edit?.ephemeral_message_id != null) { toast("Telegram does not allow a new file upload when editing an ephemeral message. Edit its text, caption, or buttons instead.", "error"); return; }
+    const maxFiles = conversation?.receiver_user_id != null ? 1 : BOT_VIEW_MAX_FILES;
+    const remaining = maxFiles - draft.files.length;
+    if (remaining <= 0) { toast(`Telegram albums support up to ${BOT_VIEW_MAX_FILES} files.`, "error"); return; }
+    const accepted = files.slice(0, remaining);
+    const limit = botViewUploadLimit();
+    const tooLarge = accepted.find((file) => file.size > limit);
+    if (tooLarge) { toast(`${tooLarge.name} is larger than this bot's ${formatBytes(limit)} upload limit.`, "error"); return; }
+    accepted.forEach((file) => draft.files.push({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, file, url: URL.createObjectURL(file), name: file.name || "attachment", size: file.size, type: file.type || "application/octet-stream", isVoice: Boolean(file.isVoice), forceDocument: Boolean(file.forceDocument), explicitMethod }));
+    if (sendMode) draft.sendMode = sendMode;
+    if (files.length > accepted.length) toast(conversation?.receiver_user_id != null ? "Ephemeral messages support one attachment at a time." : `Only the first ${remaining} files were added.`, "warning");
+    state.botViewOpenPanel = null;
+    renderBotViewLive();
+    document.querySelector("#message-form textarea")?.focus({ preventScroll: true });
+  }
+
+  async function sendBotViewSpecialAction(method, params, optimisticPayload = {}, suppliedActionGeneration) {
+    const id = String(state.selectedBotId || "");
+    const conversationIdValue = String(state.selectedConversationId || "");
+    if (!id || !conversationIdValue) return;
+    const key = botViewSendKey(id, conversationIdValue);
+    if (state.botViewSendsInFlight.has(key)) return;
+    const conversation = state.conversations.find((item) => conversationId(item) === conversationIdValue);
+    if (!conversation) return;
+    if (conversation.guest_query_id) { toast("Guest queries can only be answered with text.", "error"); return; }
+    if (conversation.receiver_user_id != null && !["sendContact", "sendLocation", "sendVenue"].includes(method)) { toast("That message type is not available for ephemeral recipients.", "error"); return; }
+    if (conversation.direct_messages_topic_id != null && ["sendPoll", "sendChatAction"].includes(method)) { toast("That message type is not available in direct-message topics.", "error"); return; }
+    if (method === "sendChecklist" && !conversation.business_connection_id) { toast("Checklists require a business conversation.", "error"); return; }
+    const contextVersion = state.botContextVersion;
+    const sessionVersion = state.sessionVersion;
+    const requestKey = `botAction:${conversationIdValue}`;
+    const ticket = startRequest(requestKey);
+    const clientId = window.crypto?.randomUUID?.() || `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const sendContext = { key, requestKey, botId: id, chatId: conversationIdValue, contextVersion, sessionVersion, ticket };
+    const draftReply = effectiveReplyForConversation(botViewDraft(), conversation);
+    const actionGeneration = suppliedActionGeneration !== undefined ? suppliedActionGeneration : draftReply?.action_generation;
+    const action = { method, params, optimisticPayload, actionGeneration, upload: false };
+    const optimistic = { id: clientId, client_id: clientId, direction: "outgoing", event_type: method, created_at: new Date().toISOString(), status: "sending", _optimistic: true, _draft: { text: "", files: [], reply: botViewDraft().reply, edit: null }, _action: action, ...optimisticPayload };
+    if (!reserveBotViewSend(key, sendContext)) return;
+    state.botViewOptimisticMessages.set(key, [...(state.botViewOptimisticMessages.get(key) || []), optimistic]);
+    state.botViewOpenPanel = null;
+    renderBotViewLive();
+    try {
+      const supportsReply = ["sendContact", "sendLocation", "sendVenue", "sendPoll", "sendDice", "sendRichMessage", "sendChecklist"].includes(method);
+      const effectiveReply = draftReply;
+      const replyParameters = supportsReply ? replyParametersFromDraft({ reply: effectiveReply }) : null;
+      const response = await api(botViewActionPath(id, conversationIdValue, method), { method: "POST", body: { ...params, ...(replyParameters ? { reply_parameters: replyParameters } : {}) }, headers: replyParameters?.ephemeral_message_id != null ? botViewActionGenerationHeaders(actionGeneration) : {} });
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      mergeBotViewActionResponse(conversationIdValue, response);
+      removeOptimisticMessage(key, clientId);
+      const draft = botViewDraft();
+      draft.reply = null;
+      renderBotViewLive();
+      await loadConversationMessages(conversationIdValue);
+      renderBotViewLive();
+      window.requestAnimationFrame(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; });
+    } catch (error) {
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      optimistic.status = botViewDefinitivelyRejected(error) ? "failed" : "delivery_unknown";
+      optimistic.error = botViewErrorMessage(error);
+      renderBotViewLive();
     } finally {
       finishBotViewSend(sendContext);
-      if (state.sessionVersion === sessionVersion
-        && state.botContextVersion === contextVersion
-        && String(state.selectedBotId || "") === String(id)
-        && state.route.name === "bot-view") startBotViewRefresh();
+      if (state.route.name === "bot-view") startBotViewMessageStream();
+    }
+  }
+
+  async function sendBotViewMultipartSpecialAction(method, formData, optimisticPayload = {}, previewFiles = [], suppliedActionGeneration) {
+    const id = String(state.selectedBotId || "");
+    const conversationIdValue = String(state.selectedConversationId || "");
+    if (!id || !conversationIdValue) return;
+    const conversation = state.conversations.find((item) => conversationId(item) === conversationIdValue);
+    if (!conversation || conversation.guest_query_id) { toast("This upload is not available in this conversation.", "error"); return; }
+    const key = botViewSendKey(id, conversationIdValue);
+    if (state.botViewSendsInFlight.has(key)) { previewFiles.forEach((file) => { if (file?.url?.startsWith?.("blob:")) URL.revokeObjectURL(file.url); }); return; }
+    const contextVersion = state.botContextVersion;
+    const sessionVersion = state.sessionVersion;
+    const requestKey = `botAction:${conversationIdValue}`;
+    const ticket = startRequest(requestKey);
+    const clientId = window.crypto?.randomUUID?.() || `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const sendContext = { key, requestKey, botId: id, chatId: conversationIdValue, contextVersion, sessionVersion, ticket };
+    const actionGeneration = suppliedActionGeneration !== undefined ? suppliedActionGeneration : effectiveReplyForConversation(botViewDraft(), conversation)?.action_generation;
+    const action = { method, formData, optimisticPayload, previewFiles, actionGeneration, upload: true };
+    const optimistic = { id: clientId, client_id: clientId, direction: "outgoing", event_type: method, created_at: new Date().toISOString(), status: "uploading", _optimistic: true, _draft: { text: "", files: previewFiles }, _action: action, ...optimisticPayload };
+    if (!reserveBotViewSend(key, sendContext)) return;
+    state.botViewOptimisticMessages.set(key, [...(state.botViewOptimisticMessages.get(key) || []), optimistic]);
+    state.botViewUploadProgress = { key, percent: 0 };
+    state.botViewOpenPanel = null;
+    renderBotViewLive();
+    try {
+      const response = await uploadApi(botViewActionPath(id, conversationIdValue, method), formData, (percent) => {
+        state.botViewUploadProgress = { key, percent };
+        const progress = document.querySelector(".upload-progress");
+        if (progress) {
+          progress.setAttribute("aria-valuenow", String(percent));
+          progress.querySelector("i")?.style.setProperty("--upload-progress", `${percent}%`);
+          const label = progress.querySelector("span");
+          if (label) label.textContent = `Uploading ${percent}%`;
+        }
+      }, botViewActionGenerationHeaders(actionGeneration));
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      const mergedResponseCount = mergeBotViewActionResponse(conversationIdValue, response, previewFiles);
+      removeOptimisticMessage(key, clientId, { revoke: previewFiles.length > 0 && !mergedResponseCount });
+      renderBotViewLive();
+      await loadConversationMessages(conversationIdValue);
+      renderBotViewLive();
+      window.requestAnimationFrame(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; });
+    } catch (error) {
+      if (state.sessionVersion !== sessionVersion || !botRequestIsCurrent(requestKey, ticket, id, contextVersion)) return;
+      optimistic.status = botViewDefinitivelyRejected(error) ? "failed" : "delivery_unknown";
+      optimistic.error = botViewErrorMessage(error);
+      renderBotViewLive();
+    } finally {
+      state.botViewUploadProgress = null;
+      finishBotViewSend(sendContext);
+      if (state.route.name === "bot-view") startBotViewMessageStream();
+    }
+  }
+
+  async function deleteBotViewMessage(messageIdValue, ephemeralMessageId = "", actionGeneration = "") {
+    const ephemeral = ephemeralMessageId !== "" && ephemeralMessageId != null;
+    if ((!ephemeral && messageIdValue === "") || !state.selectedBotId || !state.selectedConversationId) return;
+    try {
+      const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
+      const business = Boolean(conversation?.business_connection_id);
+      const method = ephemeral ? "deleteEphemeralMessage" : business ? "deleteBusinessMessages" : "deleteMessage";
+      const body = ephemeral ? { ephemeral_message_id: ephemeralMessageId } : business ? { message_ids: [Number(messageIdValue) || messageIdValue] } : { message_id: Number(messageIdValue) || messageIdValue };
+      const response = await api(botViewActionPath(state.selectedBotId, state.selectedConversationId, method), { method: "POST", body, headers: ephemeral ? botViewActionGenerationHeaders(actionGeneration) : {} });
+      mergeBotViewActionResponse(state.selectedConversationId, response);
+      renderBotViewLive();
+      await loadConversationMessages(state.selectedConversationId);
+      renderBotViewLive();
+      toast("Message deleted.");
+    } catch (error) {
+      toast(botViewErrorMessage(error), "error");
+    }
+  }
+
+  function setBotViewBulkMode(enabled) {
+    const key = botViewKey();
+    state.botViewBulkModeKey = enabled ? key : null;
+    if (enabled && !state.botViewBulkSelection.has(key)) state.botViewBulkSelection.set(key, new Set());
+    if (!enabled) state.botViewBulkSelection.delete(key);
+    renderBotViewLive();
+  }
+
+  function toggleBotViewBulkMessage(messageIdValue, checked) {
+    const key = botViewKey();
+    if (state.botViewBulkModeKey !== key) return;
+    const selected = state.botViewBulkSelection.get(key) || new Set();
+    if (checked) selected.add(String(messageIdValue));
+    else selected.delete(String(messageIdValue));
+    state.botViewBulkSelection.set(key, selected);
+    renderBotViewLive();
+  }
+
+  async function deleteSelectedBotViewMessages() {
+    const key = botViewKey();
+    const selected = [...(state.botViewBulkSelection.get(key) || [])];
+    if (!selected.length || !state.selectedBotId || !state.selectedConversationId) return;
+    if (!window.confirm(`Delete ${selected.length} selected message${selected.length === 1 ? "" : "s"}? Telegram's normal deletion limits still apply.`)) return;
+    const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
+    const method = conversation?.business_connection_id ? "deleteBusinessMessages" : "deleteMessages";
+    try {
+      const response = await api(botViewActionPath(state.selectedBotId, state.selectedConversationId, method), { method: "POST", body: { message_ids: selected.map((value) => Number(value) || value) } });
+      mergeBotViewActionResponse(state.selectedConversationId, response);
+      state.botViewBulkSelection.delete(key);
+      state.botViewBulkModeKey = null;
+      renderBotViewLive();
+      await loadConversationMessages(state.selectedConversationId);
+      renderBotViewLive();
+      toast(`${selected.length} message${selected.length === 1 ? "" : "s"} deleted.`);
+    } catch (error) {
+      toast(botViewErrorMessage(error), "error");
+    }
+  }
+
+  async function startVoiceRecording() {
+    if (state.botViewRecorder) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function") {
+      toast("Voice recording is not supported by this browser. You can attach an audio file instead.", "error");
+      return;
+    }
+    const supported = (type) => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(type);
+    const mimeType = ["audio/ogg;codecs=opus", "audio/mp4;codecs=mp4a.40.2", "audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find(supported) || "";
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
+      if (state.route.name !== "bot-view" || !state.selectedConversationId) { stream.getTracks().forEach((track) => track.stop()); return; }
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const recording = { key: botViewKey(), recorder, stream, chunks: [], startedAt: Date.now(), cancelled: false, timer: null, mimeType: recorder.mimeType || mimeType };
+      recorder.addEventListener("dataavailable", (event) => { if (event.data?.size) recording.chunks.push(event.data); });
+      recorder.addEventListener("stop", () => {
+        window.clearInterval(recording.timer);
+        stream.getTracks().forEach((track) => track.stop());
+        if (state.botViewRecorder === recording) state.botViewRecorder = null;
+        if (!recording.cancelled && recording.chunks.length) {
+          const type = recording.mimeType || recording.chunks[0].type || "audio/webm";
+          const voiceCompatible = type.startsWith("audio/ogg") || type.startsWith("audio/mp4") || type.startsWith("audio/mpeg") || type.startsWith("audio/x-m4a");
+          const extension = type.startsWith("audio/ogg") ? "ogg" : type.startsWith("audio/mp4") ? "m4a" : type.startsWith("audio/mpeg") ? "mp3" : "webm";
+          const file = new File(recording.chunks, `voice-${Date.now()}.${extension}`, { type });
+          file.isVoice = voiceCompatible;
+          file.forceDocument = !voiceCompatible;
+          addBotViewFiles([file], { sendMode: voiceCompatible ? "media" : "document" });
+          if (!voiceCompatible) toast("This browser records WebM, so the recording will be sent as a file.", "warning");
+        } else if (state.route.name === "bot-view") renderBotViewLive();
+      });
+      state.botViewRecorder = recording;
+      recorder.start(250);
+      recording.timer = window.setInterval(() => {
+        const elapsed = Math.floor((Date.now() - recording.startedAt) / 1000);
+        const timer = document.querySelector(".voice-recorder time");
+        if (timer) timer.textContent = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
+      }, 250);
+      renderBotViewLive();
+    } catch (error) {
+      toast(error?.name === "NotAllowedError" ? "Microphone access was denied. Allow it in browser settings or attach an audio file." : "Could not start voice recording.", "error");
+    }
+  }
+
+  function stopVoiceRecording({ cancel = false, renderResult = true } = {}) {
+    const recording = state.botViewRecorder;
+    if (!recording) return;
+    recording.cancelled = Boolean(cancel);
+    if (recording.recorder?.state !== "inactive") recording.recorder.stop();
+    else {
+      window.clearInterval(recording.timer);
+      recording.stream?.getTracks?.().forEach((track) => track.stop());
+      state.botViewRecorder = null;
+      if (renderResult && state.route.name === "bot-view") renderBotViewLive();
+    }
+  }
+
+  function submitPoll(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const question = String(data.get("question") || "").trim();
+    const options = String(data.get("options") || "").split(/\r?\n/).map((option) => option.trim()).filter(Boolean);
+    if (options.length < 1 || options.length > 12) { formError(form, "Enter between 1 and 12 options, one per line."); return; }
+    sendBotViewSpecialAction("sendPoll", { question, options: options.map((text) => ({ text })), is_anonymous: data.get("is_anonymous") === "on", allows_multiple_answers: data.get("allows_multiple_answers") === "on" }, { poll: { question, options: options.map((text) => ({ text, voter_count: 0 })), total_voter_count: 0 } });
+  }
+
+  function submitLocation(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const latitude = Number(data.get("latitude"));
+    const longitude = Number(data.get("longitude"));
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) { formError(form, "Enter a valid latitude and longitude."); return; }
+    sendBotViewSpecialAction("sendLocation", { latitude, longitude }, { location: { latitude, longitude } });
+  }
+
+  function submitContact(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const firstName = String(data.get("first_name") || "").trim();
+    const phoneNumber = String(data.get("phone_number") || "").trim();
+    if (!firstName || !phoneNumber) { formError(form, "Enter a name and phone number."); return; }
+    sendBotViewSpecialAction("sendContact", { first_name: firstName, phone_number: phoneNumber }, { contact: { first_name: firstName, phone_number: phoneNumber } });
+  }
+
+  function submitVenue(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const latitude = Number(data.get("latitude"));
+    const longitude = Number(data.get("longitude"));
+    const title = String(data.get("title") || "").trim();
+    const address = String(data.get("address") || "").trim();
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !title || !address) { formError(form, "Enter valid coordinates, a place name, and an address."); return; }
+    sendBotViewSpecialAction("sendVenue", { latitude, longitude, title, address }, { venue: { location: { latitude, longitude }, title, address } });
+  }
+
+  function submitLivePhoto(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const video = data.get("live_photo");
+    const photo = data.get("photo");
+    const caption = String(data.get("caption") || "").trim();
+    if (!(video instanceof File) || !video.size || !(photo instanceof File) || !photo.size) { formError(form, "Choose both the short video and its static photo."); return; }
+    if (video.size > BOT_VIEW_PHOTO_MAX_FILE_BYTES || photo.size > BOT_VIEW_PHOTO_MAX_FILE_BYTES) { formError(form, "Each live-photo file must be 10 MB or smaller."); return; }
+    if (!video.type.startsWith("video/") || !photo.type.startsWith("image/")) { formError(form, "Choose a video file and an image file."); return; }
+    const draft = botViewDraft();
+    const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
+    const replyParameters = replyParametersFromDraft({ reply: effectiveReplyForConversation(draft, conversation) });
+    const actionGeneration = effectiveReplyForConversation(draft, conversation)?.action_generation;
+    const body = new FormData();
+    if (caption) body.append("caption", caption);
+    if (draft.parseMode) body.append("parse_mode", draft.parseMode);
+    if (replyParameters) body.append("reply_parameters", JSON.stringify(replyParameters));
+    if (draft.replyMarkup) body.append("reply_markup", JSON.stringify(draft.replyMarkup));
+    body.append("live_photo", video, video.name || "live-photo.mp4");
+    body.append("photo", photo, photo.name || "live-photo.jpg");
+    const previewFiles = [
+      { file: photo, url: URL.createObjectURL(photo), name: photo.name || "Live photo", size: photo.size, type: photo.type },
+      { file: video, url: URL.createObjectURL(video), name: video.name || "Live photo video", size: video.size, type: video.type },
+    ];
+    sendBotViewMultipartSpecialAction("sendLivePhoto", body, { caption, media: [{ kind: "photo", url: previewFiles[0].url, label: "Live photo" }, { kind: "live_photo", url: previewFiles[1].url, label: "Live photo" }] }, previewFiles, actionGeneration);
+  }
+
+  function submitRichMessage(form) {
+    formError(form, "");
+    const markdown = String(new FormData(form).get("markdown") || "").trim();
+    if (!markdown) { formError(form, "Write the rich message first."); return; }
+    sendBotViewSpecialAction("sendRichMessage", { rich_message: { markdown } }, { rich_message: { blocks: [{ type: "paragraph", text: markdown }] } });
+  }
+
+  function submitChecklist(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const title = String(data.get("title") || "").trim();
+    const tasks = String(data.get("tasks") || "").split(/\r?\n/).map((task) => task.trim()).filter(Boolean);
+    if (!title || tasks.length < 1 || tasks.length > 30 || tasks.some((task) => task.length > 100)) { formError(form, "Enter a title and 1–30 tasks of at most 100 characters each."); return; }
+    const checklist = { title, tasks: tasks.map((text, index) => ({ id: index + 1, text })), ...(data.get("others_can_add_tasks") === "on" ? { others_can_add_tasks: true } : {}), ...(data.get("others_can_mark_tasks_as_done") === "on" ? { others_can_mark_tasks_as_done: true } : {}) };
+    const messageIdValue = String(data.get("message_id") || "");
+    if (messageIdValue) performBotViewControlAction("editMessageChecklist", { message_id: Number(messageIdValue) || messageIdValue, checklist }, "Checklist updated.");
+    else sendBotViewSpecialAction("sendChecklist", { checklist }, { checklist });
+  }
+
+  async function submitSuggestedPostDecision(form, decision) {
+    formError(form, "");
+    const data = new FormData(form);
+    const messageIdValue = String(data.get("message_id") || "");
+    const conversation = state.conversations.find((item) => conversationId(item) === String(state.selectedConversationId));
+    if (!messageIdValue || conversation?.direct_messages_topic_id == null) { formError(form, "This suggested post is no longer available in the current conversation."); return; }
+    const method = decision === "decline" ? "declineSuggestedPost" : "approveSuggestedPost";
+    const params = { message_id: Number(messageIdValue) || messageIdValue };
+    if (method === "approveSuggestedPost") {
+      const rawDate = String(data.get("send_date") || "").trim();
+      if (rawDate) {
+        const milliseconds = Date.parse(rawDate);
+        if (!Number.isFinite(milliseconds)) { formError(form, "Choose a valid publication time."); return; }
+        params.send_date = Math.floor(milliseconds / 1000);
+      }
+    } else {
+      const comment = String(data.get("comment") || "").trim();
+      if (comment.length > 128) { formError(form, "The decline comment must be 128 characters or fewer."); return; }
+      if (comment) params.comment = comment;
+    }
+    const botIdValue = String(state.selectedBotId || "");
+    const conversationIdValue = String(state.selectedConversationId || "");
+    const contextVersion = state.botContextVersion;
+    const sessionVersion = state.sessionVersion;
+    setSubmitting(form, true, method === "approveSuggestedPost" ? "Approving…" : "Declining…");
+    try {
+      const response = await api(botViewActionPath(botIdValue, conversationIdValue, method), { method: "POST", body: params });
+      if (state.sessionVersion !== sessionVersion || state.botContextVersion !== contextVersion || String(state.selectedConversationId || "") !== conversationIdValue) return;
+      mergeBotViewActionResponse(conversationIdValue, response);
+      state.botViewOpenPanel = null;
+      renderBotViewLive();
+      await loadConversationMessages(conversationIdValue);
+      renderBotViewLive();
+      toast(method === "approveSuggestedPost" ? "Suggested post approved." : "Suggested post declined.");
+    } catch (error) {
+      if (form.isConnected) {
+        formError(form, botViewErrorMessage(error));
+        setSubmitting(form, false);
+      } else {
+        toast(botViewErrorMessage(error), "error");
+      }
+    }
+  }
+
+  function markBotViewCallbackAnswered(conversation, actionGeneration) {
+    if (!conversation || actionGeneration === "" || actionGeneration == null) return;
+    conversationMessages(conversation).forEach((item) => {
+      if (String(item?.action_generation ?? "") === String(actionGeneration)) {
+        item.actionable = false;
+        item._locally_observed = true;
+        item._response_pending = true;
+      }
+    });
+  }
+
+  async function submitCallbackAnswer(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const actionGeneration = String(data.get("action_generation") || "");
+    const textValue = String(data.get("text") || "").trim();
+    if (!actionGeneration) { formError(form, "This callback is no longer actionable. Refresh the conversation."); return; }
+    if (textValue.length > 200) { formError(form, "Callback text must be 200 characters or fewer."); return; }
+    const botIdValue = String(state.selectedBotId || "");
+    const conversationIdValue = String(state.selectedConversationId || "");
+    const contextVersion = state.botContextVersion;
+    const sessionVersion = state.sessionVersion;
+    setSubmitting(form, true, "Answering…");
+    try {
+      await api(botViewActionPath(botIdValue, conversationIdValue, "answerCallbackQuery"), {
+        method: "POST",
+        body: { ...(textValue ? { text: textValue } : {}), ...(data.get("show_alert") === "on" ? { show_alert: true } : {}) },
+        headers: botViewActionGenerationHeaders(actionGeneration),
+      });
+      if (state.sessionVersion !== sessionVersion || state.botContextVersion !== contextVersion || String(state.selectedConversationId || "") !== conversationIdValue) return;
+      const conversation = state.conversations.find((item) => conversationId(item) === conversationIdValue);
+      markBotViewCallbackAnswered(conversation, actionGeneration);
+      state.botViewOpenPanel = null;
+      renderBotViewLive();
+      await loadConversationMessages(conversationIdValue);
+      renderBotViewLive();
+      toast("Callback answered.");
+    } catch (error) {
+      if (form.isConnected) {
+        formError(form, botViewErrorMessage(error));
+        setSubmitting(form, false);
+      } else {
+        toast(botViewErrorMessage(error), "error");
+      }
+    }
+  }
+
+  async function submitForwardMessage(form) {
+    formError(form, "");
+    const data = new FormData(form);
+    const targetConversationId = String(data.get("conversation_id") || "");
+    const messageIdValue = String(data.get("message_id") || "");
+    const fromChatId = String(data.get("from_chat_id") || "");
+    const method = data.get("mode") === "copy" ? "copyMessage" : "forwardMessage";
+    if (!targetConversationId || !messageIdValue || !fromChatId) { formError(form, "Select a destination."); return; }
+    setSubmitting(form, true, "Sending…");
+    try {
+      const response = await api(botViewActionPath(state.selectedBotId, targetConversationId, method), { method: "POST", body: { from_chat_id: Number(fromChatId) || fromChatId, message_id: Number(messageIdValue) || messageIdValue } });
+      mergeBotViewActionResponse(targetConversationId, response);
+      state.botViewOpenPanel = null;
+      renderBotViewLive();
+      toast(method === "copyMessage" ? "Message copied." : "Message forwarded.");
+    } catch (error) {
+      formError(form, botViewErrorMessage(error));
+      setSubmitting(form, false);
+    }
+  }
+
+  function submitMessageFormat(form) {
+    botViewDraft().parseMode = String(new FormData(form).get("parse_mode") || "");
+    state.botViewOpenPanel = null;
+    renderBotViewLive();
+    document.querySelector("#message-form textarea")?.focus({ preventScroll: true });
+  }
+
+  function submitMessageButtons(form) {
+    formError(form, "");
+    const lines = String(new FormData(form).get("buttons") || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const buttons = [];
+    for (const line of lines) {
+      const separator = line.indexOf("|");
+      const text = separator >= 0 ? line.slice(0, separator).trim() : "";
+      const url = separator >= 0 ? line.slice(separator + 1).trim() : "";
+      const parsed = safeExternalLink(url);
+      if (!text || !parsed || !parsed.startsWith("https://")) { formError(form, "Use one button per line in the form Label | https://example.com."); return; }
+      buttons.push([{ text, url: parsed }]);
+    }
+    if (!buttons.length || buttons.length > 100) { formError(form, "Add between 1 and 100 buttons."); return; }
+    botViewDraft().replyMarkup = { inline_keyboard: buttons };
+    state.botViewOpenPanel = null;
+    renderBotViewLive();
+    document.querySelector("#message-form textarea")?.focus({ preventScroll: true });
+  }
+
+  function removeBotViewAttachment(attachmentId) {
+    const draft = botViewDraft();
+    const attachment = draft.files.find((item) => item.id === attachmentId);
+    if (attachment?.url?.startsWith("blob:")) URL.revokeObjectURL(attachment.url);
+    draft.files = draft.files.filter((item) => item.id !== attachmentId);
+    renderBotViewLive();
+  }
+
+  function retryBotViewMessage(clientId) {
+    const key = botViewKey();
+    const optimistic = (state.botViewOptimisticMessages.get(key) || []).find((item) => item.client_id === clientId);
+    if (!optimistic?._draft) return;
+    if (optimistic.status === "delivery_unknown" && !window.confirm("Telegram may already have received this message. Retry anyway and risk sending a duplicate?")) return;
+    state.botViewDrafts.set(key, { ...optimistic._draft, files: [...(optimistic._draft.files || [])], retryClientId: null, deliveryUnknown: false });
+    removeOptimisticMessage(key, clientId);
+    renderBotViewLive();
+    window.setTimeout(() => document.querySelector("#message-form")?.requestSubmit(), 0);
+  }
+
+  function retryBotViewSpecialAction(clientId) {
+    const key = botViewKey();
+    const optimistic = (state.botViewOptimisticMessages.get(key) || []).find((item) => item.client_id === clientId);
+    const action = optimistic?._action;
+    if (!action) return;
+    if (optimistic.status === "delivery_unknown" && !window.confirm("Telegram may already have received this action. Retry anyway and risk a duplicate?")) return;
+    removeOptimisticMessage(key, clientId);
+    if (action.upload) sendBotViewMultipartSpecialAction(action.method, action.formData, action.optimisticPayload, action.previewFiles, action.actionGeneration);
+    else sendBotViewSpecialAction(action.method, action.params, action.optimisticPayload, action.actionGeneration);
+  }
+
+  async function markBusinessMessageRead(messageIdValue) {
+    if (!messageIdValue || !state.selectedBotId || !state.selectedConversationId) return;
+    try {
+      const response = await api(botViewActionPath(state.selectedBotId, state.selectedConversationId, "readBusinessMessage"), { method: "POST", body: { message_id: Number(messageIdValue) || messageIdValue } });
+      mergeBotViewActionResponse(state.selectedConversationId, response);
+      renderBotViewLive();
+      toast("Message marked as read.");
+    } catch (error) {
+      toast(botViewErrorMessage(error), "error");
+    }
+  }
+
+  async function performBotViewControlAction(method, params, successMessage) {
+    const id = String(state.selectedBotId || "");
+    const conversationIdValue = String(state.selectedConversationId || "");
+    const contextVersion = state.botContextVersion;
+    const sessionVersion = state.sessionVersion;
+    if (!id || !conversationIdValue) return;
+    try {
+      const response = await api(botViewActionPath(id, conversationIdValue, method), { method: "POST", body: params });
+      if (state.sessionVersion !== sessionVersion || state.botContextVersion !== contextVersion || String(state.selectedBotId || "") !== id || String(state.selectedConversationId || "") !== conversationIdValue) return;
+      mergeBotViewActionResponse(conversationIdValue, response);
+      state.botViewOpenPanel = null;
+      renderBotViewLive();
+      await loadConversationMessages(conversationIdValue);
+      renderBotViewLive();
+      if (successMessage) toast(successMessage);
+    } catch (error) {
+      if (state.sessionVersion === sessionVersion && state.botContextVersion === contextVersion) toast(botViewErrorMessage(error), "error");
     }
   }
 
@@ -2432,12 +4477,55 @@
     }
   }
 
+  if (window.__PHENOGRAM_CHAT_TEST_MODE__ === true) {
+    window.__PHENOGRAM_CHAT_TEST__ = {
+      state,
+      isPlatformUnauthorizedPayload,
+      isTelegramFailurePayload,
+      botViewDefinitivelyRejected,
+      safeMediaUrl,
+      messageStableId,
+      ephemeralMessageIsActionable,
+      botViewActionGenerationHeaders,
+      emptyBotViewDraft,
+      botViewDraft,
+      botViewKey,
+      botViewNearBottom,
+      botViewPrependScrollTop,
+      botViewUnreadAfterInsert,
+      reserveBotViewSend,
+      finishBotViewSend,
+      botViewMessageStreamContextIsCurrent,
+      mergeConversationMessageSnapshot,
+      mergeConversationTimelineItems,
+      botViewTimelineMessagesFromResponse,
+      botViewAggregateUploadLimit,
+      collapseMediaGroups,
+      renderMessage,
+      renderComposerPanel,
+    };
+    return;
+  }
+
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     if (form.id === "connect-bot-form") { event.preventDefault(); submitConnectBot(form); }
     if (form.id === "managed-webhook-recovery-form") { event.preventDefault(); submitManagedWebhookRecovery(form); }
     if (form.id === "message-form") { event.preventDefault(); submitMessage(form); }
+    if (form.id === "poll-form") { event.preventDefault(); submitPoll(form); }
+    if (form.id === "location-form") { event.preventDefault(); submitLocation(form); }
+    if (form.id === "contact-form") { event.preventDefault(); submitContact(form); }
+    if (form.id === "venue-form") { event.preventDefault(); submitVenue(form); }
+    if (form.id === "live-photo-form") { event.preventDefault(); submitLivePhoto(form); }
+    if (form.id === "rich-message-form") { event.preventDefault(); submitRichMessage(form); }
+    if (form.id === "checklist-form") { event.preventDefault(); submitChecklist(form); }
+    if (form.id === "suggested-post-approve-form") { event.preventDefault(); submitSuggestedPostDecision(form, "approve"); }
+    if (form.id === "suggested-post-decline-form") { event.preventDefault(); submitSuggestedPostDecision(form, "decline"); }
+    if (form.id === "callback-answer-form") { event.preventDefault(); submitCallbackAnswer(form); }
+    if (form.id === "forward-message-form") { event.preventDefault(); submitForwardMessage(form); }
+    if (form.id === "message-format-form") { event.preventDefault(); submitMessageFormat(form); }
+    if (form.id === "message-buttons-form") { event.preventDefault(); submitMessageButtons(form); }
     if (form.id === "delete-bot-form") { event.preventDefault(); submitDeleteBot(form); }
     if (form.id === "stream-key-form") { event.preventDefault(); submitStreamKey(form); }
     if (form.id === "file-link-form") { event.preventDefault(); submitFileLink(form); }
@@ -2482,19 +4570,132 @@
     else if (action === "copy-json") { const itemId = normalizeJournalId(state.drawer?.itemId || updateJournalId(state.drawer?.item)); const item = state.updates.find((candidate) => updateJournalId(candidate) === itemId) || state.drawer?.item; if (item) copyText(JSON.stringify(updatePayload(item), null, 2)); }
     else if (action === "copy-value") copyText(trigger.dataset.copyValue || "");
     else if (action === "select-conversation") {
+      stopBotViewMessageStream();
       state.botViewConversationListPinned = false;
+      state.botViewBulkModeKey = null;
       state.selectedConversationId = trigger.dataset.conversationId;
+      state.botViewOpenPanel = null;
       render();
       loadConversationMessages(state.selectedConversationId).finally(() => {
         render();
-        window.setTimeout(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; }, 10);
+        window.setTimeout(() => { const timeline = document.querySelector("#chat-timeline"); if (timeline) timeline.scrollTop = timeline.scrollHeight; startBotViewMessageStream(); }, 10);
       });
     }
     else if (action === "chat-back") {
+      stopBotViewMessageStream();
+      state.botViewBulkModeKey = null;
       state.selectedConversationId = null;
       state.botViewConversationListPinned = mobileBotViewIsSinglePane();
       render();
     }
+    else if (action === "scroll-latest") {
+      const timeline = document.querySelector("#chat-timeline");
+      if (timeline) timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
+    }
+    else if (action === "toggle-bulk-select") setBotViewBulkMode(state.botViewBulkModeKey !== botViewKey());
+    else if (action === "cancel-bulk-select") setBotViewBulkMode(false);
+    else if (action === "toggle-selected-message") toggleBotViewBulkMessage(trigger.dataset.telegramMessageId, trigger.checked);
+    else if (action === "delete-selected-messages") deleteSelectedBotViewMessages();
+    else if (action === "load-older-messages") loadOlderBotViewMessages();
+    else if (action === "toggle-composer-panel") {
+      const key = botViewKey();
+      const panel = trigger.dataset.panel;
+      state.botViewOpenPanel = state.botViewOpenPanel?.key === key && state.botViewOpenPanel?.name === panel ? null : { key, name: panel };
+      renderBotViewLive();
+      window.setTimeout(() => document.querySelector(".composer-panel input, .composer-panel textarea, .composer-panel button")?.focus({ preventScroll: true }), 0);
+    }
+    else if (action === "close-composer-panel") { state.botViewOpenPanel = null; renderBotViewLive(); }
+    else if (action === "open-special-panel") { state.botViewOpenPanel = { key: botViewKey(), name: trigger.dataset.panel }; renderBotViewLive(); }
+    else if (action === "pick-attachments") {
+      const input = document.querySelector("#message-attachments");
+      if (input) {
+        input.accept = trigger.dataset.accept || "*/*";
+        input.dataset.mode = trigger.dataset.mode || "media";
+        input.dataset.method = trigger.dataset.method || "";
+        input.click();
+      }
+    }
+    else if (action === "remove-attachment") removeBotViewAttachment(trigger.dataset.attachmentId);
+    else if (action === "set-attachment-mode") { botViewDraft().sendMode = trigger.dataset.mode === "document" ? "document" : "media"; renderBotViewLive(); }
+    else if (action === "insert-emoji") {
+      const textarea = document.querySelector("#message-form textarea");
+      if (textarea) {
+        const start = textarea.selectionStart ?? textarea.value.length;
+        const end = textarea.selectionEnd ?? start;
+        textarea.setRangeText(trigger.dataset.emoji || "", start, end, "end");
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.focus({ preventScroll: true });
+      }
+    }
+    else if (action === "cancel-message-context") { const draft = botViewDraft(); draft.reply = null; draft.edit = null; draft.suppressEphemeralReply = trigger.dataset.autoEphemeral === "true"; renderBotViewLive(); }
+    else if (action === "clear-composer-options") { const draft = botViewDraft(); draft.parseMode = ""; draft.replyMarkup = null; renderBotViewLive(); }
+    else if (action === "reply-message" || action === "edit-message") {
+      try {
+        const message = JSON.parse(trigger.dataset.message || "{}");
+        const draft = botViewDraft();
+        if (action === "reply-message") { draft.reply = message; draft.edit = null; draft.suppressEphemeralReply = false; }
+        else { draft.edit = message; draft.reply = null; draft.text = message.text || ""; draft.replyMarkup = message.reply_markup || null; }
+        renderBotViewLive();
+        document.querySelector("#message-form textarea")?.focus({ preventScroll: true });
+      } catch (_) { toast("Could not select that message.", "error"); }
+    }
+    else if (action === "copy-message-text") copyText(trigger.dataset.text || "");
+    else if (action === "forward-message") { state.botViewOpenPanel = { key: botViewKey(), name: "forward", data: { messageId: trigger.dataset.telegramMessageId, fromChatId: trigger.dataset.fromChatId } }; renderBotViewLive(); }
+    else if (action === "open-reaction-panel") { state.botViewOpenPanel = { key: botViewKey(), name: "reaction", data: { messageId: trigger.dataset.telegramMessageId } }; renderBotViewLive(); }
+    else if (action === "open-callback-answer") {
+      state.botViewOpenPanel = { key: botViewKey(), name: "callback-answer", data: { actionGeneration: trigger.dataset.actionGeneration } };
+      renderBotViewLive();
+      window.setTimeout(() => document.querySelector("#callback-answer-form textarea")?.focus({ preventScroll: true }), 0);
+    }
+    else if (action === "review-suggested-post") {
+      const decision = trigger.dataset.decision === "decline" ? "decline" : "approve";
+      state.botViewOpenPanel = { key: botViewKey(), name: `suggested-post-${decision}`, data: { messageId: trigger.dataset.telegramMessageId } };
+      renderBotViewLive();
+      window.setTimeout(() => document.querySelector(`#suggested-post-${decision}-form input:not([type="hidden"]), #suggested-post-${decision}-form textarea, #suggested-post-${decision}-form button`)?.focus({ preventScroll: true }), 0);
+    }
+    else if (action === "set-message-reaction") performBotViewControlAction("setMessageReaction", { message_id: Number(trigger.dataset.telegramMessageId) || trigger.dataset.telegramMessageId, reaction: [{ type: "emoji", emoji: trigger.dataset.reaction }] }, "Reaction updated.");
+    else if (action === "remove-message-reaction") performBotViewControlAction("setMessageReaction", { message_id: Number(trigger.dataset.telegramMessageId) || trigger.dataset.telegramMessageId, reaction: [] }, "Reaction removed.");
+    else if (action === "stop-poll") performBotViewControlAction("stopPoll", { message_id: Number(trigger.dataset.telegramMessageId) || trigger.dataset.telegramMessageId }, "Poll stopped.");
+    else if (action === "stop-live-location") performBotViewControlAction("stopMessageLiveLocation", { message_id: Number(trigger.dataset.telegramMessageId) || trigger.dataset.telegramMessageId }, "Live location stopped.");
+    else if (action === "edit-checklist") {
+      try {
+        state.botViewOpenPanel = { key: botViewKey(), name: "checklist", data: { messageId: trigger.dataset.telegramMessageId, checklist: JSON.parse(trigger.dataset.checklist || "{}") } };
+        renderBotViewLive();
+      } catch (_) { toast("Could not open that checklist.", "error"); }
+    }
+    else if (action === "delete-message") {
+      trigger.dataset.action = "confirm-delete-message";
+      trigger.classList.add("is-confirming");
+      trigger.setAttribute("aria-label", "Confirm delete message");
+      trigger.innerHTML = "Delete?";
+      window.setTimeout(() => {
+        if (trigger.isConnected && trigger.dataset.action === "confirm-delete-message") {
+          trigger.dataset.action = "delete-message";
+          trigger.classList.remove("is-confirming");
+          trigger.setAttribute("aria-label", "Delete message");
+          trigger.innerHTML = icon("trash");
+        }
+      }, 3500);
+    }
+    else if (action === "confirm-delete-message") deleteBotViewMessage(trigger.dataset.telegramMessageId ?? "", trigger.dataset.ephemeralMessageId ?? "", trigger.dataset.actionGeneration ?? "");
+    else if (action === "retry-message") retryBotViewMessage(trigger.dataset.clientId);
+    else if (action === "retry-special-action") retryBotViewSpecialAction(trigger.dataset.clientId);
+    else if (action === "mark-business-message-read") markBusinessMessageRead(trigger.dataset.telegramMessageId);
+    else if (action === "send-dice") sendBotViewSpecialAction("sendDice", { emoji: trigger.dataset.emoji || "🎲" }, { dice: { emoji: trigger.dataset.emoji || "🎲" } });
+    else if (action === "use-current-location") {
+      const form = trigger.closest("form");
+      if (!navigator.geolocation) { formError(form, "Location is not supported by this browser."); return; }
+      trigger.disabled = true;
+      navigator.geolocation.getCurrentPosition((position) => {
+        trigger.disabled = false;
+        if (!form?.isConnected) return;
+        form.elements.latitude.value = String(position.coords.latitude);
+        form.elements.longitude.value = String(position.coords.longitude);
+      }, (error) => { trigger.disabled = false; formError(form, error.code === 1 ? "Location permission was denied." : "Could not determine your location."); }, { enableHighAccuracy: true, timeout: 10000 });
+    }
+    else if (action === "start-voice-recording") startVoiceRecording();
+    else if (action === "stop-voice-recording") stopVoiceRecording();
+    else if (action === "cancel-voice-recording") stopVoiceRecording({ cancel: true });
     else if (action === "retry-stream-keys") loadStreamKeys();
     else if (action === "revoke-stream-key") revokeStreamKey(trigger);
     else if (action === "dismiss-stream-secret") { state.streamKey = null; state.streamKeyId = null; render(); }
@@ -2508,11 +4709,59 @@
       applyConversationFilter(event.target.value);
     }
     if (event.target.matches("input[aria-invalid='true']")) event.target.removeAttribute("aria-invalid");
+    if (event.target.matches("#message-form textarea")) {
+      const draft = botViewDraft();
+      draft.text = event.target.value;
+      resizeBotViewComposer(event.target);
+      updateBotViewPrimaryAction();
+    }
   });
 
+  document.addEventListener("change", (event) => {
+    if (event.target.matches("#message-attachments")) {
+      addBotViewFiles(event.target.files, { sendMode: event.target.dataset.mode || "media", explicitMethod: event.target.dataset.method || "" });
+      event.target.value = "";
+      event.target.dataset.method = "";
+    }
+  });
+
+  document.addEventListener("paste", (event) => {
+    if (!event.target.closest?.(".composer")) return;
+    const files = [...(event.clipboardData?.files || [])];
+    if (!files.length) return;
+    event.preventDefault();
+    addBotViewFiles(files, { sendMode: "media" });
+  });
+
+  ["dragenter", "dragover"].forEach((type) => document.addEventListener(type, (event) => {
+    if (state.route.name !== "bot-view" || !event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    document.querySelector(".timeline-wrap")?.classList.add("is-dragging");
+  }));
+
+  ["dragleave", "drop"].forEach((type) => document.addEventListener(type, (event) => {
+    if (state.route.name !== "bot-view") return;
+    if (type === "drop" && event.dataTransfer?.files?.length) {
+      event.preventDefault();
+      addBotViewFiles(event.dataTransfer.files, { sendMode: "media" });
+    }
+    if (type === "drop" || !event.relatedTarget) document.querySelector(".timeline-wrap")?.classList.remove("is-dragging");
+  }));
+
+  document.addEventListener("scroll", (event) => {
+    if (event.target?.matches?.("#chat-timeline")) updateScrollLatestControl();
+  }, true);
+
   document.addEventListener("keydown", (event) => {
+    if (event.target.matches?.("#message-form textarea") && event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      const form = event.target.form;
+      if (event.target.value.trim() || botViewDraft().files.length || botViewDraft().edit) form?.requestSubmit();
+    }
     if (event.key === "Escape") {
-      if (state.modal) closeModal();
+      if (state.botViewOpenPanel) { state.botViewOpenPanel = null; renderBotViewLive(); }
+      else if (state.modal) closeModal();
       else if (state.drawer) { state.drawer = null; render(); }
       else if (state.mobileMenu) setMobileMenu(false, { restoreFocus: true });
     }
@@ -2534,10 +4783,13 @@
   window.addEventListener("beforeunload", () => {
     stopUpdatesStream({ status: "idle" });
     stopBotViewRefresh();
+    stopBotViewMessageStream();
+    stopVoiceRecording({ cancel: true, renderResult: false });
   });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") {
       stopBotViewRefresh();
+      stopBotViewMessageStream();
       return;
     }
     if (document.visibilityState === "visible" && state.route.name === "bot-updates" && !state.updatesPaused && !state.updatesStream && !state.updatesStreamRetryTimer) {

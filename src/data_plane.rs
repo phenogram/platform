@@ -9,11 +9,19 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::{config::PublicSurface, state::AppState};
+use crate::{
+    config::PublicSurface,
+    state::AppState,
+    telegram::{OutboundMessageRecord, record_outbound_message},
+};
 
 pub const ROUTES_PATH: &str = "/api/internal/data-plane/routes";
 pub const TELEMETRY_PATH: &str = "/api/internal/data-plane/telemetry";
-pub const TELEMETRY_BODY_LIMIT: usize = 64 * 1024;
+/// Must match the gateway's bounded batch envelope. The gateway never queues
+/// more than this many serialized bytes, while this receiver still applies
+/// per-event and per-payload validation below.
+pub const TELEMETRY_BODY_LIMIT: usize = 576 * 1024;
+const OUTBOUND_PAYLOAD_LIMIT: usize = 448 * 1024;
 
 pub fn is_internal_path(path: &str) -> bool {
     matches!(
@@ -73,7 +81,7 @@ pub struct TelemetryBatch {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum TelemetryEvent {
-    OutboundMessage(OutboundMessageTelemetryEvent),
+    OutboundMessage(Box<OutboundMessageTelemetryEvent>),
     ApiCall(ApiCallTelemetryEvent),
 }
 
@@ -112,7 +120,22 @@ enum OutboundTelemetryKind {
 #[serde(deny_unknown_fields)]
 struct OutboundTelegramMessage {
     chat_id: i64,
-    telegram_message_id: i64,
+    #[serde(default)]
+    telegram_message_id: Option<i64>,
+    #[serde(default)]
+    receiver_user_id: Option<i64>,
+    #[serde(default)]
+    ephemeral_message_id: Option<i64>,
+    #[serde(default)]
+    business_connection_id: Option<String>,
+    #[serde(default)]
+    guest_query_id: Option<String>,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+    #[serde(default)]
+    direct_messages_topic_id: Option<i64>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
     text: Option<String>,
     chat_type: Option<String>,
     title: Option<String>,
@@ -223,7 +246,7 @@ struct ValidOutboundMessageTelemetryEvent {
 
 enum ValidTelemetryEvent {
     ApiCall(ValidApiCallTelemetryEvent),
-    OutboundMessage(ValidOutboundMessageTelemetryEvent),
+    OutboundMessage(Box<ValidOutboundMessageTelemetryEvent>),
 }
 
 fn validate_telemetry(
@@ -280,7 +303,31 @@ fn validate_telemetry(
                 )?;
                 if !(200..=299).contains(&event.upstream_status)
                     || event.message.chat_id == 0
-                    || event.message.telegram_message_id <= 0
+                    || (event.message.telegram_message_id.is_none_or(|id| id <= 0)
+                        && event.message.ephemeral_message_id.is_none())
+                    || event.message.ephemeral_message_id.is_some_and(|id| id <= 0)
+                    || (event.message.ephemeral_message_id.is_some()
+                        && event.message.receiver_user_id.is_none_or(|id| id <= 0))
+                    || event.message.payload.as_ref().is_some_and(|payload| {
+                        serde_json::to_vec(payload)
+                            .map_or(true, |value| value.len() > OUTBOUND_PAYLOAD_LIMIT)
+                            || contains_sensitive_payload_key(payload)
+                    })
+                    || !valid_optional_string(
+                        event.message.business_connection_id.as_deref(),
+                        512,
+                        2 * 1024,
+                    )
+                    || !valid_optional_string(
+                        event.message.guest_query_id.as_deref(),
+                        512,
+                        2 * 1024,
+                    )
+                    || event.message.message_thread_id.is_some_and(|id| id <= 0)
+                    || event
+                        .message
+                        .direct_messages_topic_id
+                        .is_some_and(|id| id <= 0)
                     || !valid_optional_string(event.message.text.as_deref(), 4_096, 16 * 1024)
                     || !valid_optional_string(event.message.chat_type.as_deref(), 64, 256)
                     || !valid_optional_string(event.message.title.as_deref(), 512, 2 * 1024)
@@ -290,7 +337,7 @@ fn validate_telemetry(
                     return Err("invalid outbound message");
                 }
                 let _ = event.kind;
-                Ok(ValidTelemetryEvent::OutboundMessage(
+                Ok(ValidTelemetryEvent::OutboundMessage(Box::new(
                     ValidOutboundMessageTelemetryEvent {
                         token_lookup_hash: event.token_lookup_hash,
                         pool: event.pool.as_str(),
@@ -299,10 +346,24 @@ fn validate_telemetry(
                         observed_at,
                         message: event.message,
                     },
-                ))
+                )))
             }
         })
         .collect()
+}
+
+fn contains_sensitive_payload_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            key == "file_path"
+                || key == "authorization"
+                || key.contains("token")
+                || contains_sensitive_payload_key(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_sensitive_payload_key),
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,12 +425,12 @@ async fn insert_telemetry(
     for event in events {
         match event {
             ValidTelemetryEvent::ApiCall(event) => api_calls.push(event),
-            ValidTelemetryEvent::OutboundMessage(event) => outbound_messages.push(event),
+            ValidTelemetryEvent::OutboundMessage(event) => outbound_messages.push(*event),
         }
     }
-    let mut tx = state.db.begin().await?;
     let mut accepted = 0_i64;
     if !api_calls.is_empty() {
+        let mut tx = state.db.begin().await?;
         let mut hashes = Vec::with_capacity(api_calls.len());
         let mut pools = Vec::with_capacity(api_calls.len());
         let mut methods = Vec::with_capacity(api_calls.len());
@@ -413,104 +474,64 @@ async fn insert_telemetry(
         .bind(observed)
         .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
     }
     for event in outbound_messages {
         let message = event.message;
-        accepted += sqlx::query_scalar::<_, i64>(
-            r#"WITH target AS (
-               SELECT bots.id
-                     FROM bots
-                    WHERE bots.token_lookup_hash = $1
-                      AND bots.data_plane_pool = $2
-               ), written AS (
-                   INSERT INTO outbound_messages
-                          (bot_id, user_id, chat_id, telegram_message_id, method,
-                           source, text, status, response_status, error_summary,
-                           created_at, expires_at)
-                   SELECT target.id, NULL, $3, $4, $5, 'proxy', $6, 'sent', $7,
-                          NULL, $8,
-                          $8 + make_interval(days => bot_effective_retention_days(target.id))
-                     FROM target
-                   ON CONFLICT (bot_id, chat_id, telegram_message_id)
-                       WHERE telegram_message_id IS NOT NULL
-                   DO UPDATE SET
-                       source = CASE
-                           WHEN outbound_messages.source = 'bot_view' THEN outbound_messages.source
-                           ELSE EXCLUDED.source
-                       END,
-                       method = CASE
-                           WHEN EXCLUDED.created_at > outbound_messages.created_at
-                           THEN EXCLUDED.method ELSE outbound_messages.method
-                       END,
-                       text = CASE
-                           WHEN EXCLUDED.created_at > outbound_messages.created_at
-                           THEN COALESCE(EXCLUDED.text, outbound_messages.text)
-                           ELSE outbound_messages.text
-                       END,
-                       status = CASE
-                           WHEN EXCLUDED.created_at > outbound_messages.created_at
-                           THEN EXCLUDED.status ELSE outbound_messages.status
-                       END,
-                       response_status = CASE
-                           WHEN EXCLUDED.created_at > outbound_messages.created_at
-                           THEN EXCLUDED.response_status ELSE outbound_messages.response_status
-                       END,
-                       error_summary = CASE
-                           WHEN EXCLUDED.created_at > outbound_messages.created_at
-                           THEN EXCLUDED.error_summary ELSE outbound_messages.error_summary
-                       END,
-                       created_at = GREATEST(outbound_messages.created_at, EXCLUDED.created_at),
-                       expires_at = GREATEST(outbound_messages.expires_at, EXCLUDED.expires_at)
-                   RETURNING bot_id, method, source, text, created_at
-               ), conversation AS (
-                   INSERT INTO conversations
-                          (bot_id, chat_id, chat_type, title, username, display_name,
-                           last_message_preview, last_update_at, expires_at)
-                   SELECT written.bot_id, $3, $9, $10, $11,
-                          COALESCE($12, 'Chat ' || $3::text),
-                          CASE WHEN written.source = 'bot_view' THEN 'You: ' ELSE 'Bot: ' END
-                              || left(COALESCE(written.text, written.method), 170),
-                          written.created_at,
-                          written.created_at
-                              + make_interval(days => bot_effective_retention_days(written.bot_id))
-                     FROM written
-                   ON CONFLICT (bot_id, chat_id) DO UPDATE SET
-                       chat_type = COALESCE(EXCLUDED.chat_type, conversations.chat_type),
-                       title = COALESCE(EXCLUDED.title, conversations.title),
-                       username = COALESCE(EXCLUDED.username, conversations.username),
-                       display_name = CASE
-                           WHEN conversations.display_name IS NULL
-                                OR conversations.display_name = 'Chat ' || EXCLUDED.chat_id::text
-                           THEN EXCLUDED.display_name
-                           ELSE conversations.display_name
-                       END,
-                       last_message_preview = CASE
-                           WHEN EXCLUDED.last_update_at >= conversations.last_update_at
-                           THEN EXCLUDED.last_message_preview
-                           ELSE conversations.last_message_preview
-                       END,
-                       last_update_at = GREATEST(conversations.last_update_at, EXCLUDED.last_update_at),
-                       expires_at = GREATEST(conversations.expires_at, EXCLUDED.expires_at)
-                   RETURNING 1
-               )
-               SELECT count(*) FROM target"#,
+        let observation_key = format!(
+            "v1:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            event.token_lookup_hash,
+            event.pool,
+            event.method,
+            event.observed_at.timestamp_micros(),
+            message.chat_id,
+            message.telegram_message_id.unwrap_or(0),
+            message.receiver_user_id.unwrap_or(0),
+            message.ephemeral_message_id.unwrap_or(0),
+            message.business_connection_id.as_deref().unwrap_or(""),
+            message.guest_query_id.as_deref().unwrap_or(""),
+            message.message_thread_id.unwrap_or(0),
+            message.direct_messages_topic_id.unwrap_or(0),
+        );
+        let bot_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            r#"SELECT bots.id FROM bots
+                WHERE bots.token_lookup_hash = $1 AND bots.data_plane_pool = $2"#,
         )
-        .bind(event.token_lookup_hash)
+        .bind(&event.token_lookup_hash)
         .bind(event.pool)
-        .bind(message.chat_id)
-        .bind(message.telegram_message_id)
-        .bind(event.method)
-        .bind(message.text)
-        .bind(event.upstream_status)
-        .bind(event.observed_at)
-        .bind(message.chat_type)
-        .bind(message.title)
-        .bind(message.username)
-        .bind(message.display_name)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&state.db)
         .await?;
+        let Some(bot_id) = bot_id else {
+            continue;
+        };
+        record_outbound_message(
+            state,
+            OutboundMessageRecord {
+                bot_id,
+                user_id: None,
+                conversation_id: None,
+                chat_id: message.chat_id,
+                telegram_message_id: message.telegram_message_id,
+                receiver_user_id: message.receiver_user_id,
+                ephemeral_message_id: message.ephemeral_message_id,
+                observation_key: Some(&observation_key),
+                business_connection_id: message.business_connection_id.as_deref(),
+                guest_query_id: message.guest_query_id.as_deref(),
+                message_thread_id: message.message_thread_id,
+                direct_messages_topic_id: message.direct_messages_topic_id,
+                method: &event.method,
+                source: "proxy",
+                text: message.text.as_deref(),
+                payload: message.payload.as_ref(),
+                status: "sent",
+                response_status: Some(event.upstream_status),
+                error_summary: None,
+                created_at: Some(event.observed_at),
+            },
+        )
+        .await?;
+        accepted += 1;
     }
-    tx.commit().await?;
     usize::try_from(accepted).map_err(|_| crate::error::AppError::Internal)
 }
 
@@ -706,6 +727,9 @@ mod tests {
                 "message": {
                     "chat_id": -1007,
                     "telegram_message_id": 9002,
+                    "business_connection_id": "business-1",
+                    "message_thread_id": 7,
+                    "direct_messages_topic_id": 9,
                     "text": "caption",
                     "chat_type": "supergroup",
                     "title": "Launch",
@@ -771,5 +795,26 @@ mod tests {
             .unwrap();
             assert!(validate_telemetry(batch).is_err());
         }
+
+        let oversized_payload = json!({"text": "x".repeat(super::OUTBOUND_PAYLOAD_LIMIT)});
+        let batch: TelemetryBatch = serde_json::from_value(json!({
+            "schema_version": 1,
+            "events": [{
+                "schema_version": 1,
+                "kind": "outbound_message",
+                "token_lookup_hash": "phg_abcdefghijklmnopqrstuvwx",
+                "pool": "standard",
+                "method": "sendRichMessage",
+                "upstream_status": 200,
+                "observed_at_unix_us": now,
+                "message": {
+                    "chat_id": 99,
+                    "telegram_message_id": 9003,
+                    "payload": oversized_payload
+                }
+            }]
+        }))
+        .unwrap();
+        assert!(validate_telemetry(batch).is_err());
     }
 }

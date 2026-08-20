@@ -47,10 +47,18 @@ pub fn app(state: AppState) -> Router {
         .route("/bots/{bot_id}/activity", get(api::activity))
         .route("/bots/{bot_id}/conversations", get(api::conversations))
         .route(
-            "/bots/{bot_id}/conversations/{chat_id}/messages",
+            "/bots/{bot_id}/conversations/{conversation_id}/messages",
             get(api::conversation_messages),
         )
-        .route("/bots/{bot_id}/messages", post(api::send_message))
+        .route(
+            "/bots/{bot_id}/conversations/{conversation_id}/messages/stream",
+            get(api::conversation_messages_stream),
+        )
+        .route(
+            "/bots/{bot_id}/conversations/{conversation_id}/actions/{method}",
+            post(api::conversation_action).layer(DefaultBodyLimit::max(20_100_000_000)),
+        )
+        .route("/bots/{bot_id}/media/{file_id}", get(api::bot_media))
         .route(
             "/bots/{bot_id}/stream-keys",
             get(api::list_stream_keys).post(api::create_stream_key),

@@ -65,6 +65,14 @@ struct ManagedBotIdentity {
 #[derive(Debug)]
 struct ConversationProjection {
     chat_id: i64,
+    telegram_message_id: Option<i64>,
+    business_connection_id: Option<String>,
+    guest_query_id: Option<String>,
+    message_thread_id: Option<i64>,
+    direct_messages_topic_id: Option<i64>,
+    receiver_user_id: Option<i64>,
+    ephemeral_message_id: Option<i64>,
+    edit_date: Option<DateTime<Utc>>,
     user_id: Option<i64>,
     chat_type: Option<String>,
     title: Option<String>,
@@ -99,6 +107,13 @@ pub async fn ingest_update(
     let projection = conversation_projection(&payload);
     let projected_chat_id = projection.as_ref().map(|value| value.chat_id);
     let projected_telegram_user_id = projection.as_ref().and_then(|value| value.user_id);
+    let projected_message_id = projection
+        .as_ref()
+        .and_then(|value| value.telegram_message_id);
+    let projected_ephemeral_message_id = projection
+        .as_ref()
+        .and_then(|value| value.ephemeral_message_id);
+    let projected_edit_date = projection.as_ref().and_then(|value| value.edit_date);
 
     let mut tx = db.begin().await?;
     // This lock spans every ingress process. Besides making shadow webhook/tap
@@ -141,10 +156,11 @@ pub async fn ingest_update(
     let inserted =
         sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, DateTime<Utc>, DateTime<Utc>)>(
             r#"INSERT INTO updates
-                  (bot_id, update_id, event_type, chat_id, telegram_user_id, payload,
+                  (bot_id, update_id, event_type, chat_id, telegram_user_id,
+                   telegram_message_id, ephemeral_message_id, edit_date, payload,
                    expires_at, ingestion_source)
-           SELECT bots.id, $2, $3, $4, $5, $6,
-                  now() + make_interval(days => bot_effective_retention_days(bots.id)), $7
+           SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9,
+                  now() + make_interval(days => bot_effective_retention_days(bots.id)), $10
              FROM bots
             WHERE bots.id = $1
            ON CONFLICT (bot_id, update_id) DO NOTHING
@@ -155,6 +171,9 @@ pub async fn ingest_update(
         .bind(&event_type)
         .bind(projected_chat_id)
         .bind(projected_telegram_user_id)
+        .bind(projected_message_id)
+        .bind(projected_ephemeral_message_id)
+        .bind(projected_edit_date)
         .bind(&payload)
         .bind(source.as_str())
         .fetch_optional(&mut *tx)
@@ -187,32 +206,205 @@ pub async fn ingest_update(
         queue_managed_bot_sync(&mut tx, bot, update_id, row_id, identity).await?;
     }
     if let Some(projection) = projection {
-        sqlx::query(
+        let event_preview = projection.preview.clone();
+        let linked_conversation_id = if matches!(
+            event_type.as_str(),
+            "message_reaction" | "message_reaction_count"
+        ) {
+            if let Some(message_id) = projection.telegram_message_id.filter(|id| *id != 0) {
+                sqlx::query_scalar::<_, Uuid>(
+                    r#"SELECT events.conversation_id
+                         FROM conversation_events AS events
+                         JOIN conversations ON conversations.id = events.conversation_id
+                        WHERE events.bot_id = $1
+                          AND conversations.chat_id = $2
+                          AND events.telegram_message_id = $3
+                          AND events.direction <> 'action'
+                          AND (
+                              events.direction = 'outgoing'
+                              OR events.event_type IN (
+                                  'message', 'edited_message', 'channel_post',
+                                  'edited_channel_post', 'business_message',
+                                  'edited_business_message', 'guest_message'
+                              )
+                          )
+                        ORDER BY events.id DESC
+                        LIMIT 1"#,
+                )
+                .bind(bot.id)
+                .bind(projection.chat_id)
+                .bind(message_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let conversation_id = if let Some(conversation_id) = linked_conversation_id {
+            sqlx::query(
+                r#"UPDATE conversations
+                      SET last_update_at = GREATEST(last_update_at, $2),
+                          expires_at = GREATEST(expires_at, $3)
+                    WHERE id = $1"#,
+            )
+            .bind(conversation_id)
+            .bind(received_at)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
+            conversation_id
+        } else {
+            sqlx::query_scalar::<_, Uuid>(
             r#"INSERT INTO conversations
-                   (bot_id, chat_id, chat_type, title, username, display_name,
+                   (bot_id, chat_id, business_connection_id, guest_query_id,
+                    message_thread_id, direct_messages_topic_id, receiver_user_id,
+                    chat_type, title, username, display_name,
                     last_message_preview, last_update_at, expires_at)
-               SELECT bots.id, $2, $3, $4, $5, $6, $7, now(),
+               SELECT bots.id, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(),
                       now() + make_interval(days => bot_effective_retention_days(bots.id))
                  FROM bots
                 WHERE bots.id = $1
-               ON CONFLICT (bot_id, chat_id) DO UPDATE SET
+               ON CONFLICT ON CONSTRAINT conversations_identity_unique DO UPDATE SET
                    chat_type = COALESCE(EXCLUDED.chat_type, conversations.chat_type),
                    title = COALESCE(EXCLUDED.title, conversations.title),
                    username = COALESCE(EXCLUDED.username, conversations.username),
                    display_name = COALESCE(EXCLUDED.display_name, conversations.display_name),
                    last_message_preview = COALESCE(EXCLUDED.last_message_preview, conversations.last_message_preview),
                    last_update_at = EXCLUDED.last_update_at,
-                   expires_at = EXCLUDED.expires_at"#,
+                   expires_at = EXCLUDED.expires_at
+               RETURNING id"#,
+            )
+            .bind(bot.id)
+            .bind(projection.chat_id)
+            .bind(projection.business_connection_id.as_deref())
+            .bind(projection.guest_query_id.as_deref())
+            .bind(projection.message_thread_id)
+            .bind(projection.direct_messages_topic_id)
+            .bind(projection.receiver_user_id)
+            .bind(projection.chat_type.as_deref())
+            .bind(projection.title.as_deref())
+            .bind(projection.username.as_deref())
+            .bind(projection.display_name.as_deref())
+            .bind(projection.preview.as_deref())
+            .fetch_one(&mut *tx)
+            .await?
+        };
+        sqlx::query("UPDATE updates SET conversation_id = $2 WHERE id = $1")
+            .bind(row_id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO conversation_events
+                   (bot_id, conversation_id, direction, event_type, source_table,
+                    source_id, telegram_message_id, receiver_user_id,
+                    ephemeral_message_id, edit_date, text, status, payload,
+                    created_at, expires_at)
+               VALUES ($1, $2, 'incoming', $3, 'updates', $4, $5, $6, $7, $8,
+                       $9, 'received', $10, $11, $12)"#,
         )
         .bind(bot.id)
-        .bind(projection.chat_id)
-        .bind(projection.chat_type)
-        .bind(projection.title)
-        .bind(projection.username)
-        .bind(projection.display_name)
-        .bind(projection.preview)
+        .bind(conversation_id)
+        .bind(&event_type)
+        .bind(row_id)
+        .bind(projected_message_id)
+        .bind(projection.receiver_user_id)
+        .bind(projected_ephemeral_message_id)
+        .bind(projected_edit_date)
+        .bind(event_preview.as_deref())
+        .bind(&payload)
+        .bind(received_at)
+        .bind(expires_at)
         .execute(&mut *tx)
         .await?;
+        if event_type == "deleted_business_messages"
+            && let Some(message_ids) = payload
+                .pointer("/deleted_business_messages/message_ids")
+                .and_then(Value::as_array)
+        {
+            for message_id in message_ids.iter().filter_map(Value::as_i64) {
+                sqlx::query(
+                    r#"INSERT INTO conversation_events
+                           (bot_id, conversation_id, direction, event_type, source_table,
+                            telegram_message_id, status, payload, created_at, expires_at)
+                       VALUES ($1, $2, 'action', 'deleted_business_message', 'updates',
+                               $3, 'deleted', $4, $5, $6)"#,
+                )
+                .bind(bot.id)
+                .bind(conversation_id)
+                .bind(message_id)
+                .bind(&payload)
+                .bind(received_at)
+                .bind(expires_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+    } else if let Some(poll_id) = payload
+        .pointer("/poll/id")
+        .or_else(|| payload.pointer("/poll_answer/poll_id"))
+        .and_then(Value::as_str)
+    {
+        let linked_conversation_id = sqlx::query_scalar::<_, Uuid>(
+            r#"SELECT events.conversation_id
+                 FROM conversation_events AS events
+                WHERE events.bot_id = $1
+                  AND (
+                      events.direction = 'outgoing'
+                      OR events.event_type IN (
+                          'message', 'edited_message', 'channel_post',
+                          'edited_channel_post', 'business_message',
+                          'edited_business_message', 'guest_message'
+                      )
+                  )
+                  AND jsonb_path_exists(
+                      events.payload,
+                      '$.**.poll.id ? (@ == $poll_id)',
+                      jsonb_build_object('poll_id', to_jsonb($2::text))
+                  )
+                ORDER BY events.id DESC
+                LIMIT 1"#,
+        )
+        .bind(bot.id)
+        .bind(poll_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(conversation_id) = linked_conversation_id {
+            sqlx::query("UPDATE updates SET conversation_id = $2 WHERE id = $1")
+                .bind(row_id)
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                r#"INSERT INTO conversation_events
+                       (bot_id, conversation_id, direction, event_type, source_table,
+                        source_id, text, status, payload, created_at, expires_at)
+                   VALUES ($1, $2, 'incoming', $3, 'updates', $4, NULL, 'received',
+                           $5, $6, $7)"#,
+            )
+            .bind(bot.id)
+            .bind(conversation_id)
+            .bind(&event_type)
+            .bind(row_id)
+            .bind(&payload)
+            .bind(received_at)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"UPDATE conversations
+                      SET last_update_at = GREATEST(last_update_at, $2),
+                          expires_at = GREATEST(expires_at, $3)
+                    WHERE id = $1"#,
+            )
+            .bind(conversation_id)
+            .bind(received_at)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     // The official Bot API server is the canonical webhook/polling owner for
@@ -566,9 +758,12 @@ fn conversation_projection(payload: &Value) -> Option<ConversationProjection> {
     let message = event.and_then(|value| value.get("message").or(Some(value)))?;
     let chat = message.get("chat")?;
     let chat_id = chat.get("id")?.as_i64()?;
-    let from = message
-        .get("from")
-        .or_else(|| event.and_then(|value| value.get("from")));
+    // Wrapper updates such as callback_query have their own actor. The nested
+    // Message.from is the author of the referenced message (often the bot), not
+    // the human who triggered this update.
+    let from = event
+        .and_then(|value| value.get("from"))
+        .or_else(|| message.get("from"));
     let first_name = chat.get("first_name").and_then(Value::as_str);
     let last_name = chat.get("last_name").and_then(Value::as_str);
     let display_name = match (first_name, last_name) {
@@ -583,6 +778,34 @@ fn conversation_projection(payload: &Value) -> Option<ConversationProjection> {
         .map(|value| value.chars().take(180).collect());
     Some(ConversationProjection {
         chat_id,
+        telegram_message_id: message.get("message_id").and_then(Value::as_i64),
+        business_connection_id: message
+            .get("business_connection_id")
+            .or_else(|| event.and_then(|value| value.get("business_connection_id")))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        guest_query_id: message
+            .get("guest_query_id")
+            .or_else(|| event.and_then(|value| value.get("guest_query_id")))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        message_thread_id: message.get("message_thread_id").and_then(Value::as_i64),
+        direct_messages_topic_id: message
+            .pointer("/direct_messages_topic/topic_id")
+            .or_else(|| message.pointer("/direct_messages_topic/id"))
+            .and_then(Value::as_i64),
+        receiver_user_id: message
+            .get("ephemeral_message_id")
+            .and_then(Value::as_i64)
+            .and_then(|_| {
+                from.and_then(|value| value.get("id"))
+                    .and_then(Value::as_i64)
+            }),
+        ephemeral_message_id: message.get("ephemeral_message_id").and_then(Value::as_i64),
+        edit_date: message
+            .get("edit_date")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0)),
         user_id: from
             .and_then(|value| value.get("id"))
             .and_then(Value::as_i64),

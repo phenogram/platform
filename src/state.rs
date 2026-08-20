@@ -21,6 +21,15 @@ pub struct AppState {
     pub auth_limiter: AuthLimiter,
     pub stream_limiter: StreamLimiter,
     pub console_stream_limiter: StreamLimiter,
+    /// Shared fail-open budget for best-effort audit/timeline/API-call writes.
+    /// Telegram request delivery and responses never wait for these permits.
+    pub observation_budget: Arc<Semaphore>,
+    /// API-call metrics are lower priority than chat timeline persistence and
+    /// therefore have an independent budget that cannot starve Bot View.
+    pub api_call_observation_budget: Arc<Semaphore>,
+    /// Short-lived capabilities for files returned by a successful Bot View
+    /// action before the detached timeline write becomes visible.
+    pub pending_media: PendingMediaCapabilities,
 }
 
 impl AppState {
@@ -54,7 +63,43 @@ impl AppState {
             auth_limiter: AuthLimiter::default(),
             stream_limiter: StreamLimiter::default(),
             console_stream_limiter: StreamLimiter::with_limits(256, 4),
+            observation_budget: Arc::new(Semaphore::new(128)),
+            api_call_observation_budget: Arc::new(Semaphore::new(32)),
+            pending_media: PendingMediaCapabilities::default(),
         })
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct PendingMediaCapabilities {
+    entries: Arc<StdMutex<HashMap<(Uuid, String), Instant>>>,
+}
+
+impl PendingMediaCapabilities {
+    pub fn authorize<'a>(&self, bot_id: Uuid, file_ids: impl IntoIterator<Item = &'a str>) {
+        let now = Instant::now();
+        let Ok(mut entries) = self.entries.try_lock() else {
+            return;
+        };
+        entries.retain(|_, expires_at| *expires_at > now);
+        for file_id in file_ids.into_iter().take(128) {
+            if entries.len() >= 2_048 {
+                break;
+            }
+            entries.insert(
+                (bot_id, file_id.to_owned()),
+                now + Duration::from_secs(5 * 60),
+            );
+        }
+    }
+
+    pub fn contains(&self, bot_id: Uuid, file_id: &str) -> bool {
+        let now = Instant::now();
+        let Ok(mut entries) = self.entries.try_lock() else {
+            return false;
+        };
+        entries.retain(|_, expires_at| *expires_at > now);
+        entries.contains_key(&(bot_id, file_id.to_owned()))
     }
 }
 
@@ -220,7 +265,7 @@ impl EventBus {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventBus, StreamLimiter};
+    use super::{EventBus, PendingMediaCapabilities, StreamLimiter};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -255,5 +300,17 @@ mod tests {
             .try_acquire(b"first")
             .expect("released permit is reusable");
         drop((second, replacement));
+    }
+
+    #[test]
+    fn pending_media_capability_is_scoped_to_the_bot() {
+        let capabilities = PendingMediaCapabilities::default();
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        capabilities.authorize(owner, ["owned-file"]);
+
+        assert!(capabilities.contains(owner, "owned-file"));
+        assert!(!capabilities.contains(other, "owned-file"));
+        assert!(!capabilities.contains(owner, "not-owned"));
     }
 }
