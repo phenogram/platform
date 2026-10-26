@@ -5,6 +5,11 @@ on:
     branches:
       - master
   workflow_dispatch:
+    inputs:
+      preflight_only:
+        description: Verify new-cluster access without deploying images
+        type: boolean
+        default: true
 
 concurrency:
   group: phenogram-production
@@ -17,13 +22,14 @@ env:
   GATEWAY_IMAGE: ghcr.io/phenogram/data-plane-gateway
   RELEASE_NAME: phenogram
   KUBE_NAMESPACE: phenogram
-  CONTABO_INGRESS_IP: 84.247.177.201
+  UNIFIED_INGRESS_IP: 89.35.119.225
   LANDING_URL: https://phenogram.io
   APP_URL: https://app.phenogram.io
   MACHINE_API_URL: https://api.phenogram.io
 
 jobs:
   validate:
+    if: github.event_name != 'workflow_dispatch' || !inputs.preflight_only
     name: Validate source and chart
     runs-on: ubuntu-24.04
     permissions:
@@ -266,112 +272,68 @@ jobs:
           cache-from: type=gha,scope=data-plane-gateway
           cache-to: type=gha,mode=max,scope=data-plane-gateway
 
-  deploy:
-    name: Deploy with Helm to Contabo
-    needs: build
+  unified-preflight:
+    name: Verify unified access without application changes
+    if: github.event_name == 'workflow_dispatch' && inputs.preflight_only
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment:
-      name: production
-      url: https://app.phenogram.io
+    environment: production
     permissions:
       contents: read
     steps:
-      - name: Check out repository
+      - name: Check out the reviewed release
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - name: Install Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
-        with:
-          version: v3.17.3
-
       - name: Install kubectl
         uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede
         with:
-          version: v1.28.15
-
-      - name: Save Kube Config
+          version: v1.36.5
+      - name: Prepare the restricted unified API transport
         env:
-          KUBE_CONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+          PHENOGRAM_KUBECONFIG: ${{ secrets.KUBECONFIG }}
+        run: python3 scripts/prepare-unified-ci.py
+      - name: Admit exact existing workload updates without writing
+        run: python3 scripts/deploy-unified.py --preflight-only
+      - name: Check the current live database and public entry
         run: |
           set -euo pipefail
-          test -n "$KUBE_CONFIG_CONTENT"
-          mkdir -p "$HOME/.kube"
-          umask 077
-          printf '%s' "$KUBE_CONFIG_CONTENT" > "$HOME/.kube/config"
-          chmod 0600 "$HOME/.kube/config"
-          test "$(kubectl config view --minify --raw --output 'jsonpath={.clusters[0].cluster.server}')" = 'https://84.247.177.201:61119'
-          test "$(kubectl config view --minify --raw --output 'jsonpath={.clusters[0].cluster.insecure-skip-tls-verify}')" != 'true'
-          test "$(kubectl config view --minify --output 'jsonpath={..namespace}')" = "$KUBE_NAMESPACE"
-          kubectl auth can-i get deployments --namespace "$KUBE_NAMESPACE"
-          if kubectl auth can-i create namespaces >/dev/null 2>&1; then
-            printf '%s\n' 'Deployment credential is unexpectedly cluster-scoped.' >&2
-            exit 1
-          fi
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 25 \
+            --resolve "app.phenogram.io:443:$UNIFIED_INGRESS_IP" \
+            "$APP_URL/api/health" | jq -e '.status == "ok" and .database == true'
+      - name: Remove temporary deployment credentials
+        if: always()
+        run: python3 scripts/prepare-unified-ci.py --cleanup
 
-      - name: Reconcile the data-plane control credential
+  deploy:
+    name: Deploy immutable images to the existing unified workloads
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the reviewed release
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede
+        with:
+          version: v1.36.5
+      - name: Prepare the restricted unified API transport
         env:
-          DATA_PLANE_SYNC_TOKEN: ${{ secrets.DATA_PLANE_SYNC_TOKEN }}
-        run: |
-          set -euo pipefail
-          token_file="$RUNNER_TEMP/data-plane-sync-token"
-          encoded_file="$RUNNER_TEMP/data-plane-sync-token.b64"
-          patch_file="$RUNNER_TEMP/data-plane-sync-token-patch.json"
-          trap 'rm -f "$token_file" "$encoded_file" "$patch_file"' EXIT
-          umask 077
-          printf '%s' "$DATA_PLANE_SYNC_TOKEN" > "$token_file"
-          test "$(wc -c < "$token_file" | tr -d ' ')" -ge 32
-          base64 < "$token_file" | tr -d '\n' > "$encoded_file"
-          jq --rawfile encoded "$encoded_file" -n \
-            '{data:{DATA_PLANE_SYNC_TOKEN:$encoded}}' > "$patch_file"
-          kubectl --namespace "$KUBE_NAMESPACE" patch secret phenogram-secrets \
-            --type=merge --patch-file "$patch_file" >/dev/null
-
-      - name: Deploy the immutable release
+          PHENOGRAM_KUBECONFIG: ${{ secrets.KUBECONFIG }}
+        run: python3 scripts/prepare-unified-ci.py
+      - name: Update images while retaining migrated storage and bindings
         env:
           APP_DIGEST: ${{ needs.build.outputs.app_digest }}
           TELEGRAM_DIGEST: ${{ needs.build.outputs.telegram_digest }}
           GATEWAY_DIGEST: ${{ needs.build.outputs.gateway_digest }}
+        run: python3 scripts/deploy-unified.py
+      - name: Verify the unified origin
         run: |
           set -euo pipefail
-          case "$APP_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
-          case "$TELEGRAM_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
-          case "$GATEWAY_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
-          for secret_name in phenogram-secrets phenogram-backup-secrets phenogram-ghcr phenogram-io-tls app-phenogram-io-tls api-phenogram-io-tls; do
-            kubectl --namespace "$KUBE_NAMESPACE" get secret "$secret_name" >/dev/null
-          done
-          secret_revision="$(kubectl --namespace "$KUBE_NAMESPACE" get secret phenogram-secrets --output 'jsonpath={.metadata.resourceVersion}')"
-          test -n "$secret_revision"
-          helm upgrade --install "$RELEASE_NAME" deploy/helm/phenogram-platform \
-            --namespace "$KUBE_NAMESPACE" \
-            --values deploy/helm/phenogram-platform/values-production.yaml \
-            --set-string image.digest="$APP_DIGEST" \
-            --set-string telegramBotApi.image.digest="$TELEGRAM_DIGEST" \
-            --set-string deploymentRevision="$GITHUB_SHA" \
-            --set-string secretRevision="$secret_revision" \
-            --atomic \
-            --wait \
-            --timeout 20m \
-            --history-max 10
-
-      - name: Verify Kubernetes rollout
-        run: |
-          set -euo pipefail
-          kubectl --namespace "$KUBE_NAMESPACE" rollout status deployment/phenogram --timeout=5m
-          kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-postgresql --timeout=5m
-          if kubectl --namespace "$KUBE_NAMESPACE" get statefulset/phenogram-data-plane-gateway >/dev/null 2>&1; then
-            kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-data-plane-gateway --timeout=10m
-            kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-telegram-standard --timeout=10m
-            kubectl --namespace "$KUBE_NAMESPACE" rollout status statefulset/phenogram-telegram-local --timeout=10m
-          fi
-          kubectl --namespace "$KUBE_NAMESPACE" get pods,service,ingress,pvc
-
-      - name: Verify the Contabo origin
-        run: |
-          set -euo pipefail
-          landing_resolve=(--resolve "phenogram.io:443:$CONTABO_INGRESS_IP")
-          app_resolve=(--resolve "app.phenogram.io:443:$CONTABO_INGRESS_IP")
-          api_resolve=(--resolve "api.phenogram.io:443:$CONTABO_INGRESS_IP")
+          landing_resolve=(--resolve "phenogram.io:443:$UNIFIED_INGRESS_IP")
+          app_resolve=(--resolve "app.phenogram.io:443:$UNIFIED_INGRESS_IP")
+          api_resolve=(--resolve "api.phenogram.io:443:$UNIFIED_INGRESS_IP")
           response="$(curl --fail --silent --show-error "${app_resolve[@]}" \
             --retry 18 --retry-all-errors --retry-delay 10 \
             --connect-timeout 10 --max-time 20 \
@@ -429,9 +391,8 @@ jobs:
           esac
           grep -Eiq '^set-cookie: phg_oauth=.*HttpOnly.*SameSite=Lax.*Max-Age=600.*Secure' "$github_headers"
           grep -Eiq '^cache-control: no-store' "$github_headers"
-          printf '%s\n' 'Contabo deployment revision and three-host contract verified.'
+          printf '%s\n' 'Unified deployment revision and three-host contract verified.'
 
       - name: Remove temporary deployment credentials
         if: always()
-        run: |
-          rm -f "$HOME/.kube/config"
+        run: python3 scripts/prepare-unified-ci.py --cleanup
