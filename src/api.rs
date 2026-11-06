@@ -896,6 +896,7 @@ pub async fn conversations(
 struct TimelineRow {
     event_id: i64,
     cursor: i64,
+    position_key: String,
     is_message_event: bool,
     is_message_revision: bool,
     actionable: bool,
@@ -916,6 +917,7 @@ struct TimelineRow {
 struct TimelineMessage {
     id: String,
     cursor: String,
+    history_key: String,
     event_type: String,
     direction: String,
     telegram_message_id: Option<i64>,
@@ -932,7 +934,7 @@ struct TimelineMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct TimelineQuery {
-    before: Option<i64>,
+    before: Option<String>,
     after: Option<i64>,
     limit: Option<i64>,
 }
@@ -951,43 +953,130 @@ pub async fn conversation_messages(
     }
     let conversation = get_conversation(&state, bot_id, conversation_id).await?;
     let limit = query.limit.unwrap_or(100).clamp(1, 100);
-    let rows =
-        load_timeline_rows(&state, conversation_id, query.before, query.after, limit).await?;
+    let before = query
+        .before
+        .as_deref()
+        .map(TimelinePosition::parse)
+        .transpose()?;
+    // The watermark and projected rows must use exactly the same snapshot,
+    // including revisions that replace an event row while this request runs.
+    let mut snapshot = state.db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *snapshot)
+        .await?;
+    let latest_cursor = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT max(id) FROM conversation_events WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *snapshot)
+    .await?
+    .unwrap_or(0);
+    let rows = load_timeline_rows(
+        &mut *snapshot,
+        conversation_id,
+        before.as_ref(),
+        query.after,
+        limit,
+    )
+    .await?;
+    snapshot.commit().await?;
     let messages = rows
         .iter()
         .cloned()
         .map(|row| timeline_message(bot_id, row))
         .collect::<Vec<_>>();
-    let latest_cursor = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT max(id) FROM conversation_events WHERE conversation_id = $1",
-    )
-    .bind(conversation_id)
-    .fetch_one(&state.db)
-    .await?
-    .unwrap_or(0);
     let next_before = (rows.len() as i64 == limit)
-        .then(|| rows.first().map(|row| row.cursor))
+        .then(|| {
+            rows.first()
+                .map(|row| format!("{}:{}", row.created_at.timestamp_micros(), row.position_key))
+        })
         .flatten();
     Ok(Json(json!({
         "conversation": conversation,
         "messages": messages,
-        "next_before": next_before.map(|value| value.to_string()),
+        "next_before": next_before,
         "latest_cursor": latest_cursor.to_string(),
     })))
 }
 
-async fn load_timeline_rows(
-    state: &AppState,
+struct TimelinePosition {
+    at: DateTime<Utc>,
+    key: String,
+}
+
+impl TimelinePosition {
+    fn parse(value: &str) -> Result<Self> {
+        let invalid = || AppError::Validation("Invalid history cursor".into());
+        let (micros, key) = value.split_once(':').ok_or_else(invalid)?;
+        let at = micros
+            .parse::<i64>()
+            .ok()
+            .and_then(DateTime::from_timestamp_micros)
+            .ok_or_else(invalid)?;
+        if key.is_empty()
+            || key.len() > 100
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_:".contains(&byte))
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            at,
+            key: key.to_owned(),
+        })
+    }
+}
+
+async fn load_timeline_rows<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     conversation_id: Uuid,
-    before: Option<i64>,
+    before: Option<&TimelinePosition>,
     after: Option<i64>,
     limit: i64,
 ) -> Result<Vec<TimelineRow>> {
     let mut rows = sqlx::query_as::<_, TimelineRow>(
-        r#"WITH base AS (
-               SELECT id AS event_id, event_type, direction, telegram_message_id,
+        r#"WITH source AS (
+               SELECT events.*,
+                      COALESCE(telegram_message_id,
+                          CASE WHEN COALESCE(payload ->> 'message_id',
+                              payload #>> '{message,message_id}', payload #>> '{edited_message,message_id}',
+                              payload #>> '{channel_post,message_id}', payload #>> '{edited_channel_post,message_id}',
+                              payload #>> '{business_message,message_id}', payload #>> '{edited_business_message,message_id}',
+                              payload #>> '{guest_message,message_id}') ~ '^[0-9]{1,18}$'
+                          THEN COALESCE(payload ->> 'message_id',
+                              payload #>> '{message,message_id}', payload #>> '{edited_message,message_id}',
+                              payload #>> '{channel_post,message_id}', payload #>> '{edited_channel_post,message_id}',
+                              payload #>> '{business_message,message_id}', payload #>> '{edited_business_message,message_id}',
+                              payload #>> '{guest_message,message_id}')::bigint
+                          END
+                      ) AS message_identity
+                 FROM conversation_events AS events
+                WHERE conversation_id = $1
+           ), base AS (
+               SELECT id AS event_id, event_type, direction, message_identity AS telegram_message_id,
                       receiver_user_id, ephemeral_message_id, text, status,
-                      created_at, payload, edit_date,
+                      CASE WHEN message_identity > 0 AND (
+                          direction = 'outgoing' OR event_type IN (
+                              'message', 'edited_message', 'channel_post', 'edited_channel_post',
+                              'business_message', 'edited_business_message', 'guest_message'
+                          )
+                      ) THEN 'm:' || lpad(message_identity::text, 20, '0')
+                        ELSE source_table || ':' || lpad(COALESCE(source_id, id)::text, 20, '0')
+                      END AS position_key,
+                      CASE WHEN event_type = 'callback_query' THEN created_at
+                           WHEN COALESCE(payload ->> 'date',
+                               payload #>> '{message,date}', payload #>> '{edited_message,date}',
+                               payload #>> '{channel_post,date}', payload #>> '{edited_channel_post,date}',
+                               payload #>> '{business_message,date}', payload #>> '{edited_business_message,date}',
+                               payload #>> '{guest_message,date}') ~ '^[0-9]{1,11}$'
+                           THEN to_timestamp(COALESCE(payload ->> 'date',
+                               payload #>> '{message,date}', payload #>> '{edited_message,date}',
+                               payload #>> '{channel_post,date}', payload #>> '{edited_channel_post,date}',
+                               payload #>> '{business_message,date}', payload #>> '{edited_business_message,date}',
+                               payload #>> '{guest_message,date}')::double precision)
+                           ELSE created_at END AS created_at,
+                      payload, edit_date,
                       (
                           direction = 'outgoing'
                           OR event_type IN (
@@ -996,8 +1085,8 @@ async fn load_timeline_rows(
                               'edited_business_message', 'guest_message'
                           )
                       ) AS is_message_event,
-                      telegram_message_id IS NOT NULL
-                          AND telegram_message_id <> 0
+                      message_identity IS NOT NULL
+                          AND message_identity <> 0
                           AND (
                               direction = 'outgoing'
                               OR event_type IN (
@@ -1006,8 +1095,7 @@ async fn load_timeline_rows(
                                   'edited_business_message', 'guest_message'
                               )
                           ) AS is_message_revision
-                 FROM conversation_events
-                WHERE conversation_id = $1
+                 FROM source
            ), ranked AS (
                SELECT base.*,
                       CASE
@@ -1127,7 +1215,7 @@ async fn load_timeline_rows(
                       ) AS cursor
                  FROM materialized
            )
-           SELECT event_id, cursor,
+           SELECT event_id, cursor, position_key,
                   is_message_event, is_message_revision,
                   CASE
                     WHEN event_type = 'callback_query'
@@ -1166,9 +1254,8 @@ async fn load_timeline_rows(
                   CASE WHEN is_message_revision THEN COALESCE(
                       (
                           SELECT origin.direction
-                            FROM conversation_events AS origin
-                           WHERE origin.conversation_id = $1
-                             AND origin.telegram_message_id = projected.telegram_message_id
+                            FROM base AS origin
+                           WHERE origin.telegram_message_id = projected.telegram_message_id
                              AND origin.direction <> 'action'
                              AND (
                                  origin.direction = 'outgoing'
@@ -1178,7 +1265,7 @@ async fn load_timeline_rows(
                                      'edited_business_message', 'guest_message'
                                  )
                              )
-                           ORDER BY origin.id ASC
+                           ORDER BY origin.event_id ASC
                            LIMIT 1
                       ),
                       direction
@@ -1215,18 +1302,20 @@ async fn load_timeline_rows(
                           'stopPoll', 'poll'
                       )
                   )
-              AND ($2::bigint IS NULL OR cursor < $2)
+              AND ($2::timestamptz IS NULL OR (created_at, position_key) < ($2, $5::text))
               AND ($3::bigint IS NULL OR cursor > $3)
             ORDER BY
               CASE WHEN $3::bigint IS NOT NULL THEN cursor END ASC,
-              CASE WHEN $3::bigint IS NULL THEN cursor END DESC
+              CASE WHEN $3::bigint IS NULL THEN created_at END DESC,
+              CASE WHEN $3::bigint IS NULL THEN position_key END DESC
             LIMIT $4"#,
     )
     .bind(conversation_id)
-    .bind(before)
+    .bind(before.map(|position| position.at))
     .bind(after)
     .bind(limit)
-    .fetch_all(&state.db)
+    .bind(before.map(|position| position.key.as_str()))
+    .fetch_all(executor)
     .await?;
     if after.is_none() {
         rows.reverse();
@@ -1309,6 +1398,7 @@ fn timeline_message(bot_id: Uuid, row: TimelineRow) -> TimelineMessage {
     TimelineMessage {
         id,
         cursor: row.cursor.to_string(),
+        history_key: row.position_key,
         event_type: row.event_type,
         direction: row.direction,
         telegram_message_id: row.telegram_message_id,
@@ -1616,7 +1706,7 @@ pub async fn conversation_messages_stream(
             return;
         }
         loop {
-            match load_timeline_rows(&stream_state, conversation_id, None, Some(cursor), 100).await {
+            match load_timeline_rows(&stream_state.db, conversation_id, None, Some(cursor), 100).await {
                 Ok(rows) => {
                     for row in rows {
                         cursor = cursor.max(row.cursor);
@@ -2965,6 +3055,14 @@ async fn persist_non_message_action(
     ephemeral_message_id: Option<i64>,
     payload: &Value,
 ) -> Result<()> {
+    let mut tx = state.db.begin().await?;
+    // Use the same cross-process bot lock as incoming and outgoing writers:
+    // event sequence values must become visible in commit order to SSE.
+    let lock_key = i64::from_be_bytes(bot_id.as_bytes()[..8].try_into().expect("UUID prefix"));
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
     let mut message_ids = payload
         .pointer("/request/message_ids")
         .and_then(Value::as_array)
@@ -3003,9 +3101,10 @@ async fn persist_non_message_action(
         .bind(ephemeral_message_id)
         .bind(if deleted { "deleted" } else { "sent" })
         .bind(payload)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3474,8 +3573,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ConnectBotRequest, ManagedWebhookRecoveryRequest, connect_target_pool, existing_webhook,
-        health_payload, inject_trusted_context, normalized_message_content,
+        ConnectBotRequest, ManagedWebhookRecoveryRequest, TimelinePosition, connect_target_pool,
+        existing_webhook, health_payload, inject_trusted_context, normalized_message_content,
         validate_get_me_response, validate_json_media_sources,
     };
     use crate::error::AppError;
@@ -3484,6 +3583,23 @@ mod tests {
     use crate::telegram::ExistingWebhookPolicy;
 
     const API_BASE_URL: &str = "https://api.phenogram.io";
+
+    #[test]
+    fn history_position_preserves_timestamp_precision_and_validates_opaque_key() {
+        let value = "1793966401123456:m:00000000000000000042";
+        let position = TimelinePosition::parse(value).expect("history position");
+        assert_eq!(position.at.timestamp_micros(), 1_793_966_401_123_456);
+        assert_eq!(position.key, "m:00000000000000000042");
+        for invalid in [
+            "42",
+            "not-a-time:m:42",
+            "42:",
+            "42:m:42?",
+            "9223372036854775807:m:42",
+        ] {
+            assert!(TimelinePosition::parse(invalid).is_err(), "{invalid}");
+        }
+    }
 
     fn conversation() -> ConversationSummary {
         ConversationSummary {

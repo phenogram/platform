@@ -10,10 +10,10 @@ Phenogram is a Telegram Bot API gateway and operator console. Bot applications k
 - Google and GitHub sign-in by stable provider identity, without requesting, receiving, or storing email addresses or provider tokens.
 - Encrypted bot credentials and lifecycle webhook secrets in the Phenogram PostgreSQL control plane.
 - Automatic Telegram managed-bot discovery and a visible parent/child hierarchy.
-- Searchable update and API activity history, live SSE updates, conversation projections, and operator text replies from Bot View.
+- Searchable update and API activity history, live SSE conversations, streamed attachments and albums, voice, replies, edits, deletion, reactions, polls and other conversational Bot API actions from Bot View.
 - Free, Pro, and Scale plan definitions, bot coverage, and retention warnings.
 - Separate standard and Telegram `--local` official-server pools.
-- Direct production deployment to Contabo from `master` with GitHub Actions, Helm, and `kubectl`.
+- Production deployment to the unified cluster from `master` with GitHub Actions and namespace-scoped `kubectl` access.
 
 ## Production architecture
 
@@ -71,7 +71,7 @@ Production deliberately separates three origins:
 - `https://app.phenogram.io` — authenticated console and management `/api/*`;
 - `https://api.phenogram.io` — token-bearing Bot API/file paths, SSE, and signed public downloads.
 
-All three terminate directly at ingress-nginx on Contabo. Their Cloudflare records are DNS-only. The machine API ingress disables access logs and discards its nginx error log because Telegram puts bot tokens in request paths.
+All three use the production edge in the unified cluster. Their Cloudflare records are DNS-only. The machine API edge must disable access logs and discard its nginx error log because Telegram puts bot tokens in request paths. See [current release topology](deploy/UNIFIED-RELEASES.md).
 
 ## Point a bot application at Phenogram
 
@@ -108,7 +108,7 @@ The token remains in the form after a failed connection attempt, and Telegram au
 
 ## Bot View and management API
 
-The console provides update search, live updates without manual refresh, recent API activity, conversation projections, incoming/outgoing timelines, operator `sendMessage` replies, stream-key management, signed public file links, and bot-family grouping.
+The console provides update search, live conversations without manual refresh, recent API activity, incoming/outgoing timelines, streamed media uploads, operator message actions, stream-key management, signed public file links, and bot-family grouping. Conversations have opaque IDs and preserve Telegram business, topic, guest and ephemeral context.
 
 Its JSON API lives under `/api` on `app.phenogram.io`:
 
@@ -118,7 +118,7 @@ Its JSON API lives under `/api` on `app.phenogram.io`:
 | Session | `POST /api/auth/logout`, `GET /api/me` |
 | Bots | `GET/POST /api/bots`, `GET/DELETE /api/bots/{bot_id}`, `POST /api/bots/{bot_id}/provision`, `POST /api/bots/{bot_id}/managed-webhook-recovery` |
 | Journal | `GET /api/bots/{bot_id}/updates`, `GET /api/bots/{bot_id}/updates/stream`, `GET /api/bots/{bot_id}/activity` |
-| Bot View | `GET /api/bots/{bot_id}/conversations`, `GET /api/bots/{bot_id}/conversations/{chat_id}/messages`, `POST /api/bots/{bot_id}/messages` |
+| Bot View | `GET /api/bots/{bot_id}/conversations`, `GET /api/bots/{bot_id}/conversations/{conversation_id}/messages`, `GET .../messages/stream`, `POST .../actions/{method}`, `GET/HEAD /api/bots/{bot_id}/media/{file_id}` |
 | Delivery | `GET/POST /api/bots/{bot_id}/stream-keys`, `DELETE /api/bots/{bot_id}/stream-keys/{key_id}`, `POST /api/bots/{bot_id}/file-links` |
 
 The OAuth callback establishes an HTTP-only session. Every mutating management request requires that cookie, an exact-origin check, and `X-Phenogram-CSRF`.
@@ -153,7 +153,7 @@ Checkout and self-service plan changes are not implemented; seeded plans are ass
 
 The `standard` pool runs the pinned official server without `--local` and is the compatibility target for normal public Telegram Bot API clients. The `local` pool runs the same binary with Telegram's `--local` option and is available only to eligible plans.
 
-`--local` keeps Telegram's server-local file semantics. An absolute `file_path` refers to a path on the Contabo Bot API PVC; it is not a path on the developer's laptop or bot-application host. The authenticated read-only file sidecar serves that exact native path. Pool placement is selected when a bot is connected; moving an already active bot between pools is not currently exposed as an ordinary routing toggle.
+`--local` keeps Telegram's server-local file semantics. An absolute `file_path` refers to a path on the official Bot API pool's PVC; it is not a path on the developer's laptop or bot-application host. The authenticated read-only file sidecar serves that exact native path. Pool placement is selected when a bot is connected; moving an already active bot between pools is not currently exposed as an ordinary routing toggle.
 
 ## Storage and security boundary
 
@@ -178,15 +178,15 @@ curl -fsS http://app.localhost/api/health
 
 Configure independent `MASTER_KEY`, `PUBLIC_ID_KEY`, and `LINK_SIGNING_KEY` values of at least 32 bytes, a non-default PostgreSQL password, and separate development OAuth clients. Open `http://localhost` for the landing page and `http://app.localhost` for the console.
 
-The base Compose topology is not the production native data plane and is not evidence of full gateway compatibility. Production validation uses the Helm-deployed gateway, both pinned official pools, collector, and file sidecars on Contabo.
+The base Compose topology is not the production native data plane and is not evidence of full gateway compatibility. Production validation uses the existing gateway, both pinned official pools, collector, and file sidecars in the unified cluster. Run `bash tests/run-local-e2e.sh` for isolated application/API regression tests with temporary PostgreSQL and a Telegram mock.
 
 ## Production deployment
 
-Every push to `master` runs validation, builds immutable application, official-server, and gateway images, and deploys the chart directly to the `phenogram` namespace on Contabo with Helm and the namespace-scoped `KUBECONFIG`. The workflow reconciles `DATA_PLANE_SYNC_TOKEN` directly into the existing Kubernetes Secret. It does not put the secret in Helm values or release history.
+Every push to `master` runs validation, builds immutable application, official-server, and gateway images, and updates the existing workloads in the unified cluster's `phenogram` namespace using its restricted `KUBECONFIG`. The release preserves migrated configuration, claims and bindings; it does not reapply the former cluster's Helm installation. See [unified releases](deploy/UNIFIED-RELEASES.md) for the authoritative deployment procedure.
 
 Phenogram does not use Flux for application deployment, and this repository must not add project releases to `infra-flux`. See the [production chart guide](deploy/helm/phenogram-platform/README.md) and [operations guide](docs/operations.md).
 
-The first official-data-plane cutover is intentionally destructive for legacy bot state: build and deploy the new resources in shadow, delete the disposable legacy bot record/session data rather than migrating it, then switch `/bot*` and `/file*` publicly and remove the obsolete legacy PVC after validation. User identities and browser sessions are control-plane data and are not part of that bot-data deletion.
+The one-time destructive official-data-plane cutover is complete. Do not repeat its legacy bot deletion or shadow-routing steps during ordinary releases. The live app, database and native pools currently share one node and persistent storage: this is not an automatic failover/HA installation.
 
 ## License
 

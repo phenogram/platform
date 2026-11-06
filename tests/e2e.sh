@@ -19,6 +19,7 @@ tap_collector_dir=""
 tap_ack_listener_pid=""
 telemetry_outbound_seeded=false
 chat_upload_dir=""
+timeline_lock_pid=""
 
 cleanup_live_stream() {
   if [[ -n "$live_stream_pid" ]]; then
@@ -35,6 +36,10 @@ cleanup_live_stream() {
 
 cleanup() {
   cleanup_live_stream
+  if [[ -n "$timeline_lock_pid" ]]; then
+    kill "$timeline_lock_pid" 2>/dev/null || true
+    wait "$timeline_lock_pid" 2>/dev/null || true
+  fi
   if [[ -n "$tap_ack_listener_pid" ]]; then
     kill "$tap_ack_listener_pid" 2>/dev/null || true
     wait "$tap_ack_listener_pid" 2>/dev/null || true
@@ -883,6 +888,76 @@ page_older="$(curl -fsS -b "$auth_cookie" \
 jq -e --argjson newer "$(jq '[.messages[].id]' <<<"$page_newest")" \
   '(.messages | length) >= 1 and ([.messages[].id] - $newer | length) == (.messages | length)' \
   <<<"$page_older" >/dev/null
+
+# Backfilled journal IDs and late edits must not group incoming/outgoing or
+# move edited messages to the end. History pagination follows send chronology.
+history_conversation="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
+INSERT INTO conversations (bot_id, chat_id, display_name, last_update_at, expires_at)
+VALUES (:'bot_id'::uuid, 999, 'History regression', now(), now() + interval '1 day') RETURNING id;
+SQL
+)"
+history_conversation="$(head -1 <<<"$history_conversation")"
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" -v conversation_id="$history_conversation" <<'SQL' >/dev/null
+INSERT INTO conversation_events (bot_id, conversation_id, direction, event_type, source_table,
+  telegram_message_id, edit_date, status, payload, created_at, expires_at)
+SELECT :'bot_id'::uuid, :'conversation_id'::uuid, direction, event_type, 'bot_view_action',
+       CASE WHEN event_type = 'message' THEN NULL ELSE message_id END,
+       edited, 'sent', jsonb_build_object('chat', jsonb_build_object('id', 999),
+       'message_id', message_id, 'date', sent, 'text', label), now(), now() + interval '1 day'
+FROM (VALUES
+  ('incoming', 'message', 1, 1700000001, NULL::timestamptz, 'first'),
+  ('incoming', 'message', 3, 1700000002, NULL::timestamptz, 'third'),
+  ('outgoing', 'sendMessage', 2, 1700000002, NULL::timestamptz, 'second'),
+  ('incoming', 'edited_message', 1, 1700000001, now(), 'edited first')
+) AS fixture(direction, event_type, message_id, sent, edited, label);
+SQL
+history_page="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/$history_conversation/messages?limit=2")"
+jq -e '[.messages[].telegram_message_id] == [2,3]' <<<"$history_page" >/dev/null
+history_before="$(jq -er '.next_before' <<<"$history_page")"
+history_older="$(curl -fsS -b "$auth_cookie" "$base_url/api/bots/$bot_id/conversations/$history_conversation/messages?limit=2&before=$history_before")"
+jq -e '[.messages[].telegram_message_id] == [1] and .messages[0].text == "edited first"' <<<"$history_older" >/dev/null
+
+# Hold the exact ingestion transaction lock while two accepted Bot View calls
+# persist in the background. Neither outgoing nor action may allocate a cursor
+# ahead of that transaction, and Telegram responses must still return promptly.
+PGAPPNAME="phenogram-timeline-lock-$identity_subject" psql "$database_url" -At \
+  -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null &
+BEGIN;
+SELECT pg_advisory_xact_lock(('x' || substr(replace(:'bot_id', '-', ''), 1, 16))::bit(64)::bigint);
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+timeline_lock_pid="$!"
+for _ in $(seq 1 60); do
+  if [[ "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v app="phenogram-timeline-lock-$identity_subject" <<'SQL'
+SELECT count(*) FROM pg_stat_activity WHERE application_name = :'app' AND wait_event = 'PgSleep';
+SQL
+)" = "1" ]]; then break; fi
+  sleep 0.05
+done
+curl -fsS --max-time 2 -b "$auth_cookie" -H 'content-type: application/json' \
+  -H "x-phenogram-csrf: $csrf" -d '{"text":"timeline lock regression"}' \
+  "$base_url/api/bots/$bot_id/conversations/$history_conversation/actions/sendMessage" \
+  | jq -e '.ok == true' >/dev/null
+curl -fsS --max-time 2 -b "$auth_cookie" -H 'content-type: application/json' \
+  -H "x-phenogram-csrf: $csrf" -d '{"action":"typing"}' \
+  "$base_url/api/bots/$bot_id/conversations/$history_conversation/actions/sendChatAction" \
+  | jq -e '.ok == true' >/dev/null
+test "$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v conversation_id="$history_conversation" <<'SQL'
+SELECT count(*) FROM conversation_events WHERE conversation_id = :'conversation_id'::uuid;
+SQL
+)" = "4"
+wait "$timeline_lock_pid"
+timeline_lock_pid=""
+for _ in $(seq 1 50); do
+  history_count="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v conversation_id="$history_conversation" <<'SQL'
+SELECT count(*) FROM conversation_events WHERE conversation_id = :'conversation_id'::uuid;
+SQL
+)"
+  if [[ "$history_count" = "6" ]]; then break; fi
+  sleep 0.05
+done
+test "$history_count" = "6"
 
 updates_before_rich_chat="$(psql "$database_url" -At -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL'
 SELECT count(*) FROM updates WHERE bot_id = :'bot_id'::uuid;

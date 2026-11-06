@@ -964,11 +964,7 @@
         merged.push(item);
       }
     });
-    return merged.sort((left, right) => {
-      const cursorOrder = compareJournalIds(timelineItemCursor(left), timelineItemCursor(right));
-      if (cursorOrder) return cursorOrder;
-      return messageTimeMs(left) - messageTimeMs(right);
-    });
+    return merged.sort(compareMessageChronology);
   }
 
   function stopBotViewMessageStream() {
@@ -1115,23 +1111,20 @@
     const existingIndex = messages.findIndex((candidate) => messageStableId(candidate) === id);
     if (existingIndex >= 0) messages[existingIndex] = item;
     else messages.push(item);
+    messages.sort(compareMessageChronology);
     conversation.messages = messages;
-    conversation.last_update_at = messageTime(item) || conversation.last_update_at;
-    conversation.last_message_preview = `${isOutgoing(item) ? "You: " : ""}${messagePreview(item)}`;
+    const latest = messages[messages.length - 1] || item;
+    if (messageTimeMs(latest) > messageTimeMs({ created_at: conversation.last_update_at })) conversation.last_update_at = messageTime(latest);
+    conversation.last_message_preview = `${isOutgoing(latest) ? "You: " : ""}${messagePreview(latest)}`;
     renderConversationListLive();
     const timeline = document.querySelector("#chat-timeline");
     if (!timeline) return;
     const key = botViewKey(context.botId, context.conversationId);
     const scrollState = state.botViewScrollState.get(key) || {};
     const wasNearBottom = botViewNearBottom(timeline);
-    const selectorId = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id.replace(/[^a-zA-Z0-9_-]/g, "");
-    const existing = timeline.querySelector(`[data-message-id="${selectorId}"]`);
-    if (existing) existing.outerHTML = renderMessage(item, existingIndex);
-    else {
-      timeline.querySelector(".empty-state")?.remove();
-      if (!timeline.querySelector(".timeline-day")) timeline.insertAdjacentHTML("afterbegin", '<div class="timeline-day"><span>Conversation history</span></div>');
-      timeline.insertAdjacentHTML("beforeend", renderMessage(item, messages.length - 1));
-    }
+    const anchor = [...timeline.querySelectorAll("[data-message-id]")].find((row) => row.getBoundingClientRect().bottom > timeline.getBoundingClientRect().top);
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const existing = upsertBotViewTimelineRow(timeline, messages, item);
     staleEphemeralRows.forEach((candidate) => {
       const stableId = messageStableId(candidate);
       const escapedId = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(stableId) : stableId.replace(/[^a-zA-Z0-9_-]/g, "");
@@ -1139,13 +1132,40 @@
       if (row) row.outerHTML = renderMessage(candidate, messages.indexOf(candidate));
     });
     if (wasNearBottom) timeline.scrollTop = timeline.scrollHeight;
-    else scrollState.unread = botViewUnreadAfterInsert(scrollState.unread, existing ? 0 : 1, false);
+    else {
+      if (anchor?.isConnected && Number.isFinite(anchorTop)) timeline.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+      scrollState.unread = botViewUnreadAfterInsert(scrollState.unread, existing ? 0 : 1, false);
+    }
     scrollState.top = timeline.scrollTop;
     scrollState.nearBottom = wasNearBottom;
     scrollState.messageCount = messages.length;
     state.botViewScrollState.set(key, scrollState);
     updateScrollLatestControl();
     observeBotViewMedia();
+  }
+
+  function upsertBotViewTimelineRow(timeline, messages, item) {
+    const rowFor = (candidate) => {
+      const id = messageStableId(candidate);
+      const escaped = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id.replace(/[^a-zA-Z0-9_-]/g, "");
+      return timeline.querySelector(`[data-message-id="${escaped}"]`);
+    };
+    const existing = rowFor(item);
+    const position = messages.indexOf(item);
+    if (existing) existing.outerHTML = renderMessage(item, position);
+    else {
+      timeline.querySelector(".empty-state")?.remove();
+      if (!timeline.querySelector(".timeline-day")) timeline.insertAdjacentHTML("afterbegin", '<div class="timeline-day"><span>Conversation history</span></div>');
+      const next = messages.slice(position + 1).map(rowFor).find(Boolean);
+      if (next) next.insertAdjacentHTML("beforebegin", renderMessage(item, position));
+      else timeline.insertAdjacentHTML("beforeend", renderMessage(item, position));
+    }
+    return existing;
+  }
+
+  function mergeOlderConversationMessages(current, older) {
+    const existingIds = new Set(current.map((item) => messageStableId(item)));
+    return [...current, ...older.filter((item) => !existingIds.has(messageStableId(item)))].sort(compareMessageChronology);
   }
 
   async function loadOlderBotViewMessages() {
@@ -1158,8 +1178,6 @@
     const sessionVersion = state.sessionVersion;
     const contextVersion = state.botContextVersion;
     const timeline = document.querySelector("#chat-timeline");
-    const oldHeight = timeline?.scrollHeight || 0;
-    const oldTop = timeline?.scrollTop || 0;
     state.botViewLoadingOlder = true;
     timeline?.querySelector('[data-action="load-older-messages"]')?.setAttribute("disabled", "");
     try {
@@ -1170,18 +1188,23 @@
       if (!conversation) return;
       const existingIds = new Set(conversationMessages(conversation).map((item) => messageStableId(item)));
       const uniqueOlder = older.filter((item) => !existingIds.has(messageStableId(item)));
-      conversation.messages = [...uniqueOlder, ...conversationMessages(conversation)];
+      conversation.messages = mergeOlderConversationMessages(conversationMessages(conversation), older);
       state.botViewMessageNextBefore.set(key, payload?.next_before ?? payload?.data?.next_before ?? null);
       const currentTimeline = document.querySelector("#chat-timeline");
+      const oldTop = currentTimeline?.scrollTop || 0;
+      const oldHeight = currentTimeline?.scrollHeight || 0;
+      const anchor = currentTimeline && [...currentTimeline.querySelectorAll("[data-message-id]")].find((row) => row.getBoundingClientRect().bottom > currentTimeline.getBoundingClientRect().top);
+      const anchorTop = anchor?.getBoundingClientRect().top;
       if (currentTimeline && uniqueOlder.length) {
-        const day = currentTimeline.querySelector(".timeline-day");
-        day?.insertAdjacentHTML("afterend", uniqueOlder.map(renderMessage).join(""));
-        currentTimeline.scrollTop = botViewPrependScrollTop(oldTop, oldHeight, currentTimeline.scrollHeight);
+        uniqueOlder.forEach((item) => upsertBotViewTimelineRow(currentTimeline, conversation.messages, item));
         observeBotViewMedia();
       }
       const loadContainer = currentTimeline?.querySelector(".load-older");
       const nextBefore = state.botViewMessageNextBefore.get(key);
       if (loadContainer) loadContainer.outerHTML = nextBefore ? '<div class="load-older"><button class="btn btn--secondary btn--sm" type="button" data-action="load-older-messages">Load earlier messages</button></div>' : "";
+      if (currentTimeline) currentTimeline.scrollTop = anchor?.isConnected && Number.isFinite(anchorTop)
+        ? oldTop + anchor.getBoundingClientRect().top - anchorTop
+        : botViewPrependScrollTop(oldTop, oldHeight, currentTimeline.scrollHeight);
       const scrollState = state.botViewScrollState.get(key) || {};
       scrollState.top = currentTimeline?.scrollTop || 0;
       scrollState.messageCount = conversation.messages.length;
@@ -2187,7 +2210,7 @@
     const message = telegramMessage(item);
     return item?.text ?? message?.text ?? item?.caption ?? message?.caption ?? item?.content?.text ?? "";
   };
-  const messageTime = (item) => item?.sent_at || item?.created_at || item?.timestamp || item?.date || telegramMessage(item)?.date;
+  const messageTime = (item) => item?.sent_at || (item?.event_type !== "callback_query" && item?.direction !== "action" ? telegramMessage(item)?.date : null) || item?.created_at || item?.timestamp || item?.date;
   const isOutgoing = (item) => item?.outgoing === true || item?.is_outgoing === true || ["out", "outgoing", "bot", "sent"].includes(String(item?.direction || item?.sender_type || "").toLowerCase());
 
   function botViewKey(botIdValue = state.selectedBotId, chatId = state.selectedConversationId) {
@@ -2207,6 +2230,19 @@
     if (typeof value === "number" && Number.isFinite(value)) return value < 1_000_000_000_000 ? value * 1000 : value;
     const parsed = Date.parse(String(value || ""));
     return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  // A change cursor orders delivery of revisions, not the conversation.
+  // Telegram's original send date and message identity keep edits in place
+  // and interleave incoming/outgoing rows even when observers commit late.
+  function compareMessageChronology(left, right) {
+    const timeOrder = messageTimeMs(left) - messageTimeMs(right);
+    if (timeOrder) return timeOrder;
+    const key = (item) => item?.history_key || (Number(telegramMessageId(item)) > 0 && item?.direction !== "action" && item?.event_type !== "callback_query"
+      ? `m:${String(telegramMessageId(item)).padStart(20, "0")}`
+      : messageStableId(item));
+    const leftKey = key(left), rightKey = key(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
   }
 
   function recentEphemeralReply(conversation, now = Date.now()) {
@@ -2995,18 +3031,18 @@
     const actionableEphemeral = ephemeralId !== "" && ephemeralId != null && ephemeralMessageIsActionable(item, conversation);
     const hasMessageIdentity = item?.actionable === false ? false : usableMessageId || actionableEphemeral;
     const deleted = status === "deleted" || type === "deleted_business_messages" || item?.deleted === true;
-    if (deleted) return `<div class="message-event message-event--deleted">${icon("trash")}<span>Message deleted</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
-    if (item?._timeline_callback_event) return `<div class="message-event message-event--callback">${renderCallbackEvent(item._timeline_callback_event)}<time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
-    if (item?._timeline_event_label) return `<div class="message-event message-event--action">${icon("pulse")}<span>${esc(item._timeline_event_label)}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    if (deleted) return `<div class="message-event message-event--deleted" data-message-id="${esc(id)}">${icon("trash")}<span>Message deleted</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    if (item?._timeline_callback_event) return `<div class="message-event message-event--callback" data-message-id="${esc(id)}">${renderCallbackEvent(item._timeline_callback_event)}<time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+    if (item?._timeline_event_label) return `<div class="message-event message-event--action" data-message-id="${esc(id)}">${icon("pulse")}<span>${esc(item._timeline_event_label)}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
     if (String(item?.direction || "").toLowerCase() === "action") {
       const actionLabel = String(type || "Bot action").replace(/^send|^edit/, "").replaceAll("_", " ").replace(/([a-z])([A-Z])/g, "$1 $2").trim();
-      return `<div class="message-event message-event--action">${icon("check")}<span>${esc(actionLabel || "Bot action")} ${status === "failed" ? "failed" : "completed"}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
+      return `<div class="message-event message-event--action" data-message-id="${esc(id)}">${icon("check")}<span>${esc(actionLabel || "Bot action")} ${status === "failed" ? "failed" : "completed"}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></div>`;
     }
     if (!text && !structured) {
       const ignored = new Set(["message_id", "date", "chat", "from", "sender_chat", "business_connection_id", "message_thread_id", "direct_messages_topic", "reply_to_message", "external_reply", "quote", "forward_origin", "edit_date", "author_signature", "has_protected_content"]);
       const field = Object.keys(message || {}).find((key) => !ignored.has(key));
       const label = field || type;
-      return `<details class="message-event message-event--raw"><summary>${icon("pulse")}<span>${esc(String(label).replaceAll("_", " "))}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></summary><pre>${esc(JSON.stringify(field ? message[field] : item?.content || {}, null, 2).slice(0, 4000))}</pre></details>`;
+      return `<details class="message-event message-event--raw" data-message-id="${esc(id)}"><summary>${icon("pulse")}<span>${esc(String(label).replaceAll("_", " "))}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></summary><pre>${esc(JSON.stringify(field ? message[field] : item?.content || {}, null, 2).slice(0, 4000))}</pre></details>`;
     }
     const business = Boolean(conversation?.business_connection_id);
     const guest = Boolean(conversation?.guest_query_id);
@@ -3442,11 +3478,7 @@
         merged[position] = next;
       }
     });
-    return merged.sort((left, right) => {
-      const cursorOrder = compareJournalIds(timelineItemCursor(left), timelineItemCursor(right));
-      if (cursorOrder) return cursorOrder;
-      return messageTimeMs(left) - messageTimeMs(right);
-    });
+    return merged.sort(compareMessageChronology);
   }
 
   function reconcileBotViewActionPreviews(base, incoming) {
@@ -4498,6 +4530,8 @@
       botViewMessageStreamContextIsCurrent,
       mergeConversationMessageSnapshot,
       mergeConversationTimelineItems,
+      mergeOlderConversationMessages,
+      mergeBotViewStreamMessage,
       botViewTimelineMessagesFromResponse,
       botViewAggregateUploadLimit,
       collapseMediaGroups,

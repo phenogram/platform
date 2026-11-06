@@ -202,6 +202,7 @@ pub struct GatewayState {
     telemetry: tokio::sync::mpsc::Sender<TelemetryEvent>,
     telemetry_byte_budget: Arc<tokio::sync::Semaphore>,
     telemetry_metrics: Arc<TelemetryMetrics>,
+    telemetry_shutdown: tokio::sync::watch::Sender<bool>,
     outbound_observation_slots: Arc<tokio::sync::Semaphore>,
     outbound_observation_clock_us: Arc<AtomicU64>,
 }
@@ -239,12 +240,45 @@ impl GatewayState {
             telemetry,
             telemetry_byte_budget: Arc::new(tokio::sync::Semaphore::new(MAX_TELEMETRY_QUEUE_BYTES)),
             telemetry_metrics: Arc::new(TelemetryMetrics::default()),
+            telemetry_shutdown: tokio::sync::watch::channel(false).0,
             outbound_observation_slots: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_OUTBOUND_OBSERVATIONS,
             )),
             outbound_observation_clock_us: Arc::new(AtomicU64::new(0)),
         };
         Ok((state, receiver))
+    }
+
+    /// Called after HTTP serving has drained. Give detached response parsing and
+    /// accepted telemetry a bounded opportunity to finish before process exit.
+    /// Storage availability never participates in serving a Telegram request.
+    pub async fn drain_telemetry(
+        &self,
+        worker: &mut tokio::task::JoinHandle<()>,
+        timeout: Duration,
+    ) -> bool {
+        let result = tokio::time::timeout(timeout, async {
+            let _captures = self
+                .outbound_observation_slots
+                .acquire_many(MAX_CONCURRENT_OUTBOUND_OBSERVATIONS as u32)
+                .await
+                .expect("observation semaphore remains open");
+            self.telemetry_shutdown.send_replace(true);
+            (&mut *worker).await
+        })
+        .await;
+        if matches!(result, Ok(Ok(()))) {
+            return true;
+        }
+        self.telemetry_shutdown.send_replace(true);
+        worker.abort();
+        let _ = worker.await;
+        tracing::warn!(
+            queued = self.telemetry_metrics.queued.load(Ordering::Relaxed),
+            delivered = self.telemetry_metrics.delivered.load(Ordering::Relaxed),
+            "telemetry shutdown deadline exceeded; remaining observation data may be lost"
+        );
+        false
     }
 
     pub async fn load_last_good_snapshot(&self, path: &Path) -> Result<bool, String> {
@@ -926,11 +960,12 @@ pub async fn telemetry_delivery_loop(
     const MAX_BATCH_WAIT: Duration = Duration::from_millis(250);
     const BATCH_WRAPPER_BYTES: usize = 40;
 
+    let mut shutdown = state.telemetry_shutdown.subscribe();
     let mut pending = None;
     loop {
         let first = match pending.take() {
             Some(event) => event,
-            None => match receiver.recv().await {
+            None => match receive_telemetry(&mut receiver, &mut shutdown).await {
                 Some(event) => event,
                 None => break,
             },
@@ -940,7 +975,9 @@ pub async fn telemetry_delivery_loop(
         events.push(first);
         let deadline = tokio::time::Instant::now() + MAX_BATCH_WAIT;
         while events.len() < MAX_BATCH {
-            match tokio::time::timeout_at(deadline, receiver.recv()).await {
+            match tokio::time::timeout_at(deadline, receive_telemetry(&mut receiver, &mut shutdown))
+                .await
+            {
                 Ok(Some(event)) => {
                     let event_bytes = telemetry_event_json_len(&event) + 1;
                     if serialized_bytes + event_bytes > MAX_TELEMETRY_BATCH_BYTES {
@@ -988,8 +1025,30 @@ pub async fn telemetry_delivery_loop(
             if !retryable {
                 break;
             }
-            tokio::time::sleep(retry_delay).await;
+            // Shutdown may arrive during a long retry backoff. Spend the
+            // bounded flush window on delivery, rather than sleeping through it.
+            let already_shutting_down = *shutdown.borrow();
+            tokio::select! {
+                _ = tokio::time::sleep(retry_delay) => {}
+                _ = shutdown_requested(&mut shutdown), if !already_shutting_down => {}
+            }
             retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+        }
+    }
+}
+
+async fn receive_telemetry(
+    receiver: &mut tokio::sync::mpsc::Receiver<TelemetryEvent>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<TelemetryEvent> {
+    if *shutdown.borrow() {
+        receiver.close();
+    }
+    tokio::select! {
+        event = receiver.recv() => event,
+        _ = shutdown_requested(shutdown), if !receiver.is_closed() => {
+            receiver.close();
+            receiver.recv().await
         }
     }
 }
@@ -4401,6 +4460,107 @@ mod tests {
         .await
         .expect("delivery metric update");
         assert_eq!(state.telemetry_metrics.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_detached_observation_and_flushes_the_last_batch() {
+        let (capture_tx, mut capture_rx) = mpsc::channel(2);
+        let telemetry =
+            Router::new()
+                .fallback(any(
+                    |State(capture_tx): State<mpsc::Sender<serde_json::Value>>,
+                     request: Request| async move {
+                        let body = serde_json::from_slice::<serde_json::Value>(
+                            &to_bytes(request.into_body(), 1024 * 1024)
+                                .await
+                                .expect("telemetry body"),
+                        )
+                        .expect("telemetry JSON");
+                        capture_tx.send(body).await.expect("capture final batch");
+                        StatusCode::NO_CONTENT
+                    },
+                ))
+                .with_state(capture_tx);
+        let config = test_config("http://127.0.0.1:1", &spawn(telemetry).await);
+        let (state, receiver) = GatewayState::new(&config).expect("gateway state");
+        let mut worker = tokio::spawn(telemetry_delivery_loop(state.clone(), config, receiver));
+        state.record_telemetry(telemetry_event(
+            "phg_012345678901234567890123".into(),
+            Pool::Standard,
+            "sendMessage".into(),
+            StatusCode::OK,
+            Duration::from_millis(7),
+        ));
+
+        let observation = test_outbound_observation(&state);
+        let parse_state = state.clone();
+        tokio::spawn(async move {
+            // Model a response observation that was accepted before HTTP drain
+            // but whose detached parsing has not run when SIGTERM is handled.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let body = br#"{"ok":true,"result":{"message_id":17,"chat":{"id":99,"type":"private"},"text":"final reply"}}"#;
+            for message in outbound_messages_from_response(body) {
+                parse_state.record_telemetry(outbound_telemetry_event(
+                    &observation,
+                    parse_state.next_outbound_observed_at_unix_us(),
+                    message,
+                ));
+            }
+        });
+
+        assert!(
+            state
+                .drain_telemetry(&mut worker, Duration::from_secs(2))
+                .await
+        );
+        let captured = capture_rx.recv().await.expect("final telemetry batch");
+        let events = captured["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["kind"], "outbound_message");
+        assert_eq!(events[1]["message"]["text"], "final reply");
+        assert!(worker.is_finished());
+        assert_eq!(state.telemetry_metrics.queued.load(Ordering::Relaxed), 2);
+        assert_eq!(state.telemetry_metrics.delivered.load(Ordering::Relaxed), 2);
+        assert_eq!(state.telemetry_metrics.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            state.telemetry_byte_budget.available_permits(),
+            MAX_TELEMETRY_QUEUE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_does_not_wait_forever_for_unavailable_storage() {
+        let telemetry = Router::new().fallback(any(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let config = test_config("http://127.0.0.1:1", &spawn(telemetry).await);
+        let (state, receiver) = GatewayState::new(&config).expect("gateway state");
+        let mut worker = tokio::spawn(telemetry_delivery_loop(state.clone(), config, receiver));
+        state.record_telemetry(telemetry_event(
+            "phg_012345678901234567890123".into(),
+            Pool::Standard,
+            "getMe".into(),
+            StatusCode::OK,
+            Duration::from_millis(7),
+        ));
+        let started = tokio::time::Instant::now();
+        assert!(
+            !state
+                .drain_telemetry(&mut worker, Duration::from_millis(150))
+                .await
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(worker.is_finished());
+        assert_eq!(state.telemetry_metrics.delivered.load(Ordering::Relaxed), 0);
+        assert!(
+            state
+                .telemetry_metrics
+                .delivery_failed
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            state.telemetry_byte_budget.available_permits(),
+            MAX_TELEMETRY_QUEUE_BYTES
+        );
     }
 
     #[tokio::test]

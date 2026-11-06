@@ -1,6 +1,6 @@
 # Phenogram Platform operations guide
 
-This guide describes the production architecture deployed to the `phenogram` namespace on Contabo. The central invariant is simple: the pinned official Telegram Bot API server owns polling and webhook delivery, while Phenogram's journal is a nonblocking observer. PostgreSQL, the collector, and the console must be able to fail without becoming prerequisites for native update delivery.
+Production runs in the unified cluster's `phenogram` namespace; [unified releases](../deploy/UNIFIED-RELEASES.md) describes its deployment transport and ownership. The pinned official Telegram Bot API server owns polling and webhook delivery, while Phenogram's journal is a nonblocking observer. PostgreSQL, the collector, and the console must be able to fail without becoming prerequisites for native update delivery.
 
 ## Runtime inventory
 
@@ -13,9 +13,11 @@ This guide describes the production architecture deployed to the `phenogram` nam
 | Official `local` pool | Same pinned binary with Telegram `--local`; owns local-mode sessions and files | 100 GiB native Bot API PVC |
 | File sidecar, one per pool | Authenticated read-only HTTP bridge for `/file`, because the official binary has no public file endpoint | None; reads its pool PVC |
 | Tap collector, one per pool | Reassembles best-effort update mirrors, commits ACKed managed-lifecycle receipts, and writes journal/projections | None outside PostgreSQL |
-| ingress-nginx | TLS, strict host routing, request streaming, token-path log suppression | Kubernetes TLS Secrets |
+| `phenogram-public-edge` nginx | TLS, strict host routing, request streaming, token-path log suppression | Kubernetes TLS Secrets |
 
 Each official pool has one replica and is the only writer to its PVC. Collector and file-sidecar health are deliberately excluded from the official service's readiness: an observer or download-sidecar failure must not remove the official Bot API endpoint.
+
+As verified on 2026-11-06, the app, database, gateway and both official pools share the `home` node and static volumes. Staged `-ha-v1` claims are not the mounted production claims. Healthy pods and successful database backups do not imply node failover or a tested full restoration.
 
 ## Public topology
 
@@ -23,7 +25,9 @@ Each official pool has one replica and is the only writer to its PVC. Collector 
 - `https://app.phenogram.io` serves the console, same-origin management API, and health endpoint.
 - `https://api.phenogram.io` serves `/bot*`, `/file*`, `/telegram/*`, `/events/*`, and `/public/*` only.
 
-The three Cloudflare records stay DNS-only and point to the Contabo ingress. Do not introduce another proxy until full-URI redaction, disabled buffering, long polling, multipart uploads, large downloads, SSE, and forwarding-header handling have been verified with synthetic credentials.
+The three Cloudflare records stay DNS-only and point to the unified cluster's edge. Its reviewed nginx configuration is in `deploy/unified/phenogram-edge-nginx.conf`. Both the console upload path and machine API require streaming request bodies and no nginx aggregate size limit; the application enforces authenticated upload limits. Verify full-URI redaction, long polling, uploads, downloads and SSE after any edge change.
+
+The edge config is mounted with `subPath`: a ConfigMap update alone does not update the running nginx. Validate the desired config with `nginx -t`, then roll only `phenogram-public-edge` and verify its live config. Ordinary image releases do not reconcile this ConfigMap.
 
 Telegram-compatible paths contain the raw bot token:
 
@@ -62,9 +66,9 @@ Helm expects existing Secrets rather than rendering secret values:
 - `phenogram-backup-secrets` contains the currently enabled PostgreSQL Restic target credentials;
 - `phenogram-io-tls`, `app-phenogram-io-tls`, and `api-phenogram-io-tls` are managed by cert-manager.
 
-GitHub Actions receives the namespace-scoped `KUBECONFIG` and repository secret `DATA_PLANE_SYNC_TOKEN`. The workflow writes the data-plane value to a protected temporary file, patches only that key into `phenogram-secrets`, and removes the file. The value is never passed as a Helm parameter or stored in Helm release history.
+GitHub Actions receives a namespace-scoped `KUBECONFIG` with the restricted transport to the unified cluster. The image release preserves existing Secrets, including `DATA_PLANE_SYNC_TOKEN`; configuration changes are separate scoped operations. Secret values are never passed as Helm parameters.
 
-The chart renders NetworkPolicy resources, but Contabo's current Minikube bridge CNI does not enforce them. Treat `DATA_PLANE_SYNC_TOKEN` as the actual internal authorization boundary until a policy-capable CNI is installed; do not claim that the rendered policies provide live isolation.
+The Helm chart is a reference installation, not a description of the migrated cluster's current CNI or network policies. Verify policy enforcement in the live cluster. Internal endpoints also require `DATA_PLANE_SYNC_TOKEN` regardless of network isolation.
 
 ## Social OAuth setup
 
@@ -96,12 +100,14 @@ A push to `master` runs:
 
 1. Rust formatting, lint, tests, browser syntax checks, action lint, and strict Helm rendering;
 2. immutable Linux/amd64 builds for the application, pinned official server, and streaming gateway;
-3. direct `helm upgrade --install` against the Contabo `phenogram` namespace using the namespace-limited kubeconfig;
+3. verified image patches to existing unified workloads using the namespace-limited kubeconfig;
 4. Kubernetes rollout checks and origin-pinned checks for all three public hosts and OAuth redirects.
 
-The production workflow checks the Kubernetes API endpoint and namespace before deployment and rejects a credential that can create namespaces. Image references are digest-pinned. Normal control-plane releases do not implicitly move the independently pinned official, collector, file-sidecar, or gateway images.
+The production workflow checks the Kubernetes API endpoint and namespace before deployment. Image references are digest-pinned. The unified release updates the application, gateway and both official pool workloads, including their collector/file sidecars, to the verified build outputs. This can restart native sessions during a release; it does not change their persistent storage. Do not use the old chart pins to infer which images run in production.
 
-## Destructive first data-plane cutover
+## Historical: destructive first data-plane cutover (completed)
+
+This records the completed source-cluster cutover, not a current release procedure. Do not repeat the deletion or old Helm deployment below on the unified cluster.
 
 There is no legacy bot migration in this release. Existing bot records, their captured update history, and the old Telegram sidecar state are disposable. User identities and current browser sessions are separate control-plane records and remain intact.
 
@@ -116,6 +122,15 @@ releases so the new official pools are warm before the public ingress moves:
 No database backup, bot replay, compatibility shim, per-bot migration, or fallback route is a prerequisite for this empty-bot destructive cutover. The shadow phase exists only to prove that the already-built replacement is healthy before ingress moves; it is not a data-migration phase.
 
 ## Release validation
+
+Run the complete isolated service test locally with PostgreSQL 17 installed:
+
+```sh
+bash tests/run-local-e2e.sh
+node tests/chat_frontend_regression.mjs
+```
+
+The runner creates its own local database and Telegram mock and removes them after success. It never sends messages to real Telegram bots. On failure it prints the disposable log directory. `PG_BIN` and `PHENOGRAM_TEST_{APP,MOCK,PG}_PORT` can select local binaries and unused ports.
 
 Render the chart before merging:
 
@@ -201,7 +216,7 @@ Plan coverage is deterministic. Directly connected bots consume capacity first. 
 
 The standard pool is the public Bot API compatibility target. Its `/file` request uses the relative `file_path` returned by native `getFile`, and the sidecar resolves it under the raw-token directory on the official PVC.
 
-The local pool keeps Telegram's documented `--local` contract. `getFile` may return an absolute path under `/var/lib/telegram-bot-api`; that path refers to the Contabo pool PVC. It never refers to the bot application's machine or a developer workstation. Ingress preserves the double slash before an absolute path, and the sidecar also accepts only the exact configured root form if an intermediary merges it.
+The local pool keeps Telegram's documented `--local` contract. `getFile` may return an absolute path under `/var/lib/telegram-bot-api`; that path refers to the official pool's PVC. It never refers to the bot application's machine or a developer workstation. Ingress preserves the double slash before an absolute path, and the sidecar also accepts only the exact configured root form if an intermediary merges it.
 
 The sidecar performs descriptor-relative, no-follow, same-filesystem opens and streams regular files only. It accepts `GET`/`HEAD` and valid byte ranges. It reads the pool PVC but never writes it. The internal gateway-to-sidecar request is authenticated with `DATA_PLANE_SYNC_TOKEN`.
 
@@ -272,7 +287,7 @@ New connections, route changes, Bot View, and new route-snapshot publication req
 
 1. Use the exact `file_path` returned by the selected pool's native `getFile`.
 2. Confirm route pool, file-sidecar process, read-only PVC mount, and `DATA_PLANE_SYNC_TOKEN` agreement.
-3. For `--local`, confirm the absolute path is under the configured Contabo data root; a developer-machine path is invalid by design.
+3. For `--local`, confirm the absolute path is under the configured official pool data root; a developer-machine path is invalid by design.
 4. Test `HEAD` and a small range before attempting the complete download.
 
 ### Data-plane control token rotation
@@ -281,10 +296,11 @@ Update the repository secret and reconcile the Kubernetes Secret, then restart t
 
 ## Current production boundaries
 
-- The standard compatibility target is the pinned official server. Phenogram's added hop can still fail at ingress, route authentication, or transport; compatibility must be regression-tested at the raw HTTP boundary.
+- The standard compatibility target is the pinned official Bot API 10.2 server, not every method of later Telegram releases. Updating to 10.3 or later requires a separate native build and observer/wire compatibility check. Phenogram's added hop can still fail at ingress, route authentication, or transport; compatibility must be regression-tested at the raw HTTP boundary.
 - The gateway and each official pool are single replica in the MVP, so node/pod disruption can interrupt service even though observer failures are isolated.
 - Observer history, Bot View projections, and SSE use best-effort type-1 copies and can contain gaps. Managed discovery uses a bounded ACKed seven-day observer queue; overflow, expiry, or local persistence failure can still create a gap but never blocks native Telegram delivery.
-- `--local` absolute paths are Contabo server-local paths, not client-local paths.
+- If one conversation contains several copies of the same poll, their projected live updates can share a cursor. An interrupted SSE batch may leave a sibling poll display stale until the conversation is reloaded; the stored snapshot and native poll are unaffected.
+- `--local` absolute paths are official-server-local paths, not client-local paths.
 - Moving an already active bot between standard and local pools is not exposed as an ordinary routing change.
 - A managed token rotation with an active webhook requires explicit recovery of authentication settings.
 - Payment collection, self-service upgrades, MFA, organizations/RBAC, multi-region failover, and point-in-time recovery are not implemented.

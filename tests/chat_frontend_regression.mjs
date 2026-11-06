@@ -35,6 +35,20 @@ vm.runInNewContext(source, {
 const chat = window.__PHENOGRAM_CHAT_TEST__;
 assert.ok(chat, "chat test hooks must be exposed in test mode");
 
+// Journal allocation/commit order and edit delivery cursors do not define
+// conversation chronology: the original Telegram send time does.
+const chronologicalRows = [
+  { id: "incoming-message-1", cursor: "1", direction: "incoming", created_at: "2026-11-06T12:00:01Z", payload: { message: { message_id: 1, date: 1793966401, text: "first" } } },
+  { id: "incoming-message-3", cursor: "2", direction: "incoming", created_at: "2026-11-06T12:00:03Z", payload: { message: { message_id: 3, date: 1793966403, text: "third" } } },
+  { id: "outgoing-message-2", cursor: "90", direction: "outgoing", created_at: "2026-11-06T12:00:09Z", payload: { message_id: 2, date: 1793966402, text: "second" } },
+];
+assert.deepEqual(Array.from(chat.mergeConversationMessageSnapshot(chronologicalRows, [], "90"), row => row.id), ["incoming-message-1", "outgoing-message-2", "incoming-message-3"]);
+const editedFirst = { ...chronologicalRows[0], cursor: "100", payload: { message: { message_id: 1, date: 1793966401, edit_date: 1793966500, text: "edited" } } };
+assert.deepEqual(Array.from(chat.mergeConversationTimelineItems(chronologicalRows, [editedFirst]), row => row.id), ["incoming-message-1", "outgoing-message-2", "incoming-message-3"], "editing an old message must not move it to the latest position");
+const equalSecondThird = { ...chronologicalRows[1], payload: { message: { ...chronologicalRows[1].payload.message, date: 1793966402 } } };
+assert.deepEqual(Array.from(chat.mergeOlderConversationMessages([editedFirst, equalSecondThird], chronologicalRows), row => row.id), ["incoming-message-1", "outgoing-message-2", "incoming-message-3"], "older pagination must interleave with historical edits already received by SSE and order same-second messages by identity");
+assert.equal(chat.mergeOlderConversationMessages([editedFirst], chronologicalRows)[0].cursor, "100", "an older page must not overwrite a newer SSE edit");
+
 // Telegram-native authorization failures belong to the bot, not the operator session.
 assert.equal(chat.isPlatformUnauthorizedPayload({ ok: false, error_code: 401, description: "Unauthorized" }), false);
 assert.equal(chat.isPlatformUnauthorizedPayload({ error: { code: "unauthorized", message: "Unauthorized" } }), true);
@@ -97,6 +111,11 @@ Object.assign(chat.state, {
 });
 const streamContext = { botId: "bot-a", conversationId: "conversation-a", sessionVersion: 3, contextVersion: 9, generation: 12 };
 assert.equal(chat.botViewMessageStreamContextIsCurrent(streamContext), true);
+const liveConversation = { id: "conversation-a", messages: chronologicalRows.slice(), last_update_at: "2026-11-06T12:00:09Z", last_message_preview: "third" };
+chat.state.conversations = [liveConversation];
+chat.mergeBotViewStreamMessage(streamContext, editedFirst);
+assert.equal(liveConversation.last_message_preview, "third", "an old edit must not replace the latest conversation preview");
+assert.equal(liveConversation.last_update_at, "2026-11-06T12:00:09Z", "an old edit must not move the conversation activity backwards");
 chat.state.selectedConversationId = "conversation-b";
 assert.equal(chat.botViewMessageStreamContextIsCurrent(streamContext), false);
 chat.state.selectedConversationId = "conversation-a";

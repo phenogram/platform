@@ -59,7 +59,12 @@ jobs:
           cargo test --manifest-path deploy/gateway/Cargo.toml --all-targets --locked
 
       - name: Check browser application syntax
-        run: node --check assets/app.js
+        run: |
+          node --check assets/app.js
+          node tests/chat_frontend_regression.mjs
+
+      - name: Test application against disposable PostgreSQL and Telegram mock
+        run: bash tests/run-local-e2e.sh
 
       - name: Lint GitHub Actions
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7

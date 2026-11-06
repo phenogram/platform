@@ -44,7 +44,7 @@ async fn run() -> Result<(), String> {
     tokio::spawn(async move { snapshot_sync_loop(sync_state, sync_config).await });
     let telemetry_state = state.clone();
     let telemetry_config = config.clone();
-    tokio::spawn(async move {
+    let mut telemetry_worker = tokio::spawn(async move {
         telemetry_delivery_loop(telemetry_state, telemetry_config, telemetry_receiver).await;
     });
 
@@ -62,12 +62,16 @@ async fn run() -> Result<(), String> {
         shutdown_rx.clone(),
     );
     let admin_shutdown = wait_for_shutdown(shutdown_rx);
-    let admin =
-        axum::serve(admin_listener, admin_router(state)).with_graceful_shutdown(admin_shutdown);
+    let admin = axum::serve(admin_listener, admin_router(state.clone()))
+        .with_graceful_shutdown(admin_shutdown);
 
-    tokio::try_join!(public, admin).map_err(|error| format!("HTTP server failed: {error}"))?;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    Ok(())
+    let server_result = tokio::try_join!(public, admin);
+    state
+        .drain_telemetry(&mut telemetry_worker, Duration::from_secs(5))
+        .await;
+    server_result
+        .map(|_| ())
+        .map_err(|error| format!("HTTP server failed: {error}"))
 }
 
 async fn run_file_server(config: FileServerConfig) -> Result<(), String> {

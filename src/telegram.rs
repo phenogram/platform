@@ -1373,6 +1373,15 @@ pub async fn record_outbound_message(
     message: OutboundMessageRecord<'_>,
 ) -> Result<()> {
     let mut tx = state.db.begin().await?;
+    let lock_key = i64::from_be_bytes(
+        message.bot_id.as_bytes()[..8]
+            .try_into()
+            .expect("UUID prefix"),
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
     let context = outbound_message_context(&message);
     let conversation_id = if let Some(conversation_id) = message.conversation_id {
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM conversations WHERE id = $1 AND bot_id = $2")
@@ -1529,7 +1538,7 @@ pub async fn record_outbound_message(
                    text = EXCLUDED.text,
                    status = EXCLUDED.status,
                    payload = EXCLUDED.payload,
-                   created_at = EXCLUDED.created_at,
+                   created_at = conversation_events.created_at,
                    expires_at = EXCLUDED.expires_at"#,
         )
         .bind(message.bot_id)
