@@ -765,12 +765,13 @@ pub async fn get_bot(
 ) -> Result<Json<Value>> {
     let bot = get_bot_summary(&state, user.id, bot_id).await?;
     let membership = membership(&state, user.id).await?;
-    let stats = sqlx::query_as::<_, (i64, i64, i64, Option<f64>)>(
+    let stats = sqlx::query_as::<_, (i64, i64, i64, Option<f64>, Option<f64>)>(
         r#"SELECT
               (SELECT count(*) FROM updates WHERE bot_id = $1 AND received_at > now() - interval '24 hours'),
               (SELECT count(*) FROM api_calls WHERE bot_id = $1 AND created_at > now() - interval '24 hours'),
               (SELECT count(*) FROM webhook_deliveries WHERE bot_id = $1 AND state = 'failed'),
-              (SELECT avg(latency_ms)::float8 FROM api_calls WHERE bot_id = $1 AND created_at > now() - interval '24 hours')"#,
+              (SELECT avg(latency_ms)::float8 FROM api_calls WHERE bot_id = $1 AND created_at > now() - interval '24 hours' AND lower(method) <> 'getupdates'),
+              (SELECT avg(latency_ms)::float8 FROM api_calls WHERE bot_id = $1 AND created_at > now() - interval '24 hours' AND lower(method) = 'getupdates')"#,
     )
     .bind(bot_id)
     .fetch_one(&state.db)
@@ -778,7 +779,7 @@ pub async fn get_bot(
     Ok(Json(json!({
         "bot": bot,
         "membership": membership,
-        "stats": {"updates_24h": stats.0, "api_calls_24h": stats.1, "failed_deliveries": stats.2, "average_api_latency_ms": stats.3},
+        "stats": {"updates_24h": stats.0, "api_calls_24h": stats.1, "failed_deliveries": stats.2, "average_api_latency_ms": stats.3, "average_poll_wait_ms": stats.4},
         "integration": {
             "api_base": format!(
                 "{}/bot${{BOT_TOKEN}}{}",

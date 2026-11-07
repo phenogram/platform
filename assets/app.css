@@ -974,6 +974,8 @@ svg { display: block; }
 .message-event .icon { width: 12px; }
 .message-event--deleted { color: var(--danger); }
 .message-event--callback { border-radius: 10px; }
+.message-event--reaction { border-radius: 10px; font: 12px/1.5 var(--font-body, sans-serif); color: var(--ink-soft); }
+.message-event--reaction time { flex-shrink: 0; font-size: 10px; color: var(--ink-faint); }
 .message-event--callback .message-callback { padding: 0; }
 .message-event--raw { display: block; border-radius: 10px; }
 .message-event--raw summary { display: flex; align-items: center; gap: 7px; cursor: pointer; list-style: none; }

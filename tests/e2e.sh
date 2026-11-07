@@ -145,6 +145,28 @@ else
 fi
 bot_id="$(jq -er '.bot.id' <<<"$connected")"
 public_id="$(jq -er '.bot.public_id' <<<"$connected")"
+# Isolated fixture rows: polling waits must not inflate ordinary API latency.
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+DELETE FROM api_calls WHERE bot_id = :'bot_id'::uuid;
+INSERT INTO api_calls (bot_id, method, latency_ms, created_at, expires_at) VALUES
+  (:'bot_id'::uuid, 'getUpdates', 15000, now(), now() + interval '1 day'),
+  (:'bot_id'::uuid, 'GETUPDATES', 13000, now(), now() + interval '1 day'),
+  (:'bot_id'::uuid, 'sendMessage', 200, now(), now() + interval '1 day'),
+  (:'bot_id'::uuid, 'sendPhoto', 400, now(), now() + interval '1 day'),
+  (:'bot_id'::uuid, 'sendPhoto', 999999, now() - interval '25 hours', now() + interval '1 day');
+SQL
+curl -fsS -H "cookie: $auth_cookie" "$base_url/api/bots/$bot_id" | jq -e \
+  '.stats.average_api_latency_ms == 300 and .stats.average_poll_wait_ms == 14000 and .stats.api_calls_24h == 4' >/dev/null
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+DELETE FROM api_calls WHERE bot_id = :'bot_id'::uuid AND lower(method) <> 'getupdates';
+SQL
+curl -fsS -H "cookie: $auth_cookie" "$base_url/api/bots/$bot_id" | jq -e \
+  '.stats.average_api_latency_ms == null and .stats.average_poll_wait_ms == 14000' >/dev/null
+psql "$database_url" -v ON_ERROR_STOP=1 -v bot_id="$bot_id" <<'SQL' >/dev/null
+DELETE FROM api_calls WHERE bot_id = :'bot_id'::uuid;
+SQL
+curl -fsS -H "cookie: $auth_cookie" "$base_url/api/bots/$bot_id" | jq -e \
+  '.stats.average_api_latency_ms == null and .stats.average_poll_wait_ms == null' >/dev/null
 jq -e '.bot.username == "phenogram_test_bot" and .bot.update_mode == "webhook" and (.bot | has("token_fingerprint") | not) and (.bot.public_id | length > 20)' <<<"$connected" >/dev/null
 if jq -e '.bot.data_plane_pool != null' <<<"$connected" >/dev/null; then
   jq -e '.webhook_ip_address_preserved == true

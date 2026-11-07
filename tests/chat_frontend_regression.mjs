@@ -35,6 +35,40 @@ vm.runInNewContext(source, {
 const chat = window.__PHENOGRAM_CHAT_TEST__;
 assert.ok(chat, "chat test hooks must be exposed in test mode");
 
+// Non-message updates must never expose internal timeline metadata as content.
+const reactionCounts = {
+  action_generation: null, actionable: false, cursor: "501", id: "event-501",
+  direction: "incoming", event_type: "message_reaction_count", text: null,
+  payload: { update_id: 1, message_reaction_count: { message_id: 42, date: 1793966401,
+    reactions: [{ type: { type: "emoji", emoji: "👍" }, total_count: 3 }, { type: { type: "paid" }, total_count: 2 }] } },
+};
+const countsHtml = chat.renderMessage(reactionCounts, 0);
+assert.match(countsHtml, /Reactions on message #42: 👍 × 3 · ⭐ × 2/);
+assert.doesNotMatch(countsHtml, /action generation|action_generation|message__actions/);
+assert.equal(chat.messagePreview(reactionCounts), "Reactions on message #42: 👍 × 3 · ⭐ × 2");
+assert.match(chat.renderMessage({ ...reactionCounts, payload: { message_reaction_count: { message_id: 42, reactions: [] } } }, 0), /Reactions on message #42: none/);
+const reactionChanged = { ...reactionCounts, event_type: "message_reaction", payload: { message_reaction: {
+  message_id: 42, user: { first_name: "<script>" }, old_reaction: [{ type: "custom_emoji", custom_emoji_id: "123" }], new_reaction: [{ type: "emoji", emoji: "❤️" }],
+} } };
+assert.match(chat.renderMessage(reactionChanged, 0), /&lt;script&gt; reacted on message #42: Custom emoji → ❤️/);
+assert.match(chat.renderMessage({ ...reactionChanged, payload: { message_reaction: { ...reactionChanged.payload.message_reaction, new_reaction: [] } } }, 0), /removed reactions on message #42: Custom emoji/);
+const unknownHtml = chat.renderMessage({ ...reactionCounts, event_type: "future_event", payload: { update_id: 2, future_event: { value: "<unsafe>" } } }, 0);
+assert.match(unknownHtml, /future event/);
+assert.match(unknownHtml, /&lt;unsafe&gt;/);
+assert.doesNotMatch(unknownHtml, /action generation|action_generation|actionable/);
+
+// Long-poll waits are separate from API latency, with explicit readable units.
+assert.equal(chat.milliseconds(271.6), "272 ms");
+assert.match(chat.milliseconds(12100), /^12[.,]1 s$/);
+assert.equal(chat.milliseconds(1000), "1 s");
+assert.equal(chat.milliseconds(0), "0 ms");
+for (const value of [null, undefined, "", NaN, Infinity, -1]) assert.equal(chat.milliseconds(value), "—");
+const metricsHtml = chat.renderMetrics({ average_api_latency_ms: 271.6, average_poll_wait_ms: 14566 });
+assert.match(metricsHtml, /272 ms/);
+assert.match(metricsHtml, /excludes getUpdates/);
+assert.match(metricsHtml, /Update polling wait: 14[.,]57 s/);
+assert.doesNotMatch(chat.renderMetrics({ average_api_latency_ms: null, p95_latency_ms: 99999 }), /99[.,]999|100 s/, "an empty average must not fall back to an unrelated percentile");
+
 // Journal allocation/commit order and edit delivery cursors do not define
 // conversation chronology: the original Telegram send time does.
 const chronologicalRows = [

@@ -2030,7 +2030,7 @@
       ["pulse", "Updates", bot.updates_24h ?? bot.updates_count_24h ?? bot.metrics?.updates_24h, "last 24 hours"],
       ["terminal", "API requests", bot.api_calls_24h ?? bot.api_requests_24h ?? bot.requests_24h ?? bot.metrics?.api_requests_24h, "last 24 hours"],
       ["check", "Delivery success", percent(bot.delivery_success_rate ?? bot.metrics?.delivery_success_rate), "successful deliveries"],
-      ["zap", "Avg. API latency", milliseconds(bot.average_api_latency_ms ?? bot.p95_latency_ms ?? bot.metrics?.p95_latency_ms), "last 24 hours"],
+      ["zap", "Avg. API latency", milliseconds(bot.average_api_latency_ms ?? bot.metrics?.average_api_latency_ms), `last 24 hours · excludes getUpdates${bot.average_poll_wait_ms != null ? `<br>Update polling wait: ${esc(milliseconds(bot.average_poll_wait_ms))}` : ""}`],
     ];
     return `<section class="metrics-grid">${cards.map(([symbol, label, value, detail]) => `<article class="metric-card"><div class="metric-card__top"><span class="stat-label">${label}</span><span class="metric-card__icon">${icon(symbol)}</span></div><div class="metric-card__value">${esc(value ?? "—")}</div><div class="metric-card__detail">${detail}</div></article>`).join("")}</section>`;
   }
@@ -2041,7 +2041,11 @@
     if (!Number.isFinite(number)) return String(value);
     return `${number <= 1 ? (number * 100).toFixed(2) : number.toFixed(2)}%`;
   };
-  const milliseconds = (value) => value == null || value === "" ? "—" : `${formatNumber(value)} ms`;
+  const milliseconds = (value) => {
+    if (value == null || value === "" || !Number.isFinite(Number(value)) || Number(value) < 0) return "—";
+    const number = Number(value);
+    return number < 1000 ? `${Math.round(number)} ms` : `${(number / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} s`;
+  };
 
   function renderActivityList(limit = 7) {
     if (state.loading.activity) return `<div class="panel__body skeleton-stack"><div class="skeleton skeleton--activity"></div><div class="skeleton skeleton--activity"></div><div class="skeleton skeleton--activity"></div></div>`;
@@ -2607,6 +2611,8 @@
   }
 
   function messagePreview(item) {
+    const reaction = reactionEventLabel(item);
+    if (reaction) return reaction;
     const text = messageText(item);
     if (text) return text;
     const message = telegramMessage(item);
@@ -2617,6 +2623,31 @@
     if (message?.contact) return "👤 Contact";
     if (message?.dice) return `${message.dice.emoji || "🎲"} ${message.dice.value || ""}`.trim();
     return item?.event_type || item?.type || "Message";
+  }
+
+  function reactionTypeLabel(reaction) {
+    if (reaction?.type === "emoji") return reaction.emoji || "Emoji";
+    if (reaction?.type === "custom_emoji") return "Custom emoji";
+    if (reaction?.type === "paid") return "⭐";
+    return "Reaction";
+  }
+
+  function reactionEventLabel(item) {
+    const type = item?.event_type || item?.type;
+    if (!["message_reaction", "message_reaction_count"].includes(type)) return "";
+    const event = item?.payload?.[type] || item?.[type] || {};
+    const target = event.message_id != null ? ` on message #${event.message_id}` : "";
+    if (type === "message_reaction_count") {
+      const counts = (Array.isArray(event.reactions) ? event.reactions : [])
+        .map((reaction) => `${reactionTypeLabel(reaction.type)} × ${Number(reaction.total_count) || 0}`);
+      return `Reactions${target}: ${counts.length ? counts.join(" · ") : "none"}`;
+    }
+    const actor = event.user?.first_name || event.user?.username || event.actor_chat?.title || "Someone";
+    const oldReactions = (Array.isArray(event.old_reaction) ? event.old_reaction : []).map(reactionTypeLabel).join(" ");
+    const newReactions = (Array.isArray(event.new_reaction) ? event.new_reaction : []).map(reactionTypeLabel).join(" ");
+    return newReactions
+      ? `${actor} reacted${target}: ${oldReactions ? `${oldReactions} → ` : ""}${newReactions}`
+      : `${actor} removed reactions${target}${oldReactions ? `: ${oldReactions}` : ""}`;
   }
 
   function callbackEventStableId(callback, item) {
@@ -3016,6 +3047,11 @@
   }
 
   function renderMessage(item, index) {
+    const reaction = reactionEventLabel(item);
+    if (reaction) {
+      const event = item?.payload?.[item.event_type || item.type] || item?.[item.event_type || item.type];
+      return `<div class="message-event message-event--reaction" data-message-id="${esc(messageStableId(item, index))}"><span>${esc(reaction)}</span><time>${esc(formatDate(event?.date || messageTime(item), "time"))}</time></div>`;
+    }
     const text = messageText(item);
     const type = item?.type || item?.event_type || "message";
     const outgoing = isOutgoing(item);
@@ -3040,9 +3076,12 @@
     }
     if (!text && !structured) {
       const ignored = new Set(["message_id", "date", "chat", "from", "sender_chat", "business_connection_id", "message_thread_id", "direct_messages_topic", "reply_to_message", "external_reply", "quote", "forward_origin", "edit_date", "author_signature", "has_protected_content"]);
-      const field = Object.keys(message || {}).find((key) => !ignored.has(key));
+      // Unknown updates must inspect the Telegram payload, never the timeline
+      // envelope (action_generation, cursor, actionable, etc.).
+      const raw = item?.payload || message;
+      const field = message !== item ? Object.keys(message || {}).find((key) => !ignored.has(key)) : null;
       const label = field || type;
-      return `<details class="message-event message-event--raw" data-message-id="${esc(id)}"><summary>${icon("pulse")}<span>${esc(String(label).replaceAll("_", " "))}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></summary><pre>${esc(JSON.stringify(field ? message[field] : item?.content || {}, null, 2).slice(0, 4000))}</pre></details>`;
+      return `<details class="message-event message-event--raw" data-message-id="${esc(id)}"><summary>${icon("pulse")}<span>${esc(String(label).replaceAll("_", " "))}</span><time>${esc(formatDate(messageTime(item), "time"))}</time></summary><pre>${esc(JSON.stringify(field ? message[field] : raw === item ? item?.content || {} : raw, null, 2).slice(0, 4000))}</pre></details>`;
     }
     const business = Boolean(conversation?.business_connection_id);
     const guest = Boolean(conversation?.guest_query_id);
@@ -4536,6 +4575,9 @@
       botViewAggregateUploadLimit,
       collapseMediaGroups,
       renderMessage,
+      messagePreview,
+      milliseconds,
+      renderMetrics,
       renderComposerPanel,
     };
     return;
